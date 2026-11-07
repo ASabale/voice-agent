@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+"""
+OMP Hands-Free Voice Controller (Stage 1: In-Room Loop)
+
+State machine:
+- IDLE:
+    Listens continuously on a 16 kHz mono mic stream using:
+      1. openWakeWord ("hey_jarvis") with automatic mic gain normalization, AND
+      2. Silero VAD + faster-whisper `tiny.en` (CPU int8, ~90ms) short-utterance verifier
+         with initial_prompt vocabulary bias so accented/quiet "Hey Jarvis" or "Jarvis"
+         or standalone "send prompt" is recognized reliably every time without transcribing long room chatter.
+    When "Hey Jarvis" / "Jarvis" fires:
+      1. Calls POST http://127.0.0.1:17494/barge-in to silence VoiceBox if speaking.
+      2. Plays Wake chime (marimba_start.wav).
+      3. Toggles Handy recording ON (`handy --toggle-transcription`).
+      4. Enters DICTATING.
+- DICTATING:
+    Monitors Silero VAD + RMS energy on the same 16 kHz stream:
+      - Once speech is detected in the current chunk and 5.0s of silence elapses (Pause),
+        flushes the chunk by calling `handy --toggle-transcription`.
+      - Reads the newly transcribed row from Handy's SQLite `history.db`, forwards it to
+        OMP extension `POST http://127.0.0.1:17494/transcript` (which strips command phrases
+        like "send prompt" / "pause listening" / "cancel that", updates `ctx.ui.setEditorText`,
+        or calls `pi.sendUserMessage`).
+      - If action == "appended": plays Chunk tick (Tink.aiff) and immediately calls
+        `handy --toggle-transcription` to keep recording the next chunk in DICTATING.
+      - If action == "sent": plays Send chime (marimba_stop.wav) and returns to IDLE.
+      - If action == "paused" / "cancelled": plays Pop/Basso tone and returns to IDLE.
+      - If 15.0s elapses in DICTATING with zero speech at all, cancels Handy (`handy --cancel`)
+        and returns to IDLE.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+import ctypes
+import json
+import os
+import re
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+
+HANDY_BIN = "/Applications/Handy.app/Contents/MacOS/handy"
+HANDY_DIR = Path.home() / "Library" / "Application Support" / "com.pais.handy"
+HANDY_DB = HANDY_DIR / "history.db"
+HANDY_SETTINGS = HANDY_DIR / "settings_store.json"
+HANDY_LOG = Path.home() / "Library" / "Logs" / "com.pais.handy" / "handy.log"
+
+OMP_BRIDGE_URL = os.environ.get("OMP_VOICE_BRIDGE_URL", "http://127.0.0.1:17494")
+
+SOUND_WAKE = "/Applications/Handy.app/Contents/Resources/resources/marimba_start.wav"
+SOUND_CHUNK_TICK = "/System/Library/Sounds/Tink.aiff"
+SOUND_SEND = "/Applications/Handy.app/Contents/Resources/resources/marimba_stop.wav"
+SOUND_PAUSE = "/System/Library/Sounds/Pop.aiff"
+SOUND_CANCEL = "/System/Library/Sounds/Basso.aiff"
+
+STATE_DIR = Path.home() / ".local" / "state" / "omp-voice"
+PID_FILE = STATE_DIR / "controller.pid"
+STATUS_FILE = STATE_DIR / "status.json"
+LOG_FILE = STATE_DIR / "controller.log"
+TTS_STATE_FILE = STATE_DIR / "tts-playing.json"
+
+_coreaudio = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+
+
+class _AudioObjectPropertyAddress(ctypes.Structure):
+    _fields_ = [
+        ("mSelector", ctypes.c_uint32),
+        ("mScope", ctypes.c_uint32),
+        ("mElement", ctypes.c_uint32),
+    ]
+
+
+def coreaudio_default_input_device_id() -> int:
+    """Return macOS CoreAudio kAudioHardwarePropertyDefaultInputDevice ID so we detect headphone hotplug."""
+    try:
+        addr = _AudioObjectPropertyAddress(0x64496E20, 0x676C6F62, 0)
+        dev_id = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(dev_id))
+        res = _coreaudio.AudioObjectGetPropertyData(
+            1, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev_id)
+        )
+        return int(dev_id.value) if res == 0 else -1
+    except Exception:
+        return -1
+
+
+def is_voicebox_speaking() -> bool:
+    """Fast local check (<0.1ms) whether VoiceBox afplay is currently outputting audio."""
+    try:
+        if TTS_STATE_FILE.exists():
+            data = json.loads(TTS_STATE_FILE.read_text(encoding="utf-8"))
+            if data.get("playing") is True:
+                pid = data.get("pid")
+                if isinstance(pid, int):
+                    try:
+                        os.kill(pid, 0)
+                        return True
+                    except OSError:
+                        return False
+                return (time.time() - float(data.get("started_at", 0))) < 30.0
+            ended_at = float(data.get("ended_at", 0))
+            if (time.time() - ended_at) < 0.45:
+                # 450ms room-reverb tail guard after afplay exits
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+
+
+def play_cue(path: str, wait: bool = False) -> None:
+    if not os.path.exists(path):
+        return
+    try:
+        proc = subprocess.Popen(
+            ["/usr/bin/afplay", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if wait:
+            proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
+
+def write_status(state: str, extra: dict | None = None) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state": state,
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+        }
+        if extra:
+            payload.update(extra)
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
+
+def bridge_request(path: str, method: str = "GET", body: dict | None = None, timeout: float = 2.0) -> dict | None:
+    url = f"{OMP_BRIDGE_URL}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"content-type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def latest_history_row() -> tuple[int, str]:
+    if not HANDY_DB.exists():
+        return (0, "")
+    try:
+        conn = sqlite3.connect(f"file:{HANDY_DB}?mode=ro", uri=True, timeout=1.5)
+        try:
+            cur = conn.execute(
+                "SELECT id, COALESCE(post_processed_text, transcription_text, '') "
+                "FROM transcription_history ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if not row:
+                return (0, "")
+            return (int(row[0]), str(row[1]))
+        finally:
+            conn.close()
+    except Exception:
+        return (0, "")
+
+
+def wait_for_new_history_row(after_id: int, timeout_sec: float = 6.0) -> tuple[int, str] | None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        row_id, text = latest_history_row()
+        if row_id > after_id:
+            return (row_id, text)
+        time.sleep(0.06)
+    return None
+
+
+def unmute_async() -> None:
+    try:
+        subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                'sleep 0.15; /usr/bin/osascript -e "set volume without output muted" >/dev/null 2>&1; '
+                'sleep 0.65; /usr/bin/osascript -e "set volume without output muted" >/dev/null 2>&1',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def handy_toggle() -> None:
+    subprocess.run(
+        [HANDY_BIN, "--toggle-transcription"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=3.0,
+        check=False,
+    )
+
+
+def handy_start_recording() -> None:
+    handy_cancel()
+    time.sleep(0.08)
+    handy_toggle()
+    unmute_async()
+
+
+def handy_stop_recording() -> None:
+    handy_toggle()
+
+
+def handy_cancel() -> None:
+    subprocess.run(
+        [HANDY_BIN, "--cancel"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=3.0,
+        check=False,
+    )
+
+
+def fallback_macos_inject(text: str, action: str) -> None:
+    """Fallback if OMP bridge (:17494) is unreachable (e.g. OMP not yet reloaded)."""
+    if action in ("appended", "paused") and text:
+        subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=False)
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                'tell application "System Events" to keystroke "v" using command down',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    elif action == "sent":
+        if text:
+            subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=False)
+            subprocess.run(
+                [
+                    "/usr/bin/osascript",
+                    "-e",
+                    'tell application "System Events" to keystroke "v" using command down',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            time.sleep(0.12)
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                'tell application "System Events" to key code 36',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def dispatch_transcript(text: str) -> dict:
+    """Send transcript to OMP extension bridge; handle v1 bridge deduplication or offline fallback."""
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return {"action": "noop", "draft": ""}
+
+    status = bridge_request("/status", method="GET")
+    if status and status.get("ok"):
+        if status.get("version", 1) >= 2:
+            resp = bridge_request("/transcript", method="POST", body={"text": text})
+            if resp and resp.get("ok"):
+                return resp
+        else:
+            # v1 bridge compatibility (before /reload-runtime):
+            # Handy's Cmd+V already pasted `text` into the focused OMP editor if `draft` ends with `text`.
+            current_draft = str(status.get("draft", ""))
+            already_pasted = current_draft.rstrip().endswith(text.strip()) or current_draft.rstrip().endswith(cleaned)
+            lower = cleaned.lower().rstrip(" .,!?;:")
+            is_cmd = any(
+                lower == p or lower.endswith(" " + p)
+                for p in (
+                    "send prompt",
+                    "submit prompt",
+                    "send message",
+                    "send that",
+                    "send it",
+                    "press enter",
+                    "ship it",
+                    "hey jarvis send",
+                    "jarvis send",
+                    "pause listening",
+                    "stop listening",
+                    "go to sleep",
+                    "hey jarvis stop",
+                    "jarvis stop",
+                    "stop dictation",
+                    "stop",
+                    "cancel that",
+                    "discard chunk",
+                    "cancel dictation",
+                    "hey jarvis cancel",
+                    "jarvis cancel",
+                )
+            )
+            if already_pasted and not is_cmd:
+                return {"action": "appended", "draft": current_draft}
+            if already_pasted and is_cmd:
+                n_del = len(text)
+                subprocess.run(
+                    [
+                        "/usr/bin/osascript",
+                        "-e",
+                        f'tell application "System Events" to repeat {n_del} times\nkey code 51\nend repeat',
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                time.sleep(0.08)
+            if lower in ("hey jarvis stop", "jarvis stop", "stop dictation", "stop") or any(
+                lower.endswith(" " + p) for p in ("hey jarvis stop", "jarvis stop", "stop dictation")
+            ):
+                # Map to "pause listening" so even v1 bridge recognizes it
+                for p in ("hey jarvis stop", "jarvis stop", "stop dictation", "stop"):
+                    if lower == p or lower.endswith(" " + p):
+                        prefix = cleaned[: len(cleaned) - len(p)].rstrip(" ,.;:-")
+                        mapped = f"{prefix} pause listening".strip()
+                        resp = bridge_request("/transcript", method="POST", body={"text": mapped})
+                        if resp and resp.get("ok"):
+                            return resp
+            if lower in ("hey jarvis send", "jarvis send", "send that") or any(
+                lower.endswith(" " + p) for p in ("hey jarvis send", "jarvis send", "send that")
+            ):
+                for p in ("hey jarvis send", "jarvis send", "send that"):
+                    if lower == p or lower.endswith(" " + p):
+                        prefix = cleaned[: len(cleaned) - len(p)].rstrip(" ,.;:-")
+                        mapped = f"{prefix} send prompt".strip()
+                        resp = bridge_request("/transcript", method="POST", body={"text": mapped})
+                        if resp and resp.get("ok"):
+                            return resp
+            resp = bridge_request("/transcript", method="POST", body={"text": text})
+            if resp and resp.get("ok"):
+                return resp
+
+    lower = cleaned.lower().rstrip(" .,!?;:")
+    for phrase in ("cancel that", "discard chunk", "cancel dictation"):
+        if lower == phrase or lower.endswith(" " + phrase):
+            return {"action": "cancelled", "strippedCommand": phrase}
+
+    for phrase in ("pause listening", "stop listening", "go to sleep"):
+        if lower == phrase or lower.endswith(" " + phrase):
+            prefix = cleaned[: len(cleaned) - len(phrase)].rstrip(" ,.;:-")
+            fallback_macos_inject(prefix + (" " if prefix else ""), "paused")
+            return {"action": "paused", "strippedCommand": phrase}
+
+    for phrase in ("send prompt", "submit prompt", "send message", "send it", "press enter", "ship it"):
+        if lower == phrase or lower.endswith(" " + phrase):
+            prefix = cleaned[: len(cleaned) - len(phrase)].rstrip(" ,.;:-")
+            fallback_macos_inject(prefix, "sent")
+            return {"action": "sent", "strippedCommand": phrase}
+
+    fallback_macos_inject(cleaned + " ", "appended")
+    return {"action": "appended", "draft": cleaned}
+
+
+def configure_handy_settings() -> None:
+    """Ensure Handy keeps its ASR model warm and uses standard ctrl_v paste."""
+    if not HANDY_SETTINGS.exists():
+        return
+    try:
+        raw = json.loads(HANDY_SETTINGS.read_text(encoding="utf-8"))
+        settings = raw.get("settings", {})
+        changed = False
+        if settings.get("mute_while_recording") is True:
+            settings["mute_while_recording"] = False
+            changed = True
+        if settings.get("model_unload_timeout") == "min2":
+            settings["model_unload_timeout"] = "hour1"
+            changed = True
+        if settings.get("selected_language") != "en":
+            settings["selected_language"] = "en"
+            changed = True
+        if settings.get("paste_method") != "ctrl_v":
+            settings["paste_method"] = "ctrl_v"
+            settings["external_script_path"] = None
+            changed = True
+        if changed:
+            HANDY_SETTINGS.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            log("Updated Handy settings (mute_while_recording=False, model_unload_timeout=hour1, paste_method=ctrl_v)")
+    except Exception as exc:
+        log(f"Warning: could not update Handy settings: {exc}")
+
+
+WAKE_RE = re.compile(r"\b(hey\s+jarvis|jarvis|ok\s+jarvis|hello\s+jarvis)\b", re.IGNORECASE)
+BARGE_IN_RE = re.compile(r"\b(hey\s+jarvis|jarvis\s+stop|stop\s+talking|stop\s+speaking)\b", re.IGNORECASE)
+SEND_IDLE_RE = re.compile(r"^\s*(send\s+prompt|submit\s+prompt|send\s+message|send\s+that|send\s+it|press\s+enter|ship\s+it)[\s.,!?]*$", re.IGNORECASE)
+SCRATCH_IDLE_RE = re.compile(
+    r"^\s*(scratch\s+that|scratch\s+last|undo\s+that|delete\s+that|erase\s+that|remove\s+last|clear\s+draft|clear\s+all|clear\s+text|clear\s+box|scratch\s+all|start\s+over)[\s.,!?]*$",
+    re.IGNORECASE,
+)
+FAST_CMD_RE = re.compile(
+    r"(send\s+prompt|submit\s+prompt|send\s+message|send\s+that|send\s+it|press\s+enter|ship\s+it|hey\s+jarvis\s+send|jarvis\s+send|pause\s+listening|stop\s+listening|hey\s+jarvis\s+stop|jarvis\s+stop|stop\s+dictation|cancel\s+that|discard\s+chunk|scratch\s+that|scratch\s+last|undo\s+that|delete\s+that|erase\s+that|remove\s+last|clear\s+draft|clear\s+all|clear\s+text|clear\s+box|scratch\s+all|start\s+over)[\s.,!?]*$",
+    re.IGNORECASE,
+)
+
+
+def run_daemon(
+    wake_word: str = "hey_jarvis",
+    wake_threshold: float = 0.35,
+    pause_seconds: float = 5.0,
+    idle_timeout_seconds: float = 15.0,
+    vad_threshold: float = 0.40,
+) -> None:
+    import sounddevice as sd
+    from faster_whisper import WhisperModel
+    from openwakeword.model import Model
+    from openwakeword.vad import VAD
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    configure_handy_settings()
+    # Ensure macOS microphone input gain is at least 80% so across-the-room voice isn't attenuated
+    subprocess.run(
+        ["/usr/bin/osascript", "-e", "set volume input volume 85"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    log(f"Loading openWakeWord '{wake_word}' + Silero VAD + faster-whisper tiny.en wake verifier...")
+    oww = Model(wakeword_models=[wake_word], inference_framework="onnx")
+    vad = VAD()
+    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+
+    sample_rate = 16000
+    chunk_samples = 1280  # 80 ms frames
+
+    state = "IDLE"
+    last_history_id, _ = latest_history_row()
+    speech_seen_in_chunk = False
+    chunk_started_at = 0.0
+    last_speech_at = 0.0
+    cooldown_until = 0.0
+
+    # Rolling buffer for IDLE short-utterance wake/send detection (up to 3.2s)
+    idle_pre_roll: deque[np.ndarray] = deque(maxlen=6)  # 480ms pre-roll
+    idle_speech_frames: list[np.ndarray] = []
+    idle_in_speech = False
+    idle_silence_frames = 0
+
+    # Rolling tail buffer in DICTATING for fast 1.5s detection of "send prompt" / "pause listening" / "cancel that"
+    dict_tail_frames: deque[np.ndarray] = deque(maxlen=38)  # ~3.0s
+    dict_speech_frames: list[np.ndarray] = []
+    checked_fast_cmd = False
+
+    def transcribe_local_fallback(frames_list: list[np.ndarray]) -> str:
+        """If Handy failed to persist a row (e.g. Escape/fn interference), transcribe our buffered PCM directly."""
+        if len(frames_list) < 6:
+            return ""
+        try:
+            audio_i16 = np.concatenate(frames_list)
+            if float(np.max(np.abs(audio_i16))) < 350.0:
+                return ""
+            audio_f32 = audio_i16.astype(np.float32) / 32768.0
+            peak = float(np.max(np.abs(audio_f32)))
+            if peak > 0.01:
+                audio_f32 = np.clip(audio_f32 * min(5.0, 0.5 / peak), -1.0, 1.0)
+            segments, _ = whisper.transcribe(
+                audio_f32,
+                language="en",
+                beam_size=1,
+                without_timestamps=True,
+                initial_prompt="send prompt, send that, submit prompt, scratch that, undo that, clear draft, pause listening.",
+            )
+            return " ".join(s.text for s in segments).strip()
+        except Exception:
+            return ""
+
+    def enter_dictating(reason: str) -> None:
+        nonlocal state, speech_seen_in_chunk, chunk_started_at, last_speech_at, cooldown_until, last_history_id
+        nonlocal idle_in_speech, idle_silence_frames, checked_fast_cmd
+        log(f"Wake triggered ({reason}) -> entering DICTATING")
+        oww.reset()
+        vad.reset_states()
+        idle_speech_frames.clear()
+        dict_tail_frames.clear()
+        dict_speech_frames.clear()
+        checked_fast_cmd = False
+        idle_in_speech = False
+        idle_silence_frames = 0
+        # 1. Trigger Barge-in on VoiceBox if it's speaking (and abort any in-flight OMP generation/tool run)
+        bridge_request("/barge-in", method="POST", body={"abortAgent": True})
+        subprocess.run(["/usr/bin/killall", "afplay"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        # 2. Play Wake chime AND start Handy concurrently so any speech right after "Hey Jarvis" is never missed!
+        play_cue(SOUND_WAKE, wait=False)
+        last_history_id, _ = latest_history_row()
+        # 3. Start Handy recording
+        handy_start_recording()
+        state = "DICTATING"
+        speech_seen_in_chunk = False
+        chunk_started_at = time.monotonic()
+        last_speech_at = chunk_started_at
+        cooldown_until = chunk_started_at + 0.25
+        write_status(state, {"chunk_started_at": time.time(), "trigger": reason})
+
+    write_status(state, {"wake_word": wake_word, "pause_seconds": pause_seconds})
+    log(
+        f"OMP Voice Controller ready in IDLE. Say 'Hey Jarvis' (or 'Jarvis') to start dictating; "
+        f"pause {pause_seconds:.1f}s to flush chunk; say 'send prompt' to press Enter."
+    )
+
+    running = True
+
+    def handle_sig(_signum: int, _frame: object) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    while running:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+        active_ca_dev = coreaudio_default_input_device_id()
+        try:
+            dev_info = sd.query_devices(kind="input")
+            dev_name = str(dev_info.get("name", "default")) if isinstance(dev_info, dict) else "default"
+        except Exception:
+            dev_name = "default"
+        log(f"Opening microphone input stream on '{dev_name}' (CoreAudio id={active_ca_dev})")
+        write_status(state, {"wake_word": wake_word, "pause_seconds": pause_seconds, "mic": dev_name})
+        last_dev_check = time.monotonic()
+
+        try:
+            with sd.InputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=chunk_samples,
+            ) as stream:
+                while running:
+                    pcm_block, _overflow = stream.read(chunk_samples)
+                    frame = pcm_block[:, 0]
+                    now = time.monotonic()
+
+                    # Every 2.0s, check if macOS default input device changed (e.g. AirPods / headphones connected or disconnected)
+                    if (now - last_dev_check) >= 2.0:
+                        last_dev_check = now
+                        new_ca_dev = coreaudio_default_input_device_id()
+                        if new_ca_dev != -1 and active_ca_dev != -1 and new_ca_dev != active_ca_dev:
+                            log(f"macOS default microphone changed ({active_ca_dev} -> {new_ca_dev}); rebinding stream...")
+                            subprocess.run(
+                                ["/usr/bin/osascript", "-e", "set volume input volume 85"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                            )
+                            break
+
+                    if now < cooldown_until:
+                        oww.predict(frame)
+                        continue
+
+                    rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                    vad_score = float(vad.predict(frame))
+                    is_speech = (vad_score >= vad_threshold) or (rms >= 320.0)
+
+                    if state == "IDLE":
+                        tts_active = is_voicebox_speaking()
+                        # Path 1: Fast neural keyword spotter
+                        # While VoiceBox is speaking out of the laptop speakers, use a 0.50 threshold
+                        # so speaking "Hey Jarvis" over the audio interrupts immediately, while normal
+                        # speech (which has "Jarvis" scrubbed out by forSpeech()) won't false-trigger.
+                        if tts_active:
+                            preds = oww.predict(frame)
+                            score = float(preds.get(wake_word, 0.0))
+                            if score >= 0.50:
+                                enter_dictating(f"barge-in openWakeWord score={score:.2f}")
+                            continue
+
+                        boosted = np.clip(frame.astype(np.float32) * 3.0, -32768, 32767).astype(np.int16) if rms < 1200 else frame
+                        preds = oww.predict(boosted)
+                        score = float(preds.get(wake_word, 0.0))
+                        if score >= wake_threshold:
+                            enter_dictating(f"openWakeWord score={score:.2f}")
+                            continue
+
+                        # Path 2: Short utterance verifier (disabled while VoiceBox TTS is playing so continuous TTS speech isn't fed to Whisper)
+                        if is_speech:
+                            if not idle_in_speech:
+                                idle_in_speech = True
+                                idle_silence_frames = 0
+                                idle_speech_frames.extend(idle_pre_roll)
+                            idle_speech_frames.append(frame.copy())
+                            # Cap at ~3.2s (40 frames) so long background conversations are ignored
+                            if len(idle_speech_frames) > 42:
+                                idle_speech_frames.clear()
+                                idle_in_speech = False
+                                idle_silence_frames = 0
+                        else:
+                            if not idle_in_speech:
+                                idle_pre_roll.append(frame.copy())
+                            else:
+                                idle_speech_frames.append(frame.copy())
+                                idle_silence_frames += 1
+                                # 7 frames = 560ms of silence after a short burst (0.3s - 3.2s)
+                                if idle_silence_frames >= 7:
+                                    n_frames = len(idle_speech_frames)
+                                    audio_i16 = np.concatenate(idle_speech_frames)
+                                    idle_speech_frames.clear()
+                                    idle_in_speech = False
+                                    idle_silence_frames = 0
+                                    if 5 <= n_frames <= 42 and float(np.max(np.abs(audio_i16))) >= 450.0:
+                                        audio_f32 = audio_i16.astype(np.float32) / 32768.0
+                                        peak = float(np.max(np.abs(audio_f32)))
+                                        if peak > 0.01:
+                                            audio_f32 = np.clip(audio_f32 * min(6.0, 0.5 / peak), -1.0, 1.0)
+                                        segments, _ = whisper.transcribe(
+                                            audio_f32,
+                                            language="en",
+                                            beam_size=1,
+                                            without_timestamps=True,
+                                            initial_prompt="Hey Jarvis, Jarvis, send prompt, submit prompt, scratch that, undo that, clear draft.",
+                                        )
+                                        heard = " ".join(s.text for s in segments).strip()
+                                        if WAKE_RE.search(heard):
+                                            enter_dictating(f"whisper heard {heard!r}")
+                                            continue
+                                        if SEND_IDLE_RE.match(heard):
+                                            log(f"Standalone send phrase in IDLE ({heard!r}) -> submitting draft")
+                                            outcome = dispatch_transcript("send prompt")
+                                            if outcome.get("action") == "sent":
+                                                play_cue(SOUND_SEND, wait=False)
+                                            cooldown_until = time.monotonic() + 0.6
+                                        elif SCRATCH_IDLE_RE.match(heard):
+                                            log(f"Standalone scratch/clear phrase in IDLE ({heard!r}) -> scratching draft")
+                                            outcome = dispatch_transcript(heard)
+                                            play_cue(SOUND_CANCEL, wait=False)
+                                            cooldown_until = time.monotonic() + 0.6
+
+                    elif state == "DICTATING":
+                        # If the user manually pressed `fn` and Handy already finished a new row while we were waiting,
+                        # consume and dispatch it immediately so we never re-toggle Handy out of sync!
+                        live_id, live_txt = latest_history_row()
+                        if live_id > last_history_id:
+                            last_history_id = live_id
+                            log(f"Detected manual Handy transcription #{live_id} during DICTATING: {live_txt!r}")
+                            time.sleep(0.26)
+                            outcome = dispatch_transcript(live_txt)
+                            action = outcome.get("action", "appended")
+                            log(f"Manual chunk outcome: {action}")
+                            dict_tail_frames.clear()
+                            dict_speech_frames.clear()
+                            checked_fast_cmd = False
+                            speech_seen_in_chunk = False
+                            if action in ("sent", "paused", "cancelled"):
+                                play_cue(SOUND_SEND if action == "sent" else SOUND_PAUSE, wait=False)
+                                state = "IDLE"
+                                oww.reset()
+                                vad.reset_states()
+                                cooldown_until = time.monotonic() + 0.6
+                                write_status(state, {"last_action": action})
+                            else:
+                                play_cue(SOUND_CHUNK_TICK, wait=False)
+                                handy_start_recording()
+                                chunk_started_at = time.monotonic()
+                                last_speech_at = chunk_started_at
+                                cooldown_until = chunk_started_at + 0.25
+                                write_status(state, {"last_action": action})
+                            continue
+
+                        if is_speech:
+                            if not speech_seen_in_chunk:
+                                log(f"Speech started in chunk (vad={vad_score:.2f}, rms={rms:.0f})")
+                            speech_seen_in_chunk = True
+                            last_speech_at = now
+                            checked_fast_cmd = False
+                            dict_tail_frames.append(frame.copy())
+                            if len(dict_speech_frames) < 750:  # cap at ~60s
+                                dict_speech_frames.append(frame.copy())
+                        else:
+                            if speech_seen_in_chunk:
+                                dict_tail_frames.append(frame.copy())
+                                if len(dict_speech_frames) < 750:
+                                    dict_speech_frames.append(frame.copy())
+                                silence_dur = now - last_speech_at
+                                should_flush = silence_dur >= pause_seconds
+
+                                if not should_flush and silence_dur >= 1.5 and not checked_fast_cmd and len(dict_tail_frames) >= 8:
+                                    checked_fast_cmd = True
+                                    tail_i16 = np.concatenate(list(dict_tail_frames))
+                                    tail_f32 = tail_i16.astype(np.float32) / 32768.0
+                                    peak = float(np.max(np.abs(tail_f32)))
+                                    if peak > 0.01:
+                                        tail_f32 = np.clip(tail_f32 * min(6.0, 0.5 / peak), -1.0, 1.0)
+                                    segments, _ = whisper.transcribe(
+                                        tail_f32,
+                                        language="en",
+                                        beam_size=1,
+                                        without_timestamps=True,
+                                        initial_prompt="send prompt, submit prompt, pause listening, cancel that, scratch that, undo that, clear draft.",
+                                    )
+                                    tail_heard = " ".join(s.text for s in segments).strip()
+                                    if FAST_CMD_RE.search(tail_heard):
+                                        log(f"Fast command phrase detected after {silence_dur:.1f}s silence ({tail_heard!r}) -> flushing now")
+                                        should_flush = True
+
+                                if should_flush:
+                                    log(f"Pause of {silence_dur:.1f}s detected -> flushing chunk via Handy")
+                                    prev_id = last_history_id
+                                    handy_stop_recording()
+                                    row = wait_for_new_history_row(prev_id, timeout_sec=2.2)
+                                    if row is not None:
+                                        last_history_id, transcript = row
+                                        log(f"Handy transcribed chunk #{last_history_id}: {transcript!r}")
+                                        # Wait 260ms so Handy's native Cmd+V paste (229ms) finishes before OMP deduplicates & updates editor
+                                        time.sleep(0.26)
+                                        outcome = dispatch_transcript(transcript)
+                                        action = outcome.get("action", "appended")
+                                        log(f"Transcript outcome: {action}")
+                                    else:
+                                        # Fallback: if Escape or manual key cancelled Handy's recording before stop,
+                                        # transcribe our own buffered PCM via faster-whisper so the user's speech is NEVER lost!
+                                        fallback_txt = transcribe_local_fallback(dict_speech_frames)
+                                        if fallback_txt:
+                                            log(f"Handy row missing (cancelled externally); recovered via local Whisper: {fallback_txt!r}")
+                                            outcome = dispatch_transcript(fallback_txt)
+                                            action = outcome.get("action", "appended")
+                                            log(f"Recovered transcript outcome: {action}")
+                                        else:
+                                            log("No new transcript row from Handy (empty/silence)")
+                                            action = "noop"
+
+                                    dict_speech_frames.clear()
+                                    if action == "sent":
+                                        play_cue(SOUND_SEND, wait=False)
+                                        state = "IDLE"
+                                        oww.reset()
+                                        vad.reset_states()
+                                        dict_tail_frames.clear()
+                                        cooldown_until = time.monotonic() + 0.6
+                                        write_status(state, {"last_action": "sent"})
+                                        log("Prompt submitted -> returned to IDLE")
+                                    elif action == "paused":
+                                        play_cue(SOUND_PAUSE, wait=False)
+                                        state = "IDLE"
+                                        oww.reset()
+                                        vad.reset_states()
+                                        dict_tail_frames.clear()
+                                        cooldown_until = time.monotonic() + 0.6
+                                        write_status(state, {"last_action": "paused"})
+                                        log("Paused listening -> returned to IDLE (draft preserved)")
+                                    elif action in ("scratched", "cleared"):
+                                        # Play cancel/undo tone, keep DICTATING active so the user can immediately re-speak the corrected thought!
+                                        play_cue(SOUND_CANCEL, wait=False)
+                                        last_history_id, _ = latest_history_row()
+                                        handy_start_recording()
+                                        vad.reset_states()
+                                        dict_tail_frames.clear()
+                                        checked_fast_cmd = False
+                                        speech_seen_in_chunk = False
+                                        chunk_started_at = time.monotonic()
+                                        last_speech_at = chunk_started_at
+                                        cooldown_until = chunk_started_at + 0.25
+                                        write_status(state, {"last_action": action})
+                                        log(f"Draft {action} -> continuing DICTATING for replacement chunk...")
+                                    elif action == "cancelled":
+                                        play_cue(SOUND_CANCEL, wait=False)
+                                        state = "IDLE"
+                                        oww.reset()
+                                        vad.reset_states()
+                                        dict_tail_frames.clear()
+                                        cooldown_until = time.monotonic() + 0.6
+                                        write_status(state, {"last_action": "cancelled"})
+                                        log("Cancelled chunk -> returned to IDLE")
+                                    else:
+                                        play_cue(SOUND_CHUNK_TICK, wait=False)
+                                        last_history_id, _ = latest_history_row()
+                                        handy_start_recording()
+                                        vad.reset_states()
+                                        dict_tail_frames.clear()
+                                        checked_fast_cmd = False
+                                        speech_seen_in_chunk = False
+                                        chunk_started_at = time.monotonic()
+                                        last_speech_at = chunk_started_at
+                                        cooldown_until = chunk_started_at + 0.25
+                                        write_status(state, {"last_action": "appended"})
+                                        log("Continuing DICTATING for next chunk...")
+                            else:
+                                if (now - chunk_started_at) >= idle_timeout_seconds:
+                                    log(f"No speech for {idle_timeout_seconds:.0f}s in DICTATING -> cancelling Handy & returning to IDLE")
+                                    handy_cancel()
+                                    play_cue(SOUND_PAUSE, wait=False)
+                                    state = "IDLE"
+                                    oww.reset()
+                                    vad.reset_states()
+                                    cooldown_until = time.monotonic() + 0.5
+                                    write_status(state, {"last_action": "idle_timeout"})
+        except Exception as stream_err:
+            log(f"Audio stream interrupted ({stream_err}); reconnecting in 1.0s...")
+            time.sleep(1.0)
+
+    if state == "DICTATING":
+        handy_cancel()
+    write_status("STOPPED")
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    log("OMP Voice Controller stopped.")
+
+
+def cmd_status() -> int:
+    bridge = bridge_request("/status", method="GET")
+    ctrl = json.loads(STATUS_FILE.read_text(encoding="utf-8")) if STATUS_FILE.exists() else {"state": "STOPPED"}
+    pid = ctrl.get("pid")
+    alive = False
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+    print(
+        json.dumps(
+            {
+                "controller": {**ctrl, "alive": alive},
+                "omp_bridge": bridge or {"ok": False, "note": "Restart/reload OMP session to bind :17494"},
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_stop() -> int:
+    if not PID_FILE.exists():
+        print("OMP Voice Controller is not running.")
+        return 0
+    try:
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(30):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.05)
+            except OSError:
+                break
+        PID_FILE.unlink(missing_ok=True)
+        print(f"Stopped OMP Voice Controller (pid {pid}).")
+    except Exception as exc:
+        print(f"Controller not running ({exc}).")
+        PID_FILE.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_start_bg(args: argparse.Namespace) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            print(f"OMP Voice Controller already running (pid {pid}).")
+            return 0
+        except OSError:
+            PID_FILE.unlink(missing_ok=True)
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "run",
+        "--wake-word",
+        args.wake_word,
+        "--wake-threshold",
+        str(args.wake_threshold),
+        "--pause-seconds",
+        str(args.pause_seconds),
+        "--idle-timeout",
+        str(args.idle_timeout),
+    ]
+    log_fh = open(LOG_FILE, "a", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_fh,
+        stderr=log_fh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    time.sleep(1.2)
+    print(f"Started OMP Voice Controller in background (pid {proc.pid}, log: {LOG_FILE})")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="OMP Hands-Free Voice Controller")
+    sub = parser.add_subparsers(dest="subcommand")
+
+    for name in ("run", "start"):
+        p = sub.add_parser(name)
+        p.add_argument("--wake-word", default="hey_jarvis", help="openWakeWord model name (default: hey_jarvis)")
+        p.add_argument("--wake-threshold", type=float, default=0.35, help="Wake word threshold 0..1 (default: 0.35)")
+        p.add_argument("--pause-seconds", type=float, default=5.0, help="Silence pause to flush chunk (default: 5.0)")
+        p.add_argument("--idle-timeout", type=float, default=15.0, help="Max silence with no speech before IDLE (default: 15.0)")
+
+    sub.add_parser("stop")
+    sub.add_parser("status")
+
+    p_send = sub.add_parser("inject", help="Send a synthetic transcript chunk through the OMP bridge")
+    p_send.add_argument("text", help="Transcript text to inject")
+
+    p_hook = sub.add_parser("handy-hook", help="Handy external_script_path hook receiver")
+    p_hook.add_argument("args", nargs="*", help="Optional transcript args from Handy")
+
+    sub.add_parser("barge-in", help="Immediately silence VoiceBox playback")
+
+    args = parser.parse_args()
+    if args.subcommand == "handy-hook":
+        ctrl = json.loads(STATUS_FILE.read_text(encoding="utf-8")) if STATUS_FILE.exists() else {"state": "STOPPED"}
+        if ctrl.get("state") == "DICTATING":
+            return 0
+        text = " ".join(args.args).strip()
+        if not text and not sys.stdin.isatty():
+            text = sys.stdin.read().strip()
+        if not text:
+            _, text = latest_history_row()
+        if text:
+            dispatch_transcript(text)
+        return 0
+    if args.subcommand == "run":
+        run_daemon(
+            wake_word=args.wake_word,
+            wake_threshold=args.wake_threshold,
+            pause_seconds=args.pause_seconds,
+            idle_timeout_seconds=args.idle_timeout,
+        )
+        return 0
+    if args.subcommand == "start":
+        return cmd_start_bg(args)
+    if args.subcommand == "stop":
+        return cmd_stop()
+    if args.subcommand == "inject":
+        print(json.dumps(dispatch_transcript(args.text), indent=2))
+        return 0
+    if args.subcommand == "barge-in":
+        print(json.dumps(bridge_request("/barge-in", method="POST", body={}) or {"ok": False}, indent=2))
+        return 0
+    return cmd_status()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
