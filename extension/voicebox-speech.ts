@@ -309,7 +309,7 @@ function endsSentence(text: string, index: number, flush: boolean): boolean {
 }
 
 function takeSentences(fresh: string, flush: boolean): string[] {
-  const rawSentences: string[] = [];
+  const out: string[] = [];
   let rest = fresh.trimStart();
   while (rest.length >= 12) {
     let cut = -1;
@@ -320,48 +320,13 @@ function takeSentences(fresh: string, flush: boolean): string[] {
       break;
     }
     if (cut === -1) break;
-    rawSentences.push(rest.slice(0, cut).trim());
+    out.push(rest.slice(0, cut).trim());
     rest = rest.slice(cut).trimStart();
   }
   if (flush && rest.length >= 8) {
-    rawSentences.push(rest);
-    rest = "";
+    out.push(rest.trim());
   }
-  if (rawSentences.length === 0) return [];
-
-  // Coalesce consecutive short sentences into ~160–240 char spoken chunks
-  // (after the first sentence starts playing) so Qwen-TTS generates smoothly
-  // at 0.84x RTF instead of stalling with per-sentence startup overhead + afplay gaps.
-  const chunks: string[] = [];
-  let current = "";
-  const firstSentencespoken = spoken.size > 0;
-  for (let i = 0; i < rawSentences.length; i++) {
-    const s = rawSentences[i]!;
-    if (!current) {
-      current = s;
-      // Keep the very first chunk of a turn short (~60+ chars) so audio starts quickly
-      if (!firstSentencespoken && chunks.length === 0 && current.length >= 45) {
-        chunks.push(current);
-        current = "";
-      }
-      continue;
-    }
-    const targetMax = !firstSentencespoken && chunks.length === 0 ? 90 : 220;
-    if (current.length + 1 + s.length <= targetMax) {
-      current = `${current} ${s}`;
-    } else {
-      chunks.push(current);
-      current = s;
-    }
-  }
-  // If not flushing yet and `current` is still very short (<75 chars) while later sentences have already queued,
-  // hold `current` until more streamed tokens arrive so we don't fire tiny 20-char fragments.
-  if (current) {
-    if (flush || current.length >= 75 || ( spoken.size === 0 && chunks.length === 0 )) {
-      chunks.push(current);
-    }
-  }
-  return chunks;
+  return out;
 }
 
 let cachedProfileId = "";
@@ -441,9 +406,25 @@ async function play(clip: { wav: string }, epoch: number): Promise<void> {
   } catch {
     // ignore
   }
-  child.on("exit", () => resolve());
-  child.on("error", () => resolve());
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    resolve();
+  };
+  const watchdog = setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+    finish();
+  }, 45000);
+  child.on("close", finish);
+  child.on("exit", finish);
+  child.on("error", finish);
   await promise;
+  clearTimeout(watchdog);
   if (activeAfplay === child) {
     activeAfplay = null;
     isSpeaking = false;
@@ -494,22 +475,74 @@ function push(message: unknown, flush: boolean): void {
     }
   }
   const plain = forSpeech(raw);
+  if (!plain) return;
   if (queued && !plain.startsWith(queued)) {
-    const first = takeSentences(plain, true)[0];
-    if (first && spoken.has(first)) return;
+    // Only reset if this is genuinely a brand-new message turn (where none of its sentences were spoken yet)
+    const allSentences = takeSentences(plain, true);
+    if (allSentences.some((s) => spoken.has(s))) {
+      // Same message whose normalized prefix shifted slightly mid-stream: advance only beyond spoken sentences
+      for (const s of allSentences) {
+        if (!spoken.has(s)) {
+          enqueue(s);
+        }
+      }
+      queued = plain;
+      return;
+    }
     queued = "";
     spoken.clear();
   }
-  const fresh = plain.slice(queued.length);
-  const added = takeSentences(fresh, flush);
+  const base = queued.length;
+  const fresh = plain.slice(base);
+  const rawSentences = takeSentences(fresh, flush);
+  if (rawSentences.length === 0) return;
+
+  // Coalesce consecutive ready sentences into up to ~200 chars, EXCEPT only emit a coalesced group
+  // once the NEXT sentence after it has also started/completed (or on flush=true), so a group's text
+  // NEVER grows on subsequent streaming deltas (which previously caused "A" then "A B" to both play!).
+  let consumedLen = 0;
   let rest = fresh.trimStart();
-  for (const sentence of added) {
-    const at = rest.indexOf(sentence);
-    if (at < 0) return;
-    rest = rest.slice(at + sentence.length).trimStart();
-    enqueue(sentence);
+  const leadingWs = fresh.length - rest.length;
+  consumedLen += leadingWs;
+
+  let group = "";
+  let groupEndOffset = consumedLen;
+
+  for (let i = 0; i < rawSentences.length; i++) {
+    const s = rawSentences[i]!;
+    const at = rest.indexOf(s);
+    if (at < 0) break;
+    const afterSentenceOffset = groupEndOffset + at + s.length;
+    const trailing = rest.slice(at + s.length);
+    const wsAfter = trailing.length - trailing.trimStart().length;
+    const nextOffset = afterSentenceOffset + wsAfter;
+
+    const targetMax = spoken.size === 0 ? 85 : 190;
+    if (!group) {
+      group = s;
+      groupEndOffset = nextOffset;
+    } else if (group.length + 1 + s.length <= targetMax) {
+      group = `${group} ${s}`;
+      groupEndOffset = nextOffset;
+    } else {
+      enqueue(group);
+      queued = plain.slice(0, base + groupEndOffset);
+      group = s;
+      groupEndOffset = nextOffset;
+    }
+    rest = trailing.trimStart();
   }
-  queued = plain.slice(0, plain.length - rest.length);
+
+  if (group) {
+    // Emit the final group immediately if:
+    // - flush is true (end of message), OR
+    // - it's the very first sentence of the reply (so audio starts with zero delay), OR
+    // - the group is already >= 110 chars (so it won't need to wait for another sentence).
+    if (flush || spoken.size === 0 || group.length >= 110) {
+      enqueue(group);
+      queued = plain.slice(0, base + groupEndOffset);
+    }
+  }
 }
 
 type VoiceUiCtx = {
@@ -720,6 +753,8 @@ export default function voiceboxSpeech(pi: {
 
   pi.on("turn_start", (_event, ctx) => {
     if (ctx) latestCtx = ctx;
+    queued = "";
+    spoken.clear();
   });
 
   // If any assistant speech occurs while Handy is recording in DICTATING, silence it immediately!
