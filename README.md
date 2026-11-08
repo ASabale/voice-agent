@@ -25,13 +25,13 @@ flowchart LR
 
 ## Layout on a machine
 
-These files are meant to be installed, not run from the clone:
+The clone is the only copy. [`./bin/install`](bin/install) symlinks it into place. First-time OMP, Handy, and VoiceBox steps are in [docs/setup.md](docs/setup.md).
 
 - `extension/voicebox-speech.ts` → `~/.omp/agent/extensions/voicebox-speech.ts`
 - `bin/omp-voice-controller` → `~/.local/bin/omp-voice-controller`
 - Python deps in `requirements.txt` → `~/.local/share/omp-voice/venv`
 
-Set `OMP_VOICEBOX_PROFILE` to the VoiceBox profile name. The profile id stays on the machine; this repo does not store it.
+The VoiceBox profile **name** goes in `~/.local/state/omp-voice/profile`, or in `OMP_VOICEBOX_PROFILE`. The profile id stays on the machine. This repo does not store it.
 
 Local-only state (`~/.local/state/omp-voice/`, Handy `history.db`, VoiceBox audio) is not part of this repository.
 

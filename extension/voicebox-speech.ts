@@ -15,7 +15,17 @@ import * as path from "node:path";
 const API = "http://127.0.0.1:17493";
 const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17494;
-const PROFILE = process.env.OMP_VOICEBOX_PROFILE ?? "";
+function profileName(): string {
+  const fromEnv = process.env.OMP_VOICEBOX_PROFILE?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return fs
+      .readFileSync(path.join(os.homedir(), ".local", "state", "omp-voice", "profile"), "utf8")
+      .trim();
+  } catch {
+    return "";
+  }
+}
 
 let playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
 let queued = "";
@@ -338,7 +348,7 @@ async function profileId(): Promise<string | undefined> {
   if (!Array.isArray(rows)) return undefined;
   for (const row of rows) {
     if (!row || typeof row !== "object" || !("name" in row) || !("id" in row)) continue;
-    if (row.name === PROFILE && typeof row.id === "string") {
+    if (row.name === profileName() && typeof row.id === "string") {
       cachedProfileId = row.id;
       return row.id;
     }
