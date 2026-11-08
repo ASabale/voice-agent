@@ -358,6 +358,41 @@ def handy_model_id() -> str:
         return ""
 
 
+def apply_voicebox_model(strata_running: bool) -> bool:
+    """0.6B while Strata is resident. 1.7B on the GPU when it is not."""
+    size = "0.6B" if strata_running else "1.7B"
+    drop = "qwen-tts-1.7B" if strata_running else "qwen-tts-0.6B"
+    marker = STATE_DIR / "tts-model"
+    loaded = ""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:17493/health", timeout=2) as res:
+            loaded = str(json.loads(res.read().decode()).get("model_size") or "")
+    except (OSError, ValueError, json.JSONDecodeError):
+        log("VoiceBox health unread; speech tier not changed")
+        return False
+    if loaded == size:
+        marker.write_text(size + "\n", encoding="utf-8")
+        return True
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(f"http://127.0.0.1:17493/models/{drop}/unload", method="POST"),
+            timeout=60,
+        )
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"http://127.0.0.1:17493/models/load?model_size={size}",
+                method="POST",
+            ),
+            timeout=180,
+        )
+    except (OSError, urllib.error.URLError) as exc:
+        log(f"VoiceBox model switch to {size} failed: {exc}")
+        return False
+    marker.write_text(size + "\n", encoding="utf-8")
+    log(f"VoiceBox model -> {size} ({'Strata loaded' if strata_running else 'Strata stopped'})")
+    return True
+
+
 def apply_handy_model(strata_running: bool) -> None:
     """1.7B by default. 0.6B only while Strata is resident."""
     global _handy_on_light
@@ -812,11 +847,13 @@ def run_daemon(
         cooldown_until = chunk_started_at + 0.25
         write_status(state, {"chunk_started_at": time.time(), "trigger": reason})
 
-    global _strata_loaded
+    global _strata_loaded, _handy_on_light
     _strata_loaded = strata_loaded()
     threading.Thread(target=_watch_strata, daemon=True).start()
     threading.Thread(target=watch_submitted_messages, daemon=True).start()
     apply_handy_model(_strata_loaded)
+    if not apply_voicebox_model(_strata_loaded):
+        _handy_on_light = not _strata_loaded
     write_status(state, {"wake_word": wake_word, "pause_seconds": pause_seconds})
     log(
         f"OMP Voice Controller ready in IDLE. Say 'Hey Jarvis' (or 'Jarvis') to start dictating; "
@@ -909,6 +946,8 @@ def run_daemon(
                     if state == "IDLE":
                         if _strata_loaded != _handy_on_light:
                             apply_handy_model(_strata_loaded)
+                            if not apply_voicebox_model(_strata_loaded):
+                                _handy_on_light = not _strata_loaded
                         if (now - last_manual_check) >= 1.0:
                             last_manual_check = now
                             manual_id, manual_txt = latest_history_row()

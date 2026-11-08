@@ -15,6 +15,18 @@ import * as path from "node:path";
 const API = "http://127.0.0.1:17493";
 const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17494;
+function ttsModelSize(): "0.6B" | "1.7B" {
+  try {
+    const raw = fs
+      .readFileSync(path.join(os.homedir(), ".local", "state", "omp-voice", "tts-model"), "utf8")
+      .trim();
+    if (raw === "0.6B" || raw === "1.7B") return raw;
+  } catch {
+    // controller writes this when Strata starts or stops
+  }
+  return "0.6B";
+}
+
 function profileName(): string {
   const fromEnv = process.env.OMP_VOICEBOX_PROFILE?.trim();
   if (fromEnv) return fromEnv;
@@ -383,7 +395,7 @@ async function generate(text: string, epoch: number): Promise<{ wav: string } | 
         text,
         language: "en",
         engine: "qwen",
-        model_size: "0.6B",
+        model_size: ttsModelSize(),
         personality: false,
         crossfade_ms: 25,
       }),
