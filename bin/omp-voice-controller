@@ -233,35 +233,64 @@ def handy_is_recording() -> bool:
     return False
 
 
-def handy_toggle() -> None:
-    subprocess.run(
-        [HANDY_BIN, "--toggle-transcription"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=3.0,
-        check=False,
-    )
+def handy_exec(flag: str, allow_launch: bool = False) -> bool:
+    """Send a flag to the running Handy app. Never launches the app unless allow_launch is set."""
+    if not allow_launch and not handy_process_running():
+        return False
+    try:
+        subprocess.run(
+            [HANDY_BIN, flag],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3.0,
+            check=False,
+        )
+        return True
+    except Exception:
+        return False
 
 
-def handy_start_recording() -> None:
-    handy_cancel()
+def handy_window_open() -> bool:
+    """False when the user has closed Handy's window. A failed probe is treated as still open."""
+    if not handy_process_running():
+        return False
+    try:
+        res = subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                'tell application "System Events" to tell process "handy" to count windows',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        return int((res.stdout or "0").strip() or "0") > 0
+    except Exception:
+        return True
+
+
+def handy_toggle(allow_launch: bool = False) -> bool:
+    return handy_exec("--toggle-transcription", allow_launch=allow_launch)
+
+
+def handy_start_recording(allow_launch: bool = False) -> bool:
+    if not handy_cancel(allow_launch=allow_launch):
+        return False
     time.sleep(0.08)
-    handy_toggle()
-    unmute_async()
+    started = handy_toggle(allow_launch=allow_launch)
+    if started:
+        unmute_async()
+    return started
 
 
-def handy_stop_recording() -> None:
-    handy_toggle()
+def handy_stop_recording() -> bool:
+    return handy_toggle(allow_launch=False)
 
 
-def handy_cancel() -> None:
-    subprocess.run(
-        [HANDY_BIN, "--cancel"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=3.0,
-        check=False,
-    )
+def handy_cancel(allow_launch: bool = False) -> bool:
+    return handy_exec("--cancel", allow_launch=allow_launch)
 
 
 def fallback_macos_inject(text: str, action: str) -> None:
@@ -485,6 +514,8 @@ def run_daemon(
     last_history_id, _ = latest_history_row()
     speech_seen_in_chunk = False
     chunk_started_at = 0.0
+    last_handy_ui_check = 0.0
+    handy_ui_gone = False
     last_speech_at = 0.0
     cooldown_until = 0.0
 
@@ -524,6 +555,7 @@ def run_daemon(
 
     def enter_dictating(reason: str) -> None:
         nonlocal state, speech_seen_in_chunk, chunk_started_at, last_speech_at, cooldown_until, last_history_id
+        nonlocal last_handy_ui_check, handy_ui_gone
         nonlocal idle_in_speech, idle_silence_frames, checked_fast_cmd
         log(f"Wake triggered ({reason}) -> entering DICTATING")
         oww.reset()
@@ -540,8 +572,10 @@ def run_daemon(
         # 2. Play Wake chime AND start Handy concurrently so any speech right after "Hey Jarvis" is never missed!
         play_cue(SOUND_WAKE, wait=False)
         last_history_id, _ = latest_history_row()
-        # 3. Start Handy recording
-        handy_start_recording()
+        # 3. Start Handy recording. This is the only path allowed to launch the app.
+        handy_start_recording(allow_launch=True)
+        handy_ui_gone = False
+        last_handy_ui_check = time.monotonic()
         state = "DICTATING"
         speech_seen_in_chunk = False
         chunk_started_at = time.monotonic()
@@ -690,7 +724,10 @@ def run_daemon(
                     elif state == "DICTATING":
                         # User quit Handy from the menu or with Cmd+Q. Do not toggle it back on, and do not
                         # let a failed Handy call tear down the microphone loop.
-                        if not handy_process_running():
+                        if (now - chunk_started_at) > 1.5 and (now - last_handy_ui_check) >= 1.0:
+                            last_handy_ui_check = now
+                            handy_ui_gone = not handy_process_running() or not handy_window_open()
+                        if handy_ui_gone:
                             log("Handy was closed during dictation -> returning to IDLE without restarting it")
                             state = "IDLE"
                             oww.reset()
@@ -771,8 +808,12 @@ def run_daemon(
                                 if should_flush:
                                     log(f"Pause of {silence_dur:.1f}s detected -> flushing chunk via Handy")
                                     prev_id = last_history_id
-                                    handy_stop_recording()
-                                    row = wait_for_new_history_row(prev_id, timeout_sec=2.2)
+                                    if not handy_stop_recording():
+                                        log("Handy is not running -> not launching it to flush")
+                                        action = "handy_stopped"
+                                        row = None
+                                    else:
+                                        row = wait_for_new_history_row(prev_id, timeout_sec=2.2)
                                     if row is not None:
                                         last_history_id, transcript = row
                                         log(f"Handy transcribed chunk #{last_history_id}: {transcript!r}")
