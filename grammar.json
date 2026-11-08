@@ -1,0 +1,48 @@
+{
+  "wake": [["hey", "jarvis"], ["ok", "jarvis"], ["hello", "jarvis"], ["jarvis"]],
+  "actions": [
+    {
+      "action": "sent",
+      "slots": [
+        ["send", "submit", "press", "ship", "prompt", "said", "sent", "friend"],
+        ["prompt", "that", "it", "message", "enter", "this"]
+      ]
+    },
+    {
+      "action": "paused",
+      "slots": [["stop"]]
+    },
+    {
+      "action": "paused",
+      "slots": [
+        ["stop", "pause"],
+        ["listening", "dictation", "it", "that", "talking", "speaking"]
+      ]
+    },
+    {
+      "action": "paused",
+      "slots": [["go"], ["to"], ["sleep"]]
+    },
+    {
+      "action": "scratched",
+      "slots": [
+        ["scratch", "undo", "delete", "erase", "remove"],
+        ["that", "last"]
+      ]
+    },
+    {
+      "action": "cleared",
+      "slots": [
+        ["clear", "scratch", "start"],
+        ["draft", "all", "text", "box", "over"]
+      ]
+    },
+    {
+      "action": "cancelled",
+      "slots": [
+        ["cancel", "discard"],
+        ["that", "dictation", "chunk"]
+      ]
+    }
+  ]
+}

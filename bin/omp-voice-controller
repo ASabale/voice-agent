@@ -421,19 +421,61 @@ def fallback_macos_inject(text: str, action: str) -> None:
         )
 
 
-_SEND_HOMOPHONE = re.compile(
-    r"(?:send\s+that|said\s+that|sent\s+that|friend\s+prompt)[\s.,!?]*$",
-    re.IGNORECASE,
-)
+_GRAMMAR: dict | None = None
+
+
+def command_grammar() -> dict:
+    """Phrase of N words: one word from each of N lists, in order. Wake is optional in front."""
+    global _GRAMMAR
+    if _GRAMMAR is None:
+        path = Path.home() / ".local" / "share" / "omp-voice" / "grammar.json"
+        _GRAMMAR = json.loads(path.read_text(encoding="utf-8"))
+        _GRAMMAR["wake"].sort(key=len, reverse=True)
+    return _GRAMMAR
+
+
+def _command_tokens(text: str) -> list[str]:
+    return [token for token in re.sub(r"[\s.,!?;:]+", " ", text.lower()).strip().split(" ") if token]
+
+
+def _slots_match(words: list[str], slots: list[list[str]]) -> bool:
+    return len(words) == len(slots) and all(word in choices for word, choices in zip(words, slots))
+
+
+def match_command(raw: str) -> dict | None:
+    """Longest suffix that is an optional wake plus one word from each slot."""
+    grammar = command_grammar()
+    tokens = _command_tokens(raw)
+    best: dict | None = None
+    for start in range(len(tokens)):
+        span = tokens[start:]
+        for wake in [[], *grammar["wake"]]:
+            if wake and span[: len(wake)] != wake:
+                continue
+            rest = span[len(wake) :]
+            for group in grammar["actions"]:
+                if not _slots_match(rest, group["slots"]):
+                    continue
+                if best is None or len(span) > best["span"]:
+                    best = {
+                        "span": len(span),
+                        "action": group["action"],
+                        "stem": [rest[0]],
+                        "prefix": " ".join(tokens[:start]),
+                        "phrase": " ".join(span),
+                    }
+    if best is None:
+        return None
+    best.pop("span")
+    return best
 
 
 def canonicalize_transcript(text: str) -> str:
-    """Map misheard send phrases onto the phrase the bridge already submits."""
-    cleaned = " ".join(text.strip().split())
-    match = _SEND_HOMOPHONE.search(cleaned)
-    if not match:
+    """Map a send-family suffix onto the phrase an older bridge already submits."""
+    matched = match_command(text)
+    if not matched or matched["action"] != "sent":
         return text
-    prefix = cleaned[: match.start()].rstrip(" ,.;:-")
+    prefix = matched["prefix"]
     return f"{prefix} send prompt".strip() if prefix else "send prompt"
 
 
@@ -544,36 +586,10 @@ def dispatch_transcript(text: str) -> dict:
             # Handy's Cmd+V already pasted `text` into the focused OMP editor if `draft` ends with `text`.
             current_draft = str(status.get("draft", ""))
             already_pasted = current_draft.rstrip().endswith(text.strip()) or current_draft.rstrip().endswith(cleaned)
-            lower = cleaned.lower().rstrip(" .,!?;:")
-            is_cmd = any(
-                lower == p or lower.endswith(" " + p)
-                for p in (
-                    "send prompt",
-                    "submit prompt",
-                    "send message",
-                    "send that",
-                    "send it",
-                    "press enter",
-                    "ship it",
-                    "hey jarvis send",
-                    "jarvis send",
-                    "pause listening",
-                    "stop listening",
-                    "go to sleep",
-                    "hey jarvis stop",
-                    "jarvis stop",
-                    "stop dictation",
-                    "stop",
-                    "cancel that",
-                    "discard chunk",
-                    "cancel dictation",
-                    "hey jarvis cancel",
-                    "jarvis cancel",
-                )
-            )
-            if already_pasted and not is_cmd:
+            matched = match_command(cleaned)
+            if already_pasted and not matched:
                 return {"action": "appended", "draft": current_draft}
-            if already_pasted and is_cmd:
+            if already_pasted and matched:
                 n_del = len(text)
                 subprocess.run(
                     [
@@ -586,47 +602,29 @@ def dispatch_transcript(text: str) -> dict:
                     check=False,
                 )
                 time.sleep(0.08)
-            if lower in ("hey jarvis stop", "jarvis stop", "stop dictation", "stop") or any(
-                lower.endswith(" " + p) for p in ("hey jarvis stop", "jarvis stop", "stop dictation")
-            ):
-                # Map to "pause listening" so even v1 bridge recognizes it
-                for p in ("hey jarvis stop", "jarvis stop", "stop dictation", "stop"):
-                    if lower == p or lower.endswith(" " + p):
-                        prefix = cleaned[: len(cleaned) - len(p)].rstrip(" ,.;:-")
-                        mapped = f"{prefix} pause listening".strip()
-                        resp = bridge_request("/transcript", method="POST", body={"text": mapped})
-                        if resp and resp.get("ok"):
-                            return resp
-            if lower in ("hey jarvis send", "jarvis send", "send that") or any(
-                lower.endswith(" " + p) for p in ("hey jarvis send", "jarvis send", "send that")
-            ):
-                for p in ("hey jarvis send", "jarvis send", "send that"):
-                    if lower == p or lower.endswith(" " + p):
-                        prefix = cleaned[: len(cleaned) - len(p)].rstrip(" ,.;:-")
-                        mapped = f"{prefix} send prompt".strip()
-                        resp = bridge_request("/transcript", method="POST", body={"text": mapped})
-                        if resp and resp.get("ok"):
-                            return resp
+            if matched and matched["action"] == "paused":
+                mapped = f"{matched['prefix']} pause listening".strip()
+                resp = bridge_request("/transcript", method="POST", body={"text": mapped})
+                if resp and resp.get("ok"):
+                    return resp
+            if matched and matched["action"] == "sent":
+                mapped = f"{matched['prefix']} send prompt".strip()
+                resp = bridge_request("/transcript", method="POST", body={"text": mapped})
+                if resp and resp.get("ok"):
+                    return resp
             resp = bridge_request("/transcript", method="POST", body={"text": text})
             if resp and resp.get("ok"):
                 return resp
 
-    lower = cleaned.lower().rstrip(" .,!?;:")
-    for phrase in ("cancel that", "discard chunk", "cancel dictation"):
-        if lower == phrase or lower.endswith(" " + phrase):
-            return {"action": "cancelled", "strippedCommand": phrase}
-
-    for phrase in ("pause listening", "stop listening", "go to sleep"):
-        if lower == phrase or lower.endswith(" " + phrase):
-            prefix = cleaned[: len(cleaned) - len(phrase)].rstrip(" ,.;:-")
-            fallback_macos_inject(prefix + (" " if prefix else ""), "paused")
-            return {"action": "paused", "strippedCommand": phrase}
-
-    for phrase in ("send prompt", "submit prompt", "send message", "send it", "press enter", "ship it"):
-        if lower == phrase or lower.endswith(" " + phrase):
-            prefix = cleaned[: len(cleaned) - len(phrase)].rstrip(" ,.;:-")
-            fallback_macos_inject(prefix, "sent")
-            return {"action": "sent", "strippedCommand": phrase}
+    matched = match_command(cleaned)
+    if matched and matched["action"] == "cancelled":
+        return {"action": "cancelled", "strippedCommand": matched["phrase"]}
+    if matched and matched["action"] == "paused":
+        fallback_macos_inject(matched["prefix"] + (" " if matched["prefix"] else ""), "paused")
+        return {"action": "paused", "strippedCommand": matched["phrase"]}
+    if matched and matched["action"] == "sent":
+        fallback_macos_inject(matched["prefix"], "sent")
+        return {"action": "sent", "strippedCommand": matched["phrase"]}
 
     fallback_macos_inject(cleaned + " ", "appended")
     return {"action": "appended", "draft": cleaned}
@@ -670,20 +668,12 @@ def tts_wake_threshold(on_headphones: bool) -> float:
     return 0.35
 
 
-WAKE_RE = re.compile(r"\b(hey\s+jarvis|jarvis|ok\s+jarvis|hello\s+jarvis)\b", re.IGNORECASE)
-BARGE_IN_RE = re.compile(r"\b(hey\s+jarvis|jarvis\s+stop|stop\s+talking|stop\s+speaking)\b", re.IGNORECASE)
-SEND_IDLE_RE = re.compile(
-    r"^\s*(send\s+prompt|submit\s+prompt|send\s+message|send\s+that|said\s+that|sent\s+that|friend\s+prompt|send\s+it|press\s+enter|ship\s+it)[\s.,!?]*$",
-    re.IGNORECASE,
-)
-SCRATCH_IDLE_RE = re.compile(
-    r"^\s*(scratch\s+that|scratch\s+last|undo\s+that|delete\s+that|erase\s+that|remove\s+last|clear\s+draft|clear\s+all|clear\s+text|clear\s+box|scratch\s+all|start\s+over)[\s.,!?]*$",
-    re.IGNORECASE,
-)
-FAST_CMD_RE = re.compile(
-    r"(send\s+prompt|submit\s+prompt|send\s+message|send\s+that|said\s+that|sent\s+that|friend\s+prompt|send\s+it|press\s+enter|ship\s+it|hey\s+jarvis\s+send|jarvis\s+send|pause\s+listening|stop\s+listening|hey\s+jarvis\s+stop|jarvis\s+stop|stop\s+dictation|cancel\s+that|discard\s+chunk|scratch\s+that|scratch\s+last|undo\s+that|delete\s+that|erase\s+that|remove\s+last|clear\s+draft|clear\s+all|clear\s+text|clear\s+box|scratch\s+all|start\s+over)[\s.,!?]*$",
-    re.IGNORECASE,
-)
+def idle_command(heard: str) -> dict | None:
+    """A command said alone, with no words before it."""
+    matched = match_command(heard)
+    if matched and not matched["prefix"]:
+        return matched
+    return None
 
 
 def run_daemon(
@@ -764,15 +754,17 @@ def run_daemon(
                 language="en",
                 beam_size=1,
                 without_timestamps=True,
-                initial_prompt="send prompt, send that, submit prompt, scratch that, undo that, clear draft, pause listening.",
+                initial_prompt="send prompt, prompt this, send that, submit prompt, scratch that, undo that, clear draft, pause listening.",
             )
             return " ".join(s.text for s in segments).strip()
         except Exception:
             return ""
 
     def stop_playback(reason: str) -> None:
+        # Kill the clip and the turn. Stopping only afplay leaves the agent
+        # streaming, and the next sentence starts the loop again.
         log(reason)
-        silence_speech(False)
+        silence_speech(True)
 
     def enter_dictating(reason: str) -> None:
         nonlocal state, speech_seen_in_chunk, chunk_started_at, last_speech_at, cooldown_until, last_history_id
@@ -997,7 +989,9 @@ def run_daemon(
                                             tts_rms_floor.clear()
                                             enter_dictating(f"barge-in whisper heard {heard!r}")
                                             continue
-                                        if re.fullmatch(r"stop(?:\s+(?:it|that|talking|speaking))?[\s.,!?]*", heard, re.IGNORECASE):
+                                        # "stop" and its tails come from the shared grammar, including a wake prefix.
+                                        heard_cmd = match_command(heard)
+                                        if heard_cmd and heard_cmd["action"] == "paused" and heard_cmd["stem"] == ["stop"]:
                                             stop_playback(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy")
                                             tts_loud_run = 0
                                             tts_rms_floor.clear()
@@ -1055,19 +1049,20 @@ def run_daemon(
                                             language="en",
                                             beam_size=1,
                                             without_timestamps=True,
-                                            initial_prompt="Hey Jarvis, Jarvis, send prompt, submit prompt, scratch that, undo that, clear draft.",
+                                            initial_prompt="Hey Jarvis, Jarvis, send prompt, prompt this, submit prompt, scratch that, undo that, clear draft.",
                                         )
                                         heard = " ".join(s.text for s in segments).strip()
                                         if re.fullmatch(r"(?:hey[\s,]+jarvis|ok[\s,]+jarvis|hello[\s,]+jarvis|jarvis)[\s.,!?]*", heard, re.IGNORECASE):
                                             enter_dictating(f"whisper heard {heard!r}")
                                             continue
-                                        if SEND_IDLE_RE.match(heard):
+                                        idle_cmd = idle_command(heard)
+                                        if idle_cmd and idle_cmd["action"] == "sent":
                                             log(f"Standalone send phrase in IDLE ({heard!r}) -> submitting draft")
                                             outcome = dispatch_transcript("send prompt")
                                             if outcome.get("action") == "sent":
                                                 play_cue(SOUND_SEND, wait=False)
                                             cooldown_until = time.monotonic() + 0.6
-                                        elif SCRATCH_IDLE_RE.match(heard):
+                                        elif idle_cmd and idle_cmd["action"] in ("scratched", "cleared"):
                                             log(f"Standalone scratch/clear phrase in IDLE ({heard!r}) -> scratching draft")
                                             outcome = dispatch_transcript(heard)
                                             play_cue(SOUND_CANCEL, wait=False)
@@ -1155,10 +1150,10 @@ def run_daemon(
                                         language="en",
                                         beam_size=1,
                                         without_timestamps=True,
-                                        initial_prompt="send prompt, submit prompt, pause listening, cancel that, scratch that, undo that, clear draft.",
+                                        initial_prompt="send prompt, prompt this, submit prompt, pause listening, cancel that, scratch that, undo that, clear draft.",
                                     )
                                     tail_heard = " ".join(s.text for s in segments).strip()
-                                    if FAST_CMD_RE.search(tail_heard):
+                                    if match_command(tail_heard):
                                         log(f"Fast command phrase detected after {silence_dur:.1f}s silence ({tail_heard!r}) -> flushing now")
                                         should_flush = True
 
