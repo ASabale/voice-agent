@@ -346,14 +346,34 @@ async function profileId(): Promise<string | undefined> {
   return undefined;
 }
 
+function logSpeech(event: string, text: string, extra: Record<string, unknown> = {}): void {
+  try {
+    const dir = path.join(os.homedir(), ".local", "state", "omp-voice");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, "speech.log"),
+      `${JSON.stringify({ t: new Date().toISOString(), event, chars: text.length, text, ...extra })}\n`,
+    );
+  } catch {
+    // ignore
+  }
+}
+
 async function generate(text: string, epoch: number): Promise<{ wav: string } | undefined> {
-  if (epoch !== speechEpoch) return undefined;
+  if (epoch !== speechEpoch) {
+    logSpeech("dropped", text, { reason: "epoch" });
+    return undefined;
+  }
   const controller = new AbortController();
   activeAbort = controller;
   const timer = setTimeout(() => controller.abort(), 90000);
   try {
     const id = await profileId();
-    if (!id || epoch !== speechEpoch) return undefined;
+    if (!id || epoch !== speechEpoch) {
+      logSpeech("dropped", text, { reason: id ? "epoch" : "profile" });
+      return undefined;
+    }
+    logSpeech("requested", text);
     // Use /generate/stream directly to eliminate 200ms polling latency + SQLite history churn
     const res = await fetch(`${API}/generate/stream`, {
       method: "POST",
@@ -369,13 +389,21 @@ async function generate(text: string, epoch: number): Promise<{ wav: string } | 
       }),
       signal: controller.signal,
     });
-    if (!res.ok) return undefined;
+    if (!res.ok) {
+      logSpeech("failed", text, { reason: "http", status: res.status });
+      return undefined;
+    }
     const arrayBuf = await res.arrayBuffer();
-    if (epoch !== speechEpoch || arrayBuf.byteLength < 100) return undefined;
+    if (epoch !== speechEpoch || arrayBuf.byteLength < 100) {
+      logSpeech("failed", text, { reason: epoch !== speechEpoch ? "epoch" : "short-audio", bytes: arrayBuf.byteLength });
+      return undefined;
+    }
     const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${++clipSeq}.wav`);
     fs.writeFileSync(wavPath, Buffer.from(arrayBuf));
+    logSpeech("generated", text, { bytes: arrayBuf.byteLength, wav: path.basename(wavPath) });
     return { wav: wavPath };
-  } catch {
+  } catch (err) {
+    logSpeech("failed", text, { reason: String(err) });
     return undefined;
   } finally {
     clearTimeout(timer);

@@ -213,6 +213,26 @@ def unmute_async() -> None:
         pass
 
 
+def handy_process_running() -> bool:
+    """True when the Handy app process exists. A failed probe is treated as running so we do not relaunch it."""
+    try:
+        res = subprocess.run(
+            ["/usr/bin/pgrep", "-x", "handy"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=1.0,
+        )
+        return res.returncode == 0
+    except Exception:
+        return True
+
+
+def handy_is_recording() -> bool:
+    """Manual fn barge-in has no recording flag from Handy. Never raise; a missing function used to kill the mic loop."""
+    return False
+
+
 def handy_toggle() -> None:
     subprocess.run(
         [HANDY_BIN, "--toggle-transcription"],
@@ -668,6 +688,20 @@ def run_daemon(
                                             cooldown_until = time.monotonic() + 0.6
 
                     elif state == "DICTATING":
+                        # User quit Handy from the menu or with Cmd+Q. Do not toggle it back on, and do not
+                        # let a failed Handy call tear down the microphone loop.
+                        if not handy_process_running():
+                            log("Handy was closed during dictation -> returning to IDLE without restarting it")
+                            state = "IDLE"
+                            oww.reset()
+                            vad.reset_states()
+                            dict_speech_frames.clear()
+                            dict_tail_frames.clear()
+                            speech_seen_in_chunk = False
+                            cooldown_until = time.monotonic() + 0.6
+                            write_status(state, {"last_action": "handy_closed"})
+                            play_cue(SOUND_PAUSE, wait=False)
+                            continue
                         # If the user manually pressed `fn` and Handy already finished a new row while we were waiting,
                         # consume and dispatch it immediately so we never re-toggle Handy out of sync!
                         live_id, live_txt = latest_history_row()
