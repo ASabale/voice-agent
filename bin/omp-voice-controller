@@ -672,7 +672,7 @@ def run_daemon(
                                             initial_prompt="Hey Jarvis, Jarvis, send prompt, submit prompt, scratch that, undo that, clear draft.",
                                         )
                                         heard = " ".join(s.text for s in segments).strip()
-                                        if WAKE_RE.search(heard):
+                                        if re.fullmatch(r"(?:hey[\s,]+jarvis|ok[\s,]+jarvis|hello[\s,]+jarvis|jarvis)[\s.,!?]*", heard, re.IGNORECASE):
                                             enter_dictating(f"whisper heard {heard!r}")
                                             continue
                                         if SEND_IDLE_RE.match(heard):
@@ -782,17 +782,15 @@ def run_daemon(
                                         action = outcome.get("action", "appended")
                                         log(f"Transcript outcome: {action}")
                                     else:
-                                        # Fallback: if Escape or manual key cancelled Handy's recording before stop,
-                                        # transcribe our own buffered PCM via faster-whisper so the user's speech is NEVER lost!
+                                        # Handy was closed or its recording was cancelled. Keep any words we already
+                                        # buffered, then go idle. Do not toggle Handy back on.
                                         fallback_txt = transcribe_local_fallback(dict_speech_frames)
                                         if fallback_txt:
-                                            log(f"Handy row missing (cancelled externally); recovered via local Whisper: {fallback_txt!r}")
-                                            outcome = dispatch_transcript(fallback_txt)
-                                            action = outcome.get("action", "appended")
-                                            log(f"Recovered transcript outcome: {action}")
+                                            log(f"Handy row missing (stopped externally); kept local transcript: {fallback_txt!r}")
+                                            dispatch_transcript(fallback_txt)
                                         else:
-                                            log("No new transcript row from Handy (empty/silence)")
-                                            action = "noop"
+                                            log("Handy row missing (stopped externally); nothing to keep")
+                                        action = "handy_stopped"
 
                                     dict_speech_frames.clear()
                                     if action == "sent":
@@ -827,15 +825,15 @@ def run_daemon(
                                         cooldown_until = chunk_started_at + 0.25
                                         write_status(state, {"last_action": action})
                                         log(f"Draft {action} -> continuing DICTATING for replacement chunk...")
-                                    elif action == "cancelled":
-                                        play_cue(SOUND_CANCEL, wait=False)
+                                    elif action in ("cancelled", "handy_stopped"):
+                                        play_cue(SOUND_PAUSE if action == "handy_stopped" else SOUND_CANCEL, wait=False)
                                         state = "IDLE"
                                         oww.reset()
                                         vad.reset_states()
                                         dict_tail_frames.clear()
                                         cooldown_until = time.monotonic() + 0.6
-                                        write_status(state, {"last_action": "cancelled"})
-                                        log("Cancelled chunk -> returned to IDLE")
+                                        write_status(state, {"last_action": action})
+                                        log("Handy stopped -> returned to IDLE without restarting it")
                                     else:
                                         play_cue(SOUND_CHUNK_TICK, wait=False)
                                         last_history_id, _ = latest_history_row()
