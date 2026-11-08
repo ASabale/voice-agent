@@ -33,6 +33,10 @@ const spoken = new Set<string>();
 let genTail: Promise<void> = Promise.resolve();
 let playTail: Promise<void> = Promise.resolve();
 let speechEpoch = 0;
+let lastPlain = "";
+// Set on barge-in to the reply that was playing. Later deltas of that same
+// reply must not be spoken after Handy closes. A different reply clears it.
+let droppedPlain: string | null = null;
 let clipSeq = 0;
 let activeAfplay: ChildProcess | null = null;
 let activeAbort: AbortController | null = null;
@@ -52,6 +56,9 @@ const SEND_PHRASES = [
   "submit prompt",
   "send message",
   "send that",
+  "said that",
+  "sent that",
+  "friend prompt",
   "send it",
   "press enter",
   "ship it",
@@ -212,11 +219,17 @@ export function parseVoiceTranscript(
   };
 }
 
+export function continuesDroppedReply(dropped: string | null, plain: string): boolean {
+  if (dropped === null || dropped.length === 0) return false;
+  return plain.startsWith(dropped) || dropped.startsWith(plain);
+}
+
 export function bargeIn(): boolean {
   const wasSpeaking = isSpeaking || activeAfplay !== null || activeAbort !== null;
   speechEpoch++;
   queued = "";
   spoken.clear();
+  droppedPlain = lastPlain.length > 0 ? lastPlain : null;
   genTail = Promise.resolve();
   playTail = Promise.resolve();
   if (activeAbort) {
@@ -300,6 +313,7 @@ export function forSpeech(raw: string): string {
     .replace(/\bhey[\s,]+jarvis\b/gi, "the wake phrase")
     .replace(/\bjarvis\b/gi, "the wake word")
     .replace(/\bsend[\s,]+(prompt|that|it|message)\b/gi, "the send phrase")
+    .replace(/\bstop(?:[\s,]+(?:it|that|talking|speaking|listening|dictation))?\b/gi, "the pause command")
     .replace(/\b(scratch|undo|delete|erase)[\s,]+(that|last|all)\b/gi, "the undo phrase")
     .replace(/\bclear[\s,]+(draft|all|text|box)\b/gi, "the clear phrase")
     .replace(/[*_~>|]/g, " ")
@@ -435,7 +449,30 @@ async function play(clip: { wav: string }, epoch: number): Promise<void> {
   const args = playbackRate !== 1.0
     ? ["-r", String(playbackRate), "-q", "1", clip.wav]
     : [clip.wav];
+  if (epoch !== speechEpoch) {
+    isSpeaking = false;
+    try {
+      fs.unlinkSync(clip.wav);
+    } catch {
+      // ignore
+    }
+    return;
+  }
   const child = spawn("afplay", args, { stdio: "ignore" });
+  if (epoch !== speechEpoch) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+    isSpeaking = false;
+    try {
+      fs.unlinkSync(clip.wav);
+    } catch {
+      // ignore
+    }
+    return;
+  }
   activeAfplay = child;
   const statePath = path.join(os.homedir(), ".local", "state", "omp-voice", "tts-playing.json");
   try {
@@ -514,6 +551,8 @@ function push(message: unknown, flush: boolean): void {
   }
   const plain = forSpeech(raw);
   if (!plain) return;
+  if (continuesDroppedReply(droppedPlain, plain)) return;
+  lastPlain = plain;
   if (queued && !plain.startsWith(queued)) {
     // Only reset if this is genuinely a brand-new message turn (where none of its sentences were spoken yet)
     const allSentences = takeSentences(plain, true);
@@ -791,8 +830,9 @@ export default function voiceboxSpeech(pi: {
 
   pi.on("turn_start", (_event, ctx) => {
     if (ctx) latestCtx = ctx;
-    queued = "";
-    spoken.clear();
+    // A new user message must cut the reply already playing. Clearing `spoken`
+    // alone made the rest of that reply look new, so it was spoken again.
+    bargeIn();
   });
 
   // If any assistant speech occurs while Handy is recording in DICTATING, silence it immediately!
