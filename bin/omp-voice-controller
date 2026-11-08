@@ -79,6 +79,9 @@ LOG_FILE = STATE_DIR / "controller.log"
 TTS_STATE_FILE = STATE_DIR / "tts-playing.json"
 
 _coreaudio = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+_coregraphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+_coregraphics.CGEventSourceFlagsState.argtypes = [ctypes.c_uint32]
+_coregraphics.CGEventSourceFlagsState.restype = ctypes.c_uint64
 
 
 class _AudioObjectPropertyAddress(ctypes.Structure):
@@ -556,9 +559,19 @@ def watch_submitted_messages() -> None:
         time.sleep(0.4)
 
 
+def fn_held() -> bool:
+    """True while the Globe/fn key is down. Handy uses that key as push-to-talk."""
+    try:
+        flags = _coregraphics.CGEventSourceFlagsState(1)
+    except Exception:
+        return False
+    return bool(int(flags) & 0x00800000)
+
+
 def silence_speech(abort_agent: bool) -> None:
-    bridge_request("/barge-in", method="POST", body={"abortAgent": abort_agent})
+    # Kill the speakers before the bridge round-trip. Otherwise Handy records the reply.
     kill_tts_clips()
+    bridge_request("/barge-in", method="POST", body={"abortAgent": abort_agent})
 
     def keep_killing() -> None:
         for _ in range(8):
@@ -721,6 +734,9 @@ def run_daemon(
     last_manual_check = 0.0
     barge_mute = False
     tts_active = False
+    fn_was_down = fn_held()
+    fn_ignore_through = 0
+    fn_cut_busy = False
     # Rolling speaker-bleed floor while VoiceBox plays. A person talking over the laptop
     # speakers sits well above that floor; a wake-word hit on the TTS audio does not.
     tts_rms_floor: deque[float] = deque(maxlen=25)  # ~2.0s
@@ -896,7 +912,10 @@ def run_daemon(
                         if (now - last_manual_check) >= 1.0:
                             last_manual_check = now
                             manual_id, manual_txt = latest_history_row()
-                            if manual_id > last_history_id and manual_txt.strip():
+                            if manual_id > last_history_id and manual_id <= fn_ignore_through:
+                                last_history_id = manual_id
+                                log(f"Dropped Handy transcription #{manual_id} recorded over playback")
+                            elif manual_id > last_history_id and manual_txt.strip():
                                 last_history_id = manual_id
                                 log(f"Manual Handy transcription #{manual_id}: {manual_txt!r}")
                                 manual_outcome = dispatch_transcript(manual_txt)
@@ -909,12 +928,38 @@ def run_daemon(
                         if (now - last_tts_check) >= 0.24:
                             last_tts_check = now
                             tts_active = is_voicebox_speaking()
-                            # If the user manually pressed `fn` (starting Handy recording) while VoiceBox is speaking,
-                            # immediately kill VoiceBox playback and abort the OMP turn!
-                            if tts_active and handy_is_recording():
-                                log("Detected manual `fn` press during VoiceBox playback -> triggering Barge-In!")
+                        # Handy starts recording on fn. That used to keep the reply that was
+                        # still coming out of the speakers. Cut the speakers on the key edge,
+                        # throw away that take, and record again only if fn is still held.
+                        fn_down = fn_held()
+                        if fn_down and not fn_was_down and not fn_cut_busy and (tts_active or is_voicebox_speaking()):
+                            fn_cut_busy = True
+                            tts_active = False
+                            kill_tts_clips()
+                            log("fn held during playback -> stopping speech before Handy keeps it")
+
+                            def cut_playback_then_listen() -> None:
+                                nonlocal fn_ignore_through, fn_cut_busy
                                 silence_speech(True)
-                                tts_active = False
+                                handy_cancel(allow_launch=False)
+                                deadline = time.monotonic() + 1.5
+                                while time.monotonic() < deadline and is_voicebox_speaking():
+                                    kill_tts_clips()
+                                    time.sleep(0.05)
+                                absorb_until = time.monotonic() + 0.45
+                                while time.monotonic() < absorb_until:
+                                    row_id, _ = latest_history_row()
+                                    fn_ignore_through = max(fn_ignore_through, row_id)
+                                    time.sleep(0.05)
+                                if fn_held():
+                                    handy_start_recording(allow_launch=False)
+                                    log("fn barge-in: speakers stopped, recording restarted without the reply")
+                                else:
+                                    log("fn barge-in: speakers stopped")
+                                fn_cut_busy = False
+
+                            threading.Thread(target=cut_playback_then_listen, daemon=True).start()
+                        fn_was_down = fn_down
 
                         # While VoiceBox is playing, only two phrases interrupt.
                         # "Hey Jarvis" stops playback and opens Handy.
