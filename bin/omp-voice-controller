@@ -676,8 +676,8 @@ def run_daemon(
                                 tts_active = False
 
                         # While VoiceBox is playing, ignore ordinary speech. A clear "Hey Jarvis"
-                        # at score 0.50 still interrupts. A louder voice than the speaker can too.
-                        # Whisper stays off so speaker audio cannot open Handy by itself.
+                        # at score 0.50 stops playback and opens Handy. A loud noise only stops
+                        # playback. Whisper stays off so speaker audio cannot open Handy.
                         if tts_active:
                             idle_pre_roll.clear()
                             idle_speech_frames.clear()
@@ -699,7 +699,15 @@ def run_daemon(
                             if tts_loud_run >= 6:
                                 tts_loud_run = 0
                                 tts_rms_floor.clear()
-                                enter_dictating(f"barge-in over TTS rms={rms:.0f} floor={floor:.0f}")
+                                log(f"Loud sound over TTS (rms={rms:.0f} floor={floor:.0f}) -> stopping speech, not opening Handy")
+                                bridge_request("/barge-in", method="POST", body={})
+                                subprocess.run(
+                                    ["/usr/bin/killall", "afplay"],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    check=False,
+                                )
+                                tts_active = False
                             continue
                         tts_loud_run = 0
                         tts_rms_floor.clear()
