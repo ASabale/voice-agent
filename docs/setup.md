@@ -40,6 +40,8 @@ That writes the name to `~/.local/state/omp-voice/profile`, installs Python pack
 - `bin/omp-voice-controller` → `~/.local/bin/omp-voice-controller`
 - `bin/omp-handy-hook` → `~/.local/bin/omp-handy-hook`
 - `extension/voicebox-speech.ts` → `~/.omp/agent/extensions/voicebox-speech.ts`
+- `grammar.json` → `~/.local/share/omp-voice/grammar.json`
+- `skills/conversational-collaboration` → `~/.omp/agent/managed-skills/conversational-collaboration`
 
 `OMP_VOICEBOX_PROFILE` overrides the profile file when it is set.
 

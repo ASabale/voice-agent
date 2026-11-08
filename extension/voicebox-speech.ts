@@ -30,6 +30,7 @@ function profileName(): string {
 let playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
 let queued = "";
 const spoken = new Set<string>();
+let spokenText = "";
 let genTail: Promise<void> = Promise.resolve();
 let playTail: Promise<void> = Promise.resolve();
 let speechEpoch = 0;
@@ -51,63 +52,58 @@ export type TranscriptAction =
   | { action: "appended"; draft: string }
   | { action: "noop"; draft: string };
 
-const SEND_PHRASES = [
-  "send prompt",
-  "submit prompt",
-  "send message",
-  "send that",
-  "said that",
-  "sent that",
-  "friend prompt",
-  "send it",
-  "press enter",
-  "ship it",
-  "hey jarvis send",
-  "jarvis send",
-];
+type GrammarAction = {
+  action: "sent" | "paused" | "cancelled" | "scratched" | "cleared";
+  slots: string[][];
+};
+type CommandGrammar = { wake: string[][]; actions: GrammarAction[] };
 
-const PAUSE_PHRASES = [
-  "pause listening",
-  "stop listening",
-  "go to sleep",
-  "hey jarvis stop",
-  "jarvis stop",
-  "stop dictation",
-  "stop",
-];
+let commandGrammar: CommandGrammar | null = null;
 
-const SCRATCH_PHRASES = [
-  "scratch that",
-  "scratch last",
-  "undo that",
-  "delete that",
-  "erase that",
-  "remove last",
-  "hey jarvis scratch",
-  "jarvis scratch",
-];
+function loadCommandGrammar(): CommandGrammar {
+  if (commandGrammar) return commandGrammar;
+  const grammarPath = path.join(os.homedir(), ".local", "share", "omp-voice", "grammar.json");
+  commandGrammar = JSON.parse(fs.readFileSync(grammarPath, "utf8")) as CommandGrammar;
+  commandGrammar.wake.sort((a, b) => b.length - a.length);
+  return commandGrammar;
+}
 
-const CLEAR_PHRASES = [
-  "clear draft",
-  "clear all",
-  "clear text",
-  "clear box",
-  "scratch all",
-  "start over",
-  "hey jarvis clear",
-  "jarvis clear",
-];
+export type CommandMatch = { action: GrammarAction["action"]; prefix: string; phrase: string };
 
-const CANCEL_PHRASES = [
-  "cancel that",
-  "discard chunk",
-  "cancel dictation",
-  "hey jarvis cancel",
-  "jarvis cancel",
-];
+function sameTokens(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((token, i) => token === b[i]);
+}
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function slotsMatch(words: string[], slots: string[][]): boolean {
+  return words.length === slots.length && slots.every((choices, i) => choices.includes(words[i] ?? ""));
+}
+
+/** Longest suffix that is an optional wake plus one word from each slot, in order. */
+export function matchCommand(raw: string): CommandMatch | null {
+  const grammar = loadCommandGrammar();
+  const tokens = raw
+    .toLowerCase()
+    .replace(/[\s.,!?;:]+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+  let best: { span: number; action: GrammarAction["action"]; content: string[] } | null = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const span = tokens.slice(i);
+    for (const wake of [[] as string[], ...grammar.wake]) {
+      if (wake.length > 0 && !sameTokens(span.slice(0, wake.length), wake)) continue;
+      const rest = span.slice(wake.length);
+      for (const group of grammar.actions) {
+        if (!slotsMatch(rest, group.slots)) continue;
+        if (best === null || span.length > best.span) {
+          best = { span: span.length, action: group.action, content: tokens.slice(0, i) };
+        }
+      }
+    }
+  }
+  if (!best) return null;
+  const phraseTokens = tokens.slice(tokens.length - best.span);
+  return { action: best.action, prefix: best.content.join(" "), phrase: phraseTokens.join(" ") };
 }
 
 export function deduplicateHandyPaste(currentEditorText: string, rawTranscript: string): string {
@@ -134,76 +130,49 @@ export function parseVoiceTranscript(
     };
   }
 
-  const matchTrailingPhrase = (phrases: string[]): { prefix: string; phrase: string } | null => {
-    for (const phrase of phrases) {
-      const re = new RegExp(`^(.*?)(?:[\\s,.;:!?-]+|^)(${escapeRegex(phrase)})[\\s,.;:!?]*$`, "i");
-      const m = cleaned.match(re);
-      if (m) {
-        const prefix = (m[1] ?? "").replace(/[\s,.;:-]+$/, "").trim();
-        return { prefix, phrase: m[2] ?? phrase };
-      }
-    }
-    return null;
-  };
-
-  // 0. Check Clear All Phrase ("clear draft", "clear all", "start over")
-  const clearMatch = matchTrailingPhrase(CLEAR_PHRASES);
-  if (clearMatch) {
+  const command = matchCommand(cleaned);
+  if (command?.action === "cleared") {
     return {
-      result: { action: "cleared", draft: "", strippedCommand: clearMatch.phrase },
+      result: { action: "cleared", draft: "", strippedCommand: command.phrase },
       nextEditorText: "",
     };
   }
-
-  // 1. Check Scratch / Undo Phrase ("scratch that", "undo that", "delete that")
-  //    - If the user spoke words in this chunk before "... scratch that", discard this chunk (stays at baseDraft).
-  //    - If the user just said "scratch that" (no prefix), also pop the previously pasted chunk from the screen!
-  const scratchMatch = matchTrailingPhrase(SCRATCH_PHRASES);
-  if (scratchMatch) {
-    const revertedDraft = scratchMatch.prefix
+  if (command?.action === "scratched") {
+    const revertedDraft = command.prefix
       ? baseDraft
       : previousDraft !== undefined
         ? previousDraft
         : baseDraft.replace(/(?:^|\s+)\S+[^.!?\n]*[.!?]*\s*$/, "").trimEnd();
     return {
-      result: { action: "scratched", draft: revertedDraft, strippedCommand: scratchMatch.phrase },
+      result: { action: "scratched", draft: revertedDraft, strippedCommand: command.phrase },
       nextEditorText: revertedDraft,
     };
   }
-
-  // 2. Check Cancel Phrase
-  const cancelMatch = matchTrailingPhrase(CANCEL_PHRASES);
-  if (cancelMatch) {
+  if (command?.action === "cancelled") {
     return {
-      result: { action: "cancelled", draft: baseDraft, strippedCommand: cancelMatch.phrase },
+      result: { action: "cancelled", draft: baseDraft, strippedCommand: command.phrase },
       nextEditorText: baseDraft,
     };
   }
-
-  // 2. Check Pause Phrase
-  const pauseMatch = matchTrailingPhrase(PAUSE_PHRASES);
-  if (pauseMatch) {
-    const nextDraft = pauseMatch.prefix
+  if (command?.action === "paused") {
+    const nextDraft = command.prefix
       ? baseDraft.trim()
-        ? `${baseDraft.trimEnd()} ${pauseMatch.prefix}`
-        : pauseMatch.prefix
+        ? `${baseDraft.trimEnd()} ${command.prefix}`
+        : command.prefix
       : baseDraft;
     return {
-      result: { action: "paused", draft: nextDraft, strippedCommand: pauseMatch.phrase },
+      result: { action: "paused", draft: nextDraft, strippedCommand: command.phrase },
       nextEditorText: nextDraft,
     };
   }
-
-  // 3. Check Send Phrase
-  const sendMatch = matchTrailingPhrase(SEND_PHRASES);
-  if (sendMatch) {
-    const combined = sendMatch.prefix
+  if (command?.action === "sent") {
+    const combined = command.prefix
       ? baseDraft.trim()
-        ? `${baseDraft.trimEnd()} ${sendMatch.prefix}`
-        : sendMatch.prefix
+        ? `${baseDraft.trimEnd()} ${command.prefix}`
+        : command.prefix
       : baseDraft.trim();
     return {
-      result: { action: "sent", draft: combined, strippedCommand: sendMatch.phrase },
+      result: { action: "sent", draft: combined, strippedCommand: command.phrase },
       nextEditorText: "",
       submitText: combined,
     };
@@ -224,12 +193,10 @@ export function continuesDroppedReply(dropped: string | null, plain: string): bo
   return plain.startsWith(dropped) || dropped.startsWith(plain);
 }
 
-export function bargeIn(): boolean {
+export function stopPlayback(): boolean {
   const wasSpeaking = isSpeaking || activeAfplay !== null || activeAbort !== null;
   speechEpoch++;
   queued = "";
-  spoken.clear();
-  droppedPlain = lastPlain.length > 0 ? lastPlain : null;
   genTail = Promise.resolve();
   playTail = Promise.resolve();
   if (activeAbort) {
@@ -257,6 +224,14 @@ export function bargeIn(): boolean {
     // ignore
   }
   return wasSpeaking;
+}
+
+export function bargeIn(): boolean {
+  // A real interrupt (wake, fn, typed stop). Remember the reply so it does not resume.
+  // Do not forget sentences already spoken: a sub-agent turn replays the parent text,
+  // and clearing this set makes that text play again from the start.
+  droppedPlain = lastPlain.length > 0 ? lastPlain : null;
+  return stopPlayback();
 }
 
 function textBlocks(message: unknown): string[] {
@@ -313,6 +288,7 @@ export function forSpeech(raw: string): string {
     .replace(/\bhey[\s,]+jarvis\b/gi, "the wake phrase")
     .replace(/\bjarvis\b/gi, "the wake word")
     .replace(/\bsend[\s,]+(prompt|that|it|message)\b/gi, "the send phrase")
+    .replace(/\bprompt[\s,]+this\b/gi, "the send phrase")
     .replace(/\bstop(?:[\s,]+(?:it|that|talking|speaking|listening|dictation))?\b/gi, "the pause command")
     .replace(/\b(scratch|undo|delete|erase)[\s,]+(that|last|all)\b/gi, "the undo phrase")
     .replace(/\bclear[\s,]+(draft|all|text|box)\b/gi, "the clear phrase")
@@ -517,8 +493,9 @@ async function play(clip: { wav: string }, epoch: number): Promise<void> {
 }
 
 function enqueue(sentence: string): void {
-  if (spoken.has(sentence)) return;
+  if (spoken.has(sentence) || spokenText.includes(sentence)) return;
   spoken.add(sentence);
+  spokenText += (spokenText ? " " : "") + sentence;
   const epoch = speechEpoch;
   const ready = genTail.then(() => generate(sentence, epoch));
   genTail = ready.then(() => undefined);
@@ -554,20 +531,21 @@ function push(message: unknown, flush: boolean): void {
   if (continuesDroppedReply(droppedPlain, plain)) return;
   lastPlain = plain;
   if (queued && !plain.startsWith(queued)) {
-    // Only reset if this is genuinely a brand-new message turn (where none of its sentences were spoken yet)
-    const allSentences = takeSentences(plain, true);
-    if (allSentences.some((s) => spoken.has(s))) {
-      // Same message whose normalized prefix shifted slightly mid-stream: advance only beyond spoken sentences
-      for (const s of allSentences) {
-        if (!spoken.has(s)) {
-          enqueue(s);
-        }
-      }
-      queued = plain;
-      return;
+    // forSpeech rewrites command words as the message grows, so the normalized
+    // text no longer starts with what we already queued. Replaying from the
+    // start is what looped the last reply. Keep going after the covered part.
+    const covered = spokenText.trim();
+    const head = covered.slice(0, 48);
+    const at = head ? plain.indexOf(head) : -1;
+    if (at >= 0) {
+      let i = 0;
+      while (i < covered.length && at + i < plain.length && plain[at + i] === covered[i]) i++;
+      queued = plain.slice(0, at + i);
+    } else {
+      queued = "";
+      spoken.clear();
+      spokenText = "";
     }
-    queued = "";
-    spoken.clear();
   }
   const base = queued.length;
   const fresh = plain.slice(base);
@@ -830,9 +808,10 @@ export default function voiceboxSpeech(pi: {
 
   pi.on("turn_start", (_event, ctx) => {
     if (ctx) latestCtx = ctx;
-    // A new user message must cut the reply already playing. Clearing `spoken`
-    // alone made the rest of that reply look new, so it was spoken again.
-    bargeIn();
+    // Cut audio for a new user message. Do not mark the reply dropped and do not
+    // forget spoken sentences: tool and sub-agent rounds also start a turn, and
+    // the parent text is delivered again on each one.
+    stopPlayback();
   });
 
   // If any assistant speech occurs while Handy is recording in DICTATING, silence it immediately!

@@ -21,6 +21,8 @@ flowchart LR
 | `bin/omp-voice-controller` | Wake word, silence chunking, Handy, mic rebind |
 | `bin/omp-handy-hook` | Forwards a Handy transcript into the controller |
 | `extension/voicebox-speech.ts` | OMP extension: draft, submit, barge-in, TTS |
+| `grammar.json` | Ordered command slots. One word from each slot, left to right |
+| `skills/conversational-collaboration/` | How a spoken reply should behave while he is talking |
 | `docs/` | Design notes for this stage and later ones |
 
 ## Layout on a machine
@@ -29,6 +31,8 @@ The clone is the only copy. [`./bin/install`](bin/install) symlinks it into plac
 
 - `extension/voicebox-speech.ts` → `~/.omp/agent/extensions/voicebox-speech.ts`
 - `bin/omp-voice-controller` → `~/.local/bin/omp-voice-controller`
+- `grammar.json` → `~/.local/share/omp-voice/grammar.json`
+- `skills/conversational-collaboration` → `~/.omp/agent/managed-skills/conversational-collaboration`
 - Python deps in `requirements.txt` → `~/.local/share/omp-voice/venv`
 
 The VoiceBox profile **name** goes in `~/.local/state/omp-voice/profile`, or in `OMP_VOICEBOX_PROFILE`. The profile id stays on the machine. This repo does not store it.

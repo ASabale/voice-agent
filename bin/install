@@ -8,12 +8,14 @@ STATE="$HOME/.local/state/omp-voice"
 
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install -r "$ROOT/requirements.txt"
-mkdir -p "$HOME/.local/bin" "$STATE" "$HOME/.omp/agent/extensions"
+mkdir -p "$HOME/.local/bin" "$STATE" "$HOME/.local/share/omp-voice" "$HOME/.omp/agent/extensions" "$HOME/.omp/agent/managed-skills"
 if [ -n "${1:-}" ]; then
   printf '%s\n' "$1" > "$STATE/profile"
 fi
 ln -sfn "$ROOT/bin/omp-voice-controller" "$HOME/.local/bin/omp-voice-controller"
 ln -sfn "$ROOT/bin/omp-handy-hook" "$HOME/.local/bin/omp-handy-hook"
 ln -sfn "$ROOT/extension/voicebox-speech.ts" "$HOME/.omp/agent/extensions/voicebox-speech.ts"
-echo "Linked $ROOT into ~/.local/bin and ~/.omp/agent/extensions"
+ln -sfn "$ROOT/grammar.json" "$HOME/.local/share/omp-voice/grammar.json"
+ln -sfn "$ROOT/skills/conversational-collaboration" "$HOME/.omp/agent/managed-skills/conversational-collaboration"
+echo "Linked $ROOT into ~/.local/bin, ~/.omp/agent/extensions, and the voice grammar"
 echo "Reload the OMP session, then run: omp-voice-controller start"
