@@ -698,9 +698,13 @@ def run_daemon(
                             idle_speech_frames.clear()
                             idle_in_speech = False
                             idle_silence_frames = 0
+                            on_headphones = any(
+                                word in dev_name.lower()
+                                for word in ("buds", "airpod", "headphone", "headset", "beats")
+                            )
                             preds = oww.predict(frame)
                             score = float(preds.get(wake_word, 0.0))
-                            if score >= 0.50:
+                            if score >= (0.35 if on_headphones else 0.50):
                                 tts_loud_run = 0
                                 tts_rms_floor.clear()
                                 tts_stop_frames.clear()
@@ -708,10 +712,6 @@ def run_daemon(
                                 enter_dictating(f"barge-in openWakeWord score={score:.2f}")
                                 continue
                             floor = sorted(tts_rms_floor)[len(tts_rms_floor) // 2] if tts_rms_floor else 0.0
-                            on_headphones = any(
-                                word in dev_name.lower()
-                                for word in ("buds", "airpod", "headphone", "headset", "beats")
-                            )
                             if on_headphones:
                                 user_voice = vad_score >= 0.25 and rms >= 180.0
                             else:
@@ -739,9 +739,18 @@ def run_daemon(
                                             language="en",
                                             beam_size=1,
                                             without_timestamps=True,
-                                            initial_prompt="stop",
+                                            initial_prompt="Hey Jarvis. stop.",
                                         )
                                         heard = " ".join(s.text for s in segments).strip()
+                                        if re.fullmatch(
+                                            r"(?:hey[\s,]+jarvis|ok[\s,]+jarvis|hello[\s,]+jarvis|jarvis)[\s.,!?]*",
+                                            heard,
+                                            re.IGNORECASE,
+                                        ):
+                                            tts_loud_run = 0
+                                            tts_rms_floor.clear()
+                                            enter_dictating(f"barge-in whisper heard {heard!r}")
+                                            continue
                                         if re.fullmatch(r"stop(?:\s+(?:it|talking|speaking))?[\s.,!?]*", heard, re.IGNORECASE):
                                             stop_playback(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy")
                                             tts_loud_run = 0
