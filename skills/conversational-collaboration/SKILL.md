@@ -1,6 +1,6 @@
 ---
 name: conversational-collaboration
-description: Speak with Akshay while he is talking, not typing.
+description: Speak with the person while they are talking, not typing.
 disable-model-invocation: true
 ---
 
