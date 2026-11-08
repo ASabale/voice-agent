@@ -1,0 +1,19 @@
+#!/bin/sh
+# Link this checkout into the paths OMP and the listener actually run.
+# Usage: ./bin/install [VoiceBox profile name]
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+VENV="$HOME/.local/share/omp-voice/venv"
+STATE="$HOME/.local/state/omp-voice"
+
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install -r "$ROOT/requirements.txt"
+mkdir -p "$HOME/.local/bin" "$STATE" "$HOME/.omp/agent/extensions"
+if [ -n "${1:-}" ]; then
+  printf '%s\n' "$1" > "$STATE/profile"
+fi
+ln -sfn "$ROOT/bin/omp-voice-controller" "$HOME/.local/bin/omp-voice-controller"
+ln -sfn "$ROOT/bin/omp-handy-hook" "$HOME/.local/bin/omp-handy-hook"
+ln -sfn "$ROOT/extension/voicebox-speech.ts" "$HOME/.omp/agent/extensions/voicebox-speech.ts"
+echo "Linked $ROOT into ~/.local/bin and ~/.omp/agent/extensions"
+echo "Reload the OMP session, then run: omp-voice-controller start"
