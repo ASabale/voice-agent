@@ -42,6 +42,7 @@ State machine:
 import argparse
 from collections import deque
 import ctypes
+import datetime
 import json
 import os
 import re
@@ -50,6 +51,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import queue
 import threading
 import time
 import urllib.error
@@ -73,7 +75,9 @@ SOUND_PAUSE = "/System/Library/Sounds/Pop.aiff"
 SOUND_CANCEL = "/System/Library/Sounds/Basso.aiff"
 
 STATE_DIR = Path.home() / ".local" / "state" / "omp-voice"
+SESSION_DIR = STATE_DIR / "sessions"
 PID_FILE = STATE_DIR / "controller.pid"
+TEXT_ROLES = frozenset({"AXTextArea", "AXTextField", "AXComboBox", "AXSearchField"})
 STATUS_FILE = STATE_DIR / "status.json"
 LOG_FILE = STATE_DIR / "controller.log"
 TTS_STATE_FILE = STATE_DIR / "tts-playing.json"
@@ -104,6 +108,34 @@ def coreaudio_default_input_device_id() -> int:
         return int(dev_id.value) if res == 0 else -1
     except Exception:
         return -1
+
+
+def next_mic_frame(
+    frames: queue.Queue,
+    active_id: int,
+    device_id,
+    last_check: float,
+    check_every: float = 2.0,
+) -> tuple[str, object, float]:
+    """Return the next mic block, or ask the caller to reopen the device.
+
+    The wait is capped at half a second. A blocking PortAudio read does not
+    return after stream.abort() once the default input device changes, and the
+    wake word and the Handy paste poll both sit behind that read.
+    """
+    try:
+        block = frames.get(timeout=min(0.5, check_every))
+    except queue.Empty:
+        block = None
+    now = time.monotonic()
+    if now - last_check >= check_every:
+        last_check = now
+        new_id = device_id()
+        if new_id != -1 and active_id != -1 and new_id != active_id:
+            return "rebind", None, last_check
+    if block is None:
+        return "idle", None, last_check
+    return "frame", block, last_check
 
 
 def is_voicebox_speaking() -> bool:
@@ -170,8 +202,14 @@ def write_status(state: str, extra: dict | None = None) -> None:
         pass
 
 
-def bridge_request(path: str, method: str = "GET", body: dict | None = None, timeout: float = 2.0) -> dict | None:
-    url = f"{OMP_BRIDGE_URL}{path}"
+def bridge_request(
+    path: str,
+    method: str = "GET",
+    body: dict | None = None,
+    timeout: float = 2.0,
+    base: str | None = None,
+) -> dict | None:
+    url = f"{base or OMP_BRIDGE_URL}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"content-type": "application/json"} if data is not None else {}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -180,6 +218,262 @@ def bridge_request(path: str, method: str = "GET", body: dict | None = None, tim
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
+
+
+def normalize_tty(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text in {"?", "??", "stdin", "-"}:
+        return None
+    if text.startswith("/dev/tty"):
+        return text
+    if text.startswith("tty"):
+        return "/dev/" + text
+    return None
+
+
+def normalize_started_at(value: object) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if number > 10_000_000_000:
+        return number / 1000.0
+    return number
+
+
+def choose_delivery(
+    focus: dict | None,
+    sessions: list[dict],
+    legacy_owner_pid: int | None,
+) -> dict:
+    """Pick where a Handy transcript goes.
+
+    A focused text control wins. An omp tab with its own bridge gets the
+    transcript through that bridge. Any other text control is a paste.
+    When the focused control is not text, the newest omp session gets it.
+    """
+    text_role = bool(focus) and focus.get("role") in TEXT_ROLES
+    tty = normalize_tty(focus.get("tty")) if focus else None
+    usable: list[dict] = []
+    for session in sessions:
+        pid = session.get("pid")
+        if not isinstance(pid, int):
+            continue
+        port = session.get("port")
+        usable.append(
+            {
+                "pid": pid,
+                "tty": normalize_tty(session.get("tty")),
+                "started_at": normalize_started_at(session.get("started_at")),
+                "port": port if isinstance(port, int) and port > 0 else None,
+            }
+        )
+
+    def bridge(session: dict, port: int) -> dict:
+        return {"mode": "bridge", "pid": session["pid"], "port": port, "focused_text": text_role}
+
+    def paste(pid: int | None = None) -> dict:
+        return {"mode": "paste", "pid": pid, "port": None, "focused_text": text_role}
+
+    if text_role:
+        matches = [session for session in usable if tty and session["tty"] == tty]
+        if len(matches) == 1:
+            session = matches[0]
+            if session["port"]:
+                return bridge(session, session["port"])
+            if legacy_owner_pid == session["pid"]:
+                return bridge(session, 17494)
+            return paste(session["pid"])
+        return paste(None)
+
+    if not usable:
+        return paste(None)
+    newest = max(usable, key=lambda session: (session["started_at"], session["pid"]))
+    if newest["port"]:
+        return bridge(newest, newest["port"])
+    if legacy_owner_pid == newest["pid"]:
+        return bridge(newest, 17494)
+    return paste(newest["pid"])
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def pid_tty(pid: int) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", "-a", "-p", str(pid), "-d", "0", "-Fn"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return normalize_tty(line[1:])
+    return None
+
+
+def pid_started_at(pid: int) -> float:
+    try:
+        raw = subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], text=True).strip()
+        return datetime.datetime.strptime(raw, "%a %b %d %H:%M:%S %Y").timestamp()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+def omp_ui_pids() -> list[int]:
+    try:
+        out = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "__omp_worker" in line:
+            continue
+        pid_s, _, cmd = line.partition(" ")
+        if not pid_s.isdigit() or not cmd:
+            continue
+        exe = cmd.split()[0]
+        if exe == "omp" or exe.endswith("/omp"):
+            pids.append(int(pid_s))
+    return pids
+
+
+def legacy_bridge_owner_pid() -> int | None:
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", "-iTCP:17494", "-sTCP:LISTEN", "-t"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            return int(line)
+    return None
+
+
+def load_session_registry() -> dict[int, dict]:
+    found: dict[int, dict] = {}
+    if not SESSION_DIR.exists():
+        return found
+    for path in SESSION_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(data["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if not pid_alive(pid):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        port = data.get("port")
+        found[pid] = {
+            "pid": pid,
+            "tty": normalize_tty(data.get("tty")),
+            "started_at": normalize_started_at(data.get("startedAt")),
+            "port": int(port) if isinstance(port, int) and port > 0 else None,
+        }
+    return found
+
+
+def omp_session_records() -> list[dict]:
+    records = load_session_registry()
+    for pid in omp_ui_pids():
+        if not pid_alive(pid):
+            continue
+        current = records.get(pid, {"pid": pid, "tty": None, "started_at": 0, "port": None})
+        if not current.get("tty"):
+            current["tty"] = pid_tty(pid)
+        if not current.get("started_at"):
+            current["started_at"] = pid_started_at(pid)
+        records[pid] = current
+    return list(records.values())
+
+
+_FOCUSED_TEXT_SCRIPT = """
+tell application "System Events"
+  set frontApp to first application process whose frontmost is true
+  set appName to name of frontApp
+  set roleName to ""
+  try
+    set focusedElem to value of attribute "AXFocusedUIElement" of frontApp
+    set roleName to role of focusedElem
+  end try
+end tell
+return appName & linefeed & roleName
+"""
+
+
+def focused_text_context() -> dict | None:
+    raw = subprocess.run(
+        ["/usr/bin/osascript", "-e", _FOCUSED_TEXT_SCRIPT],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if raw.returncode != 0:
+        return None
+    lines = [line.strip() for line in raw.stdout.splitlines()]
+    app = lines[0] if lines else ""
+    role = lines[1] if len(lines) > 1 else ""
+    if role not in TEXT_ROLES:
+        return None
+    tty_script = None
+    if app == "Terminal":
+        tty_script = 'tell application "Terminal" to tty of selected tab of front window'
+    elif app in {"iTerm2", "iTerm"}:
+        tty_script = 'tell application "iTerm" to tty of current session of current window'
+    tty = None
+    if tty_script:
+        tty_run = subprocess.run(
+            ["/usr/bin/osascript", "-e", tty_script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tty_run.returncode == 0:
+            tty = tty_run.stdout.strip()
+    return {"app": app, "role": role, "tty": tty}
+
+
+def resolve_delivery() -> dict:
+    return choose_delivery(focused_text_context(), omp_session_records(), legacy_bridge_owner_pid())
+
+
+def bridge_base(dest: dict) -> str:
+    port = dest.get("port") or 17494
+    return f"http://127.0.0.1:{int(port)}"
+
+
+def live_bridge_bases() -> list[str]:
+    bases: list[str] = []
+    for session in omp_session_records():
+        port = session.get("port")
+        if isinstance(port, int) and port > 0:
+            bases.append(f"http://127.0.0.1:{port}")
+    if legacy_bridge_owner_pid() is not None:
+        bases.append(OMP_BRIDGE_URL)
+    deduped: list[str] = []
+    for base in bases:
+        if base not in deduped:
+            deduped.append(base)
+    if not deduped:
+        deduped.append(OMP_BRIDGE_URL)
+    return deduped
 
 
 def latest_history_row() -> tuple[int, str]:
@@ -605,8 +899,21 @@ def fn_held() -> bool:
 
 def silence_speech(abort_agent: bool) -> None:
     # Kill the speakers before the bridge round-trip. Otherwise Handy records the reply.
+    # Abort only the session that would receive the dictation. Other sessions lose
+    # their audio but keep a turn that the user is not talking to.
     kill_tts_clips()
-    bridge_request("/barge-in", method="POST", body={"abortAgent": abort_agent})
+    try:
+        target = resolve_delivery()
+    except Exception:
+        target = {"mode": "bridge", "port": 17494}
+    target_base = bridge_base(target) if target.get("mode") == "bridge" else None
+    for base in live_bridge_bases():
+        bridge_request(
+            "/barge-in",
+            method="POST",
+            body={"abortAgent": bool(abort_agent) and base == target_base},
+            base=base,
+        )
 
     def keep_killing() -> None:
         for _ in range(8):
@@ -617,16 +924,34 @@ def silence_speech(abort_agent: bool) -> None:
 
 
 def dispatch_transcript(text: str) -> dict:
-    """Send transcript to OMP extension bridge; handle v1 bridge deduplication or offline fallback."""
+    """Paste into the focused text control, or send to the newest omp when focus is not text."""
+    original = " ".join(text.strip().split())
+    if not original:
+        return {"action": "noop", "draft": ""}
+
+    try:
+        dest = resolve_delivery()
+    except Exception as exc:
+        log(f"Delivery lookup failed ({exc}); using the legacy bridge")
+        dest = {"mode": "bridge", "port": 17494, "focused_text": False}
+    log(
+        f"Delivery {dest.get('mode')} pid={dest.get('pid')} port={dest.get('port')} "
+        f"focused_text={dest.get('focused_text')}"
+    )
+    if dest.get("mode") == "paste":
+        fallback_macos_inject(original + " ", "appended")
+        return {"action": "appended", "draft": original, "via": "focus"}
+
+    base = bridge_base(dest)
     text = canonicalize_transcript(text)
     cleaned = " ".join(text.strip().split())
     if not cleaned:
         return {"action": "noop", "draft": ""}
 
-    status = bridge_request("/status", method="GET")
+    status = bridge_request("/status", method="GET", base=base)
     if status and status.get("ok"):
         if status.get("version", 1) >= 2:
-            resp = bridge_request("/transcript", method="POST", body={"text": text})
+            resp = bridge_request("/transcript", method="POST", body={"text": text}, base=base)
             if resp and resp.get("ok"):
                 return resp
         else:
@@ -652,17 +977,21 @@ def dispatch_transcript(text: str) -> dict:
                 time.sleep(0.08)
             if matched and matched["action"] == "paused":
                 mapped = f"{matched['prefix']} pause listening".strip()
-                resp = bridge_request("/transcript", method="POST", body={"text": mapped})
+                resp = bridge_request("/transcript", method="POST", body={"text": mapped}, base=base)
                 if resp and resp.get("ok"):
                     return resp
             if matched and matched["action"] == "sent":
                 mapped = f"{matched['prefix']} send prompt".strip()
-                resp = bridge_request("/transcript", method="POST", body={"text": mapped})
+                resp = bridge_request("/transcript", method="POST", body={"text": mapped}, base=base)
                 if resp and resp.get("ok"):
                     return resp
-            resp = bridge_request("/transcript", method="POST", body={"text": text})
+            resp = bridge_request("/transcript", method="POST", body={"text": text}, base=base)
             if resp and resp.get("ok"):
                 return resp
+
+    if dest.get("focused_text"):
+        fallback_macos_inject(original + " ", "appended")
+        return {"action": "appended", "draft": original, "via": "focus"}
 
     matched = match_command(cleaned)
     if matched and matched["action"] == "cancelled":
@@ -887,48 +1216,54 @@ def run_daemon(
         log(f"Opening microphone input stream on '{dev_name}' (CoreAudio id={active_ca_dev})")
         write_status(state, {"wake_word": wake_word, "pause_seconds": pause_seconds, "mic": dev_name})
         last_dev_check = time.monotonic()
-        device_watch_stop = threading.Event()
 
         try:
+            mic_frames: queue.Queue = queue.Queue(maxsize=32)
+
+            def on_mic(indata, _frames, _time_info, _status) -> None:
+                block = indata.copy()
+                try:
+                    mic_frames.put_nowait(block)
+                except queue.Full:
+                    try:
+                        mic_frames.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        mic_frames.put_nowait(block)
+                    except queue.Full:
+                        pass
+
             with sd.InputStream(
                 samplerate=sample_rate,
                 channels=1,
                 dtype="int16",
                 blocksize=chunk_samples,
-            ) as stream:
-                device_watch_stop = threading.Event()
-
-                def watch_input_device() -> None:
-                    while not device_watch_stop.wait(1.0):
-                        new_ca_dev = coreaudio_default_input_device_id()
-                        if new_ca_dev != -1 and active_ca_dev != -1 and new_ca_dev != active_ca_dev:
-                            log(f"macOS default microphone changed ({active_ca_dev} -> {new_ca_dev}); rebinding stream...")
-                            try:
-                                stream.abort()
-                            except Exception:
-                                pass
-                            return
-
-                threading.Thread(target=watch_input_device, daemon=True).start()
+                callback=on_mic,
+            ):
                 while running:
-                    pcm_block, _overflow = stream.read(chunk_samples)
+                    kind, pcm_block, last_dev_check = next_mic_frame(
+                        mic_frames,
+                        active_ca_dev,
+                        coreaudio_default_input_device_id,
+                        last_dev_check,
+                    )
+                    if kind == "rebind":
+                        new_ca_dev = coreaudio_default_input_device_id()
+                        log(
+                            f"macOS default microphone changed ({active_ca_dev} -> {new_ca_dev}); rebinding stream..."
+                        )
+                        subprocess.run(
+                            ["/usr/bin/osascript", "-e", "set volume input volume 85"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                        break
+                    if kind != "frame" or pcm_block is None:
+                        continue
                     frame = pcm_block[:, 0]
                     now = time.monotonic()
-
-                    # Every 2.0s, check if macOS default input device changed (e.g. AirPods / headphones connected or disconnected)
-                    if (now - last_dev_check) >= 2.0:
-                        last_dev_check = now
-                        new_ca_dev = coreaudio_default_input_device_id()
-                        if new_ca_dev != -1 and active_ca_dev != -1 and new_ca_dev != active_ca_dev:
-                            log(f"macOS default microphone changed ({active_ca_dev} -> {new_ca_dev}); rebinding stream...")
-                            subprocess.run(
-                                ["/usr/bin/osascript", "-e", "set volume input volume 85"],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=False,
-                            )
-                            device_watch_stop.set()
-                            break
 
                     if now < cooldown_until:
                         oww.predict(frame)
@@ -1335,7 +1670,6 @@ def run_daemon(
                                     cooldown_until = time.monotonic() + 0.5
                                     write_status(state, {"last_action": "idle_timeout"})
         except Exception as stream_err:
-            device_watch_stop.set()
             log(f"Audio stream interrupted ({stream_err}); reconnecting in 1.0s...")
             time.sleep(1.0)
 
@@ -1351,6 +1685,10 @@ def run_daemon(
 
 def cmd_status() -> int:
     bridge = bridge_request("/status", method="GET")
+    try:
+        delivery = resolve_delivery()
+    except Exception as exc:
+        delivery = {"mode": "unknown", "error": str(exc)}
     ctrl = json.loads(STATUS_FILE.read_text(encoding="utf-8")) if STATUS_FILE.exists() else {"state": "STOPPED"}
     pid = ctrl.get("pid")
     alive = False
@@ -1364,6 +1702,7 @@ def cmd_status() -> int:
         json.dumps(
             {
                 "controller": {**ctrl, "alive": alive},
+                "delivery": delivery,
                 "omp_bridge": bridge or {"ok": False, "note": "Restart/reload OMP session to bind :17494"},
             },
             indent=2,

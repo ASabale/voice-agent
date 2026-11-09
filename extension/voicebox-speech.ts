@@ -1,7 +1,10 @@
 // Speak sentence by sentence via VoiceBox and accept hands-free dictated chunks
 // + voice submit ("send prompt") + Barge-in from omp-voice-controller.
 //
-// Local control HTTP server on 127.0.0.1:17494:
+// One HTTP server per omp session, on an ephemeral 127.0.0.1 port.
+// The controller reads ~/.local/state/omp-voice/sessions/<pid>.json and
+// sends /transcript to the focused session, not to whichever process
+// happened to bind a single shared port.
 // - GET  /status     -> { speaking, draft, draftLength, pid }
 // - POST /barge-in   -> kills active afplay and flushes pending TTS queue
 // - POST /transcript -> { text } -> appends to OMP editor Draft or submits on command phrase
@@ -42,6 +45,10 @@ function profileName(): string {
 let playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
 let queued = "";
 const spoken = new Set<string>();
+// Sentences whose audio finished. Aborted clips stay out of this list so a later
+// reply can speak them. `inflight` is the queue that stopPlayback rolls back.
+const committed: string[] = [];
+const inflight: string[] = [];
 let spokenText = "";
 let genTail: Promise<void> = Promise.resolve();
 let playTail: Promise<void> = Promise.resolve();
@@ -205,9 +212,26 @@ export function continuesDroppedReply(dropped: string | null, plain: string): bo
   return plain.startsWith(dropped) || dropped.startsWith(plain);
 }
 
+function rollbackInflight(): void {
+  for (const sentence of inflight) spoken.delete(sentence);
+  inflight.length = 0;
+  spokenText = committed.join(" ");
+}
+
+function commitSpoken(sentence: string): void {
+  const index = inflight.indexOf(sentence);
+  if (index >= 0) inflight.splice(index, 1);
+  if (!committed.includes(sentence)) committed.push(sentence);
+  spoken.add(sentence);
+  spokenText = [...committed, ...inflight].join(" ");
+}
+
 export function stopPlayback(): boolean {
   const wasSpeaking = isSpeaking || activeAfplay !== null || activeAbort !== null;
   speechEpoch++;
+  // A new turn or a barge-in aborts clips that have not finished. Forgetting
+  // them here is what left the next reply silent when it repeated that text.
+  rollbackInflight();
   queued = "";
   genTail = Promise.resolve();
   playTail = Promise.resolve();
@@ -413,7 +437,7 @@ async function generate(text: string, epoch: number): Promise<{ wav: string } | 
     const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${++clipSeq}.wav`);
     fs.writeFileSync(wavPath, Buffer.from(arrayBuf));
     logSpeech("generated", text, { bytes: arrayBuf.byteLength, wav: path.basename(wavPath) });
-    return { wav: wavPath };
+    return { wav: wavPath, sentence: text };
   } catch (err) {
     logSpeech("failed", text, { reason: String(err) });
     return undefined;
@@ -423,7 +447,7 @@ async function generate(text: string, epoch: number): Promise<{ wav: string } | 
   }
 }
 
-async function play(clip: { wav: string }, epoch: number): Promise<void> {
+async function play(clip: { wav: string; sentence: string }, epoch: number): Promise<void> {
   if (epoch !== speechEpoch) {
     try {
       fs.unlinkSync(clip.wav);
@@ -487,6 +511,7 @@ async function play(clip: { wav: string }, epoch: number): Promise<void> {
   child.on("exit", finish);
   child.on("error", finish);
   await promise;
+  if (epoch === speechEpoch) commitSpoken(clip.sentence);
   clearTimeout(watchdog);
   if (activeAfplay === child) {
     activeAfplay = null;
@@ -507,7 +532,8 @@ async function play(clip: { wav: string }, epoch: number): Promise<void> {
 function enqueue(sentence: string): void {
   if (spoken.has(sentence) || spokenText.includes(sentence)) return;
   spoken.add(sentence);
-  spokenText += (spokenText ? " " : "") + sentence;
+  inflight.push(sentence);
+  spokenText = [...committed, ...inflight].join(" ");
   const epoch = speechEpoch;
   const ready = genTail.then(() => generate(sentence, epoch));
   genTail = ready.then(() => undefined);
@@ -556,6 +582,8 @@ function push(message: unknown, flush: boolean): void {
     } else {
       queued = "";
       spoken.clear();
+      committed.length = 0;
+      inflight.length = 0;
       spokenText = "";
     }
   }
@@ -635,6 +663,29 @@ export default function voiceboxSpeech(pi: {
   let server: http.Server | undefined;
   let humanizeMode = false;
   const draftHistory: string[] = [];
+  const registryFile = path.join(
+    os.homedir(),
+    ".local",
+    "state",
+    "omp-voice",
+    "sessions",
+    `${process.pid}.json`,
+  );
+  const clearSessionRegistry = () => {
+    try {
+      fs.unlinkSync(registryFile);
+    } catch {
+      // ignore
+    }
+  };
+  const sessionTty = (): string | null => {
+    try {
+      const dest = fs.readlinkSync("/dev/fd/0");
+      return dest.startsWith("/dev/tty") ? dest : null;
+    } catch {
+      return null;
+    }
+  };
 
   void fetch(`${API}/settings/generation`, {
     method: "PUT",
@@ -759,27 +810,22 @@ export default function voiceboxSpeech(pi: {
       });
 
     const srv = createSrv();
-    let retried = false;
-    srv.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE" && !retried) {
-        retried = true;
-        // Ask the older OMP session to release 127.0.0.1:17494 so the newest session always owns voice input
-        void fetch(`http://${BRIDGE_HOST}:${BRIDGE_PORT}/takeover`, { method: "POST" })
-          .catch(() => undefined)
-          .finally(() => {
-            setTimeout(() => {
-              const retrySrv = createSrv();
-              retrySrv.on("error", () => {});
-              retrySrv.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
-                retrySrv.unref();
-              });
-              server = retrySrv;
-            }, 150);
-          });
-      }
+    srv.on("error", () => {
+      clearSessionRegistry();
     });
-
-    srv.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
+    srv.listen(0, BRIDGE_HOST, () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+      fs.writeFileSync(
+        registryFile,
+        JSON.stringify({
+          pid: process.pid,
+          port,
+          tty: sessionTty(),
+          startedAt: Date.now() / 1000,
+        }),
+      );
       srv.unref();
     });
     server = srv;
@@ -798,6 +844,7 @@ export default function voiceboxSpeech(pi: {
 
   pi.on("session_shutdown", () => {
     bargeIn();
+    clearSessionRegistry();
     if (server) {
       try {
         server.close();
