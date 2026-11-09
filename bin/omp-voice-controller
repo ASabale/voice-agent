@@ -962,10 +962,16 @@ def load_command_grammar(path: Path) -> dict:
 
 
 def command_grammar() -> dict:
-    """Phrase of N words: one word from each of N lists, in order. Wake is optional in front."""
+    """Phrase of N words: one word from each of N lists, in order. Wake is optional in front.
+
+    The install copies grammar.json into ~/.local. A checkout that has not been
+    installed, including CI, uses the copy next to this script.
+    """
     global _GRAMMAR
     if _GRAMMAR is None:
-        path = Path.home() / ".local" / "share" / "omp-voice" / "grammar.json"
+        installed = Path.home() / ".local" / "share" / "omp-voice" / "grammar.json"
+        shipped = Path(__file__).resolve().parent.parent / "grammar.json"
+        path = installed if installed.is_file() else shipped
         _GRAMMAR = load_command_grammar(path)
     return _GRAMMAR
 
