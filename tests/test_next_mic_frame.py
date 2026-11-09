@@ -6,15 +6,24 @@ half a second and report the new device.
 """
 
 import importlib.machinery
+import importlib.util
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
 
+import pytest
+
 _PATH = Path(__file__).resolve().parents[1] / "bin" / "omp-voice-controller"
-controller = importlib.machinery.SourceFileLoader(
-    "omp_voice_controller", str(_PATH)
-).load_module()
+_loader = importlib.machinery.SourceFileLoader("omp_voice_controller", str(_PATH))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+assert _spec and _spec.loader
+controller = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = controller
+_spec.loader.exec_module(controller)
+
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
 
 
 def _call(frames, active, device_id, last_check, check_every):

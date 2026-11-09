@@ -17,7 +17,8 @@ import * as path from "node:path";
 
 const API = "http://127.0.0.1:17493";
 const BRIDGE_HOST = "127.0.0.1";
-const BRIDGE_PORT = 17494;
+const HTTP_BODY_CAP = 65536;
+let boundBridgePort = 0;
 function ttsModelSize(): "0.6B" | "1.7B" {
   try {
     const raw = fs
@@ -42,25 +43,82 @@ function profileName(): string {
   }
 }
 
-let playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
-let queued = "";
-const spoken = new Set<string>();
-// Sentences whose audio finished. Aborted clips stay out of this list so a later
-// reply can speak them. `inflight` is the queue that stopPlayback rolls back.
-const committed: string[] = [];
-const inflight: string[] = [];
-let spokenText = "";
-let genTail: Promise<void> = Promise.resolve();
-let playTail: Promise<void> = Promise.resolve();
-let speechEpoch = 0;
-let lastPlain = "";
-// Set on barge-in to the reply that was playing. Later deltas of that same
-// reply must not be spoken after Handy closes. A different reply clears it.
-let droppedPlain: string | null = null;
-let clipSeq = 0;
-let activeAfplay: ChildProcess | null = null;
-let activeAbort: AbortController | null = null;
-let isSpeaking = false;
+export class VoiceSession {
+  playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
+  queued = "";
+  readonly spoken = new Set<string>();
+  // Sentences whose audio finished. Aborted clips stay out of this list so a later
+  // reply can speak them. `inflight` is the queue that stopPlayback rolls back.
+  readonly committed: string[] = [];
+  readonly inflight: string[] = [];
+  spokenText = "";
+  genTail: Promise<void> = Promise.resolve();
+  playTail: Promise<void> = Promise.resolve();
+  speechEpoch = 0;
+  lastPlain = "";
+  // Set on barge-in to the reply that was playing. Later deltas of that same
+  // reply must not be spoken after Handy closes. A different reply clears it.
+  droppedPlain: string | null = null;
+  clipSeq = 0;
+  activeAfplay: ChildProcess | null = null;
+  activeAbort: AbortController | null = null;
+  isSpeaking = false;
+  readonly loggedOnce = new Set<string>();
+
+  reset(): void {
+    this.playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
+    this.queued = "";
+    this.spoken.clear();
+    this.committed.length = 0;
+    this.inflight.length = 0;
+    this.spokenText = "";
+    this.genTail = Promise.resolve();
+    this.playTail = Promise.resolve();
+    this.speechEpoch = 0;
+    this.lastPlain = "";
+    this.droppedPlain = null;
+    this.clipSeq = 0;
+    this.activeAfplay = null;
+    this.activeAbort = null;
+    this.isSpeaking = false;
+    this.loggedOnce.clear();
+  }
+}
+
+const session = new VoiceSession();
+
+export function resetSpeechSession(): void {
+  session.reset();
+}
+
+function logOnce(key: string, err: unknown): void {
+  if (session.loggedOnce.has(key)) return;
+  session.loggedOnce.add(key);
+  logSpeech("error", key, { error: String(err) });
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): void {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(value));
+  fs.renameSync(tmp, filePath);
+}
+
+function readBody(req: http.IncomingMessage, onEnd: (body: string) => void): void {
+  let body = "";
+  let tooBig = false;
+  req.on("data", (chunk) => {
+    if (tooBig) return;
+    body += String(chunk);
+    if (body.length > HTTP_BODY_CAP) {
+      tooBig = true;
+      req.destroy();
+    }
+  });
+  req.on("end", () => {
+    if (!tooBig) onEnd(body);
+  });
+}
 
 export type TranscriptAction =
   | { action: "sent"; draft: string; strippedCommand: string }
@@ -98,8 +156,7 @@ function slotsMatch(words: string[], slots: string[][]): boolean {
 }
 
 /** Longest suffix that is an optional wake plus one word from each slot, in order. */
-export function matchCommand(raw: string): CommandMatch | null {
-  const grammar = loadCommandGrammar();
+export function matchCommand(raw: string, grammar: CommandGrammar = loadCommandGrammar()): CommandMatch | null {
   const tokens = raw
     .toLowerCase()
     .replace(/[\s.,!?;:]+/g, " ")
@@ -213,51 +270,51 @@ export function continuesDroppedReply(dropped: string | null, plain: string): bo
 }
 
 function rollbackInflight(): void {
-  for (const sentence of inflight) spoken.delete(sentence);
-  inflight.length = 0;
-  spokenText = committed.join(" ");
+  for (const sentence of session.inflight) session.spoken.delete(sentence);
+  session.inflight.length = 0;
+  session.spokenText = session.committed.join(" ");
 }
 
 function commitSpoken(sentence: string): void {
-  const index = inflight.indexOf(sentence);
-  if (index >= 0) inflight.splice(index, 1);
-  if (!committed.includes(sentence)) committed.push(sentence);
-  spoken.add(sentence);
-  spokenText = [...committed, ...inflight].join(" ");
+  const index = session.inflight.indexOf(sentence);
+  if (index >= 0) session.inflight.splice(index, 1);
+  if (!session.committed.includes(sentence)) session.committed.push(sentence);
+  session.spoken.add(sentence);
+  session.spokenText = [...session.committed, ...session.inflight].join(" ");
 }
 
 export function stopPlayback(): boolean {
-  const wasSpeaking = isSpeaking || activeAfplay !== null || activeAbort !== null;
-  speechEpoch++;
+  const wasSpeaking = session.isSpeaking || session.activeAfplay !== null || session.activeAbort !== null;
+  session.speechEpoch++;
   // A new turn or a barge-in aborts clips that have not finished. Forgetting
   // them here is what left the next reply silent when it repeated that text.
   rollbackInflight();
-  queued = "";
-  genTail = Promise.resolve();
-  playTail = Promise.resolve();
-  if (activeAbort) {
+  session.queued = "";
+  session.genTail = Promise.resolve();
+  session.playTail = Promise.resolve();
+  if (session.activeAbort) {
     try {
-      activeAbort.abort();
+      session.activeAbort.abort();
     } catch {
       // ignore
     }
-    activeAbort = null;
+    session.activeAbort = null;
   }
-  if (activeAfplay) {
+  if (session.activeAfplay) {
     try {
-      activeAfplay.kill("SIGTERM");
+      session.activeAfplay.kill("SIGTERM");
     } catch {
       // ignore
     }
-    activeAfplay = null;
+    session.activeAfplay = null;
   }
-  isSpeaking = false;
+  session.isSpeaking = false;
   const statePath = path.join(os.homedir(), ".local", "state", "omp-voice", "tts-playing.json");
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    fs.writeFileSync(statePath, JSON.stringify({ playing: false, ended_at: Date.now() / 1000 }));
-  } catch {
-    // ignore
+    writeJsonAtomic(statePath, { playing: false, ended_at: Date.now() / 1000 });
+  } catch (err) {
+    logOnce("tts-playing-write", err);
   }
   return wasSpeaking;
 }
@@ -266,7 +323,7 @@ export function bargeIn(): boolean {
   // A real interrupt (wake, fn, typed stop). Remember the reply so it does not resume.
   // Do not forget sentences already spoken: a sub-agent turn replays the parent text,
   // and clearing this set makes that text play again from the start.
-  droppedPlain = lastPlain.length > 0 ? lastPlain : null;
+  session.droppedPlain = session.lastPlain.length > 0 ? session.lastPlain : null;
   return stopPlayback();
 }
 
@@ -289,7 +346,11 @@ function textBlocks(message: unknown): string[] {
   return lines;
 }
 
+let speechCacheRaw = "";
+let speechCachePlain = "";
+
 export function forSpeech(raw: string): string {
+  if (raw === speechCacheRaw) return speechCachePlain;
   // 1. If the assistant emitted a dedicated spoken summary (<voice>...</voice> or **Voice:** ...),
   //    speak ONLY that human-friendly summary instead of reading tables/paths/commands out loud!
   const voiceTagMatch = raw.match(/<voice>([\s\S]*?)<\/voice>/i);
@@ -298,7 +359,7 @@ export function forSpeech(raw: string): string {
     : null;
   const source = voiceTagMatch ? voiceTagMatch[1]! : voiceLineMatch ? voiceLineMatch[1]! : raw;
 
-  return source
+  const plain = source
     .replace(/\r\n/g, "\n")
     // Strip fenced code blocks and markdown tables completely
     .replace(/```[\s\S]*?```/g, " ")
@@ -331,6 +392,9 @@ export function forSpeech(raw: string): string {
     .replace(/[*_~>|]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+  speechCacheRaw = raw;
+  speechCachePlain = plain;
+  return plain;
 }
 
 function endsSentence(text: string, index: number, flush: boolean): boolean {
@@ -344,7 +408,7 @@ function endsSentence(text: string, index: number, flush: boolean): boolean {
   return text.slice(0, index).trim().length >= 2;
 }
 
-function takeSentences(fresh: string, flush: boolean): string[] {
+export function takeSentences(fresh: string, flush: boolean): string[] {
   const out: string[] = [];
   let rest = fresh.trimStart();
   while (rest.length >= 12) {
@@ -395,17 +459,17 @@ function logSpeech(event: string, text: string, extra: Record<string, unknown> =
   }
 }
 
-async function generate(text: string, epoch: number): Promise<{ wav: string } | undefined> {
-  if (epoch !== speechEpoch) {
+async function generate(text: string, epoch: number): Promise<{ wav: string; sentence: string } | undefined> {
+  if (epoch !== session.speechEpoch) {
     logSpeech("dropped", text, { reason: "epoch" });
     return undefined;
   }
   const controller = new AbortController();
-  activeAbort = controller;
+  session.activeAbort = controller;
   const timer = setTimeout(() => controller.abort(), 90000);
   try {
     const id = await profileId();
-    if (!id || epoch !== speechEpoch) {
+    if (!id || epoch !== session.speechEpoch) {
       logSpeech("dropped", text, { reason: id ? "epoch" : "profile" });
       return undefined;
     }
@@ -430,11 +494,11 @@ async function generate(text: string, epoch: number): Promise<{ wav: string } | 
       return undefined;
     }
     const arrayBuf = await res.arrayBuffer();
-    if (epoch !== speechEpoch || arrayBuf.byteLength < 100) {
-      logSpeech("failed", text, { reason: epoch !== speechEpoch ? "epoch" : "short-audio", bytes: arrayBuf.byteLength });
+    if (epoch !== session.speechEpoch || arrayBuf.byteLength < 100) {
+      logSpeech("failed", text, { reason: epoch !== session.speechEpoch ? "epoch" : "short-audio", bytes: arrayBuf.byteLength });
       return undefined;
     }
-    const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${++clipSeq}.wav`);
+    const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${++session.clipSeq}.wav`);
     fs.writeFileSync(wavPath, Buffer.from(arrayBuf));
     logSpeech("generated", text, { bytes: arrayBuf.byteLength, wav: path.basename(wavPath) });
     return { wav: wavPath, sentence: text };
@@ -443,12 +507,12 @@ async function generate(text: string, epoch: number): Promise<{ wav: string } | 
     return undefined;
   } finally {
     clearTimeout(timer);
-    if (activeAbort === controller) activeAbort = null;
+    if (session.activeAbort === controller) session.activeAbort = null;
   }
 }
 
 async function play(clip: { wav: string; sentence: string }, epoch: number): Promise<void> {
-  if (epoch !== speechEpoch) {
+  if (epoch !== session.speechEpoch) {
     try {
       fs.unlinkSync(clip.wav);
     } catch {
@@ -456,13 +520,13 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
     }
     return;
   }
-  isSpeaking = true;
+  session.isSpeaking = true;
   const { promise, resolve } = Promise.withResolvers<void>();
-  const args = playbackRate !== 1.0
-    ? ["-r", String(playbackRate), "-q", "1", clip.wav]
+  const args = session.playbackRate !== 1.0
+    ? ["-r", String(session.playbackRate), "-q", "1", clip.wav]
     : [clip.wav];
-  if (epoch !== speechEpoch) {
-    isSpeaking = false;
+  if (epoch !== session.speechEpoch) {
+    session.isSpeaking = false;
     try {
       fs.unlinkSync(clip.wav);
     } catch {
@@ -471,13 +535,13 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
     return;
   }
   const child = spawn("afplay", args, { stdio: "ignore" });
-  if (epoch !== speechEpoch) {
+  if (epoch !== session.speechEpoch) {
     try {
       child.kill("SIGKILL");
     } catch {
       // ignore
     }
-    isSpeaking = false;
+    session.isSpeaking = false;
     try {
       fs.unlinkSync(clip.wav);
     } catch {
@@ -485,13 +549,13 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
     }
     return;
   }
-  activeAfplay = child;
+  session.activeAfplay = child;
   const statePath = path.join(os.homedir(), ".local", "state", "omp-voice", "tts-playing.json");
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    fs.writeFileSync(statePath, JSON.stringify({ playing: true, pid: child.pid, started_at: Date.now() / 1000 }));
-  } catch {
-    // ignore
+    writeJsonAtomic(statePath, { playing: true, pid: child.pid, started_at: Date.now() / 1000 });
+  } catch (err) {
+    logOnce("tts-playing-write", err);
   }
   let settled = false;
   const finish = () => {
@@ -511,15 +575,15 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
   child.on("exit", finish);
   child.on("error", finish);
   await promise;
-  if (epoch === speechEpoch) commitSpoken(clip.sentence);
+  if (epoch === session.speechEpoch) commitSpoken(clip.sentence);
   clearTimeout(watchdog);
-  if (activeAfplay === child) {
-    activeAfplay = null;
-    isSpeaking = false;
+  if (session.activeAfplay === child) {
+    session.activeAfplay = null;
+    session.isSpeaking = false;
     try {
-      fs.writeFileSync(statePath, JSON.stringify({ playing: false, ended_at: Date.now() / 1000 }));
-    } catch {
-      // ignore
+      writeJsonAtomic(statePath, { playing: false, ended_at: Date.now() / 1000 });
+    } catch (err) {
+      logOnce("tts-playing-write", err);
     }
   }
   try {
@@ -530,14 +594,14 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
 }
 
 function enqueue(sentence: string): void {
-  if (spoken.has(sentence) || spokenText.includes(sentence)) return;
-  spoken.add(sentence);
-  inflight.push(sentence);
-  spokenText = [...committed, ...inflight].join(" ");
-  const epoch = speechEpoch;
-  const ready = genTail.then(() => generate(sentence, epoch));
-  genTail = ready.then(() => undefined);
-  playTail = playTail.then(async () => {
+  if (session.spoken.has(sentence) || session.spokenText.includes(sentence)) return;
+  session.spoken.add(sentence);
+  session.inflight.push(sentence);
+  session.spokenText = [...session.committed, ...session.inflight].join(" ");
+  const epoch = session.speechEpoch;
+  const ready = session.genTail.then(() => generate(sentence, epoch));
+  session.genTail = ready.then(() => undefined);
+  session.playTail = session.playTail.then(async () => {
     const clip = await ready;
     if (clip) await play(clip, epoch);
   });
@@ -566,28 +630,28 @@ function push(message: unknown, flush: boolean): void {
   }
   const plain = forSpeech(raw);
   if (!plain) return;
-  if (continuesDroppedReply(droppedPlain, plain)) return;
-  lastPlain = plain;
-  if (queued && !plain.startsWith(queued)) {
+  if (continuesDroppedReply(session.droppedPlain, plain)) return;
+  session.lastPlain = plain;
+  if (session.queued && !plain.startsWith(session.queued)) {
     // forSpeech rewrites command words as the message grows, so the normalized
     // text no longer starts with what we already queued. Replaying from the
     // start is what looped the last reply. Keep going after the covered part.
-    const covered = spokenText.trim();
+    const covered = session.spokenText.trim();
     const head = covered.slice(0, 48);
     const at = head ? plain.indexOf(head) : -1;
     if (at >= 0) {
       let i = 0;
       while (i < covered.length && at + i < plain.length && plain[at + i] === covered[i]) i++;
-      queued = plain.slice(0, at + i);
+      session.queued = plain.slice(0, at + i);
     } else {
-      queued = "";
-      spoken.clear();
-      committed.length = 0;
-      inflight.length = 0;
-      spokenText = "";
+      session.queued = "";
+      session.spoken.clear();
+      session.committed.length = 0;
+      session.inflight.length = 0;
+      session.spokenText = "";
     }
   }
-  const base = queued.length;
+  const base = session.queued.length;
   const fresh = plain.slice(base);
   const rawSentences = takeSentences(fresh, flush);
   if (rawSentences.length === 0) return;
@@ -612,7 +676,7 @@ function push(message: unknown, flush: boolean): void {
     const wsAfter = trailing.length - trailing.trimStart().length;
     const nextOffset = afterSentenceOffset + wsAfter;
 
-    const targetMax = spoken.size === 0 ? 85 : 190;
+    const targetMax = session.spoken.size === 0 ? 85 : 190;
     if (!group) {
       group = s;
       groupEndOffset = nextOffset;
@@ -621,7 +685,7 @@ function push(message: unknown, flush: boolean): void {
       groupEndOffset = nextOffset;
     } else {
       enqueue(group);
-      queued = plain.slice(0, base + groupEndOffset);
+      session.queued = plain.slice(0, base + groupEndOffset);
       group = s;
       groupEndOffset = nextOffset;
     }
@@ -633,9 +697,9 @@ function push(message: unknown, flush: boolean): void {
     // - flush is true (end of message), OR
     // - it's the very first sentence of the reply (so audio starts with zero delay), OR
     // - the group is already >= 110 chars (so it won't need to wait for another sentence).
-    if (flush || spoken.size === 0 || group.length >= 110) {
+    if (flush || session.spoken.size === 0 || group.length >= 110) {
       enqueue(group);
-      queued = plain.slice(0, base + groupEndOffset);
+      session.queued = plain.slice(0, base + groupEndOffset);
     }
   }
 }
@@ -738,7 +802,7 @@ export default function voiceboxSpeech(pi: {
             ok: true,
             version: 2,
             pid: process.pid,
-            speaking: isSpeaking || activeAfplay !== null,
+            speaking: session.isSpeaking || session.activeAfplay !== null,
             agentBusy: !idle,
             draft,
             draftLength: draft.length,
@@ -761,11 +825,7 @@ export default function voiceboxSpeech(pi: {
         }
 
         if (req.method === "POST" && req.url === "/barge-in") {
-          let body = "";
-          req.on("data", (chunk) => {
-            body += String(chunk);
-          });
-          req.on("end", () => {
+          readBody(req, (body) => {
             let abortAgent = false;
             try {
               const parsed = JSON.parse(body || "{}") as { abortAgent?: boolean };
@@ -789,11 +849,7 @@ export default function voiceboxSpeech(pi: {
         }
 
         if (req.method === "POST" && req.url === "/transcript") {
-          let body = "";
-          req.on("data", (chunk) => {
-            body += String(chunk);
-          });
-          req.on("end", () => {
+          readBody(req, (body) => {
             try {
               const parsed = JSON.parse(body || "{}") as { text?: string };
               const text = typeof parsed.text === "string" ? parsed.text : "";
@@ -816,6 +872,7 @@ export default function voiceboxSpeech(pi: {
     srv.listen(0, BRIDGE_HOST, () => {
       const addr = srv.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
+      boundBridgePort = port;
       fs.mkdirSync(path.dirname(registryFile), { recursive: true });
       fs.writeFileSync(
         registryFile,
@@ -835,7 +892,7 @@ export default function voiceboxSpeech(pi: {
     latestCtx = ctx;
     startBridgeServer();
     const child = spawn(
-      `${process.env.HOME}/.local/bin/omp-voice-controller`,
+      `${os.homedir()}/.local/bin/omp-voice-controller`,
       ["start"],
       { stdio: "ignore", detached: true },
     );
@@ -874,13 +931,24 @@ export default function voiceboxSpeech(pi: {
   });
 
   // If any assistant speech occurs while Handy is recording in DICTATING, silence it immediately!
+  let dictatingCacheAt = 0;
+  let dictatingCache = false;
   const isControllerDictating = (): boolean => {
+    const now = Date.now();
+    if (now - dictatingCacheAt < 200) return dictatingCache;
+    dictatingCacheAt = now;
     try {
       const ctrlPath = path.join(os.homedir(), ".local", "state", "omp-voice", "status.json");
-      if (!fs.existsSync(ctrlPath)) return false;
+      if (!fs.existsSync(ctrlPath)) {
+        dictatingCache = false;
+        return false;
+      }
       const parsed = JSON.parse(fs.readFileSync(ctrlPath, "utf8")) as { state?: string; updated_at?: number };
-      return parsed.state === "DICTATING" && Date.now() / 1000 - (parsed.updated_at ?? 0) < 60;
-    } catch {
+      dictatingCache = parsed.state === "DICTATING" && Date.now() / 1000 - (parsed.updated_at ?? 0) < 60;
+      return dictatingCache;
+    } catch (err) {
+      logOnce("status-read", err);
+      dictatingCache = false;
       return false;
     }
   };
@@ -917,7 +985,7 @@ export default function voiceboxSpeech(pi: {
         const sub = args.trim().toLowerCase();
       if (sub === "start") {
           const child = spawn(
-            `${process.env.HOME}/.local/bin/omp-voice-controller`,
+            `${os.homedir()}/.local/bin/omp-voice-controller`,
             ["start"],
             { stdio: "ignore", detached: true },
           );
@@ -927,7 +995,7 @@ export default function voiceboxSpeech(pi: {
         }
         if (sub === "stop-daemon") {
           const child = spawn(
-            `${process.env.HOME}/.local/bin/omp-voice-controller`,
+            `${os.homedir()}/.local/bin/omp-voice-controller`,
             ["stop"],
             { stdio: "ignore", detached: true },
           );
@@ -981,16 +1049,16 @@ export default function voiceboxSpeech(pi: {
         if (sub.startsWith("rate") || sub.startsWith("speed")) {
           const val = Number(sub.split(/\s+/)[1]);
           if (Number.isFinite(val) && val >= 0.7 && val <= 2.0) {
-            playbackRate = val;
-            ctx.ui?.notify?.(`Set VoiceBox playback speed to ${playbackRate}x (afplay -r ${playbackRate} -q 1).`, "info");
+            session.playbackRate = val;
+            ctx.ui?.notify?.(`Set VoiceBox playback speed to ${session.playbackRate}x (afplay -r ${session.playbackRate} -q 1).`, "info");
           } else {
-            ctx.ui?.notify?.(`Current playback speed: ${playbackRate}x. Usage: /voice speed 1.2`, "info");
+            ctx.ui?.notify?.(`Current playback speed: ${session.playbackRate}x. Usage: /voice speed 1.2`, "info");
           }
           return;
         }
         const draft = ctx.ui?.getEditorText?.() ?? "";
         ctx.ui?.notify?.(
-          `OMP Voice Bridge listening on http://${BRIDGE_HOST}:${BRIDGE_PORT} (speaking=${isSpeaking}, rate=${playbackRate}x, humanize=${humanizeMode}, draft=${draft.length} chars)`,
+          `OMP Voice Bridge listening on http://${BRIDGE_HOST}:${boundBridgePort} (speaking=${session.isSpeaking}, rate=${session.playbackRate}x, humanize=${humanizeMode}, draft=${draft.length} chars)`,
           "info",
         );
       },

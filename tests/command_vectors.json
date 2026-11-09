@@ -1,0 +1,10 @@
+[
+  {"raw": "send prompt", "action": "sent", "prefix": "", "phrase": "send prompt"},
+  {"raw": "hey jarvis stop", "action": "paused", "prefix": "", "phrase": "hey jarvis stop"},
+  {"raw": "please stop listening", "action": "paused", "prefix": "please", "phrase": "stop listening"},
+  {"raw": "stop", "action": "paused", "prefix": "", "phrase": "stop"},
+  {"raw": "scratch that", "action": "scratched", "prefix": "", "phrase": "scratch that"},
+  {"raw": "clear draft", "action": "cleared", "prefix": "", "phrase": "clear draft"},
+  {"raw": "cancel that", "action": "cancelled", "prefix": "", "phrase": "cancel that"},
+  {"raw": "not a command", "action": null, "prefix": "", "phrase": ""}
+]

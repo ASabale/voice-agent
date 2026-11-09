@@ -1,5 +1,5 @@
 #!/bin/sh
 # Handy external_script_path hook: forwards the transcribed chunk to the OMP Voice Bridge
-# (oromp-voice-controller) instead of blindly pressing Cmd+V before command phrases are parsed.
+# (or omp-voice-controller) instead of blindly pressing Cmd+V before command phrases are parsed.
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 exec "$ROOT/omp-voice-controller" handy-hook "$@"
