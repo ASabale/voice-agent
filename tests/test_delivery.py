@@ -1,12 +1,21 @@
 """Handy text follows the focused control, not whichever omp grabbed a port."""
 
 import importlib.machinery
+import importlib.util
+import sys
 from pathlib import Path
 
+import pytest
+
 _PATH = Path(__file__).resolve().parents[1] / "bin" / "omp-voice-controller"
-controller = importlib.machinery.SourceFileLoader(
-    "omp_voice_controller_delivery", str(_PATH)
-).load_module()
+_loader = importlib.machinery.SourceFileLoader("omp_voice_controller_delivery", str(_PATH))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+assert _spec and _spec.loader
+controller = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = controller
+_spec.loader.exec_module(controller)
+
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
 
 THIS = {"pid": 13703, "tty": "/dev/ttys002", "started_at": 100, "port": None}
 OTHER = {"pid": 21526, "tty": "ttys001", "started_at": 200, "port": None}
