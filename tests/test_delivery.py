@@ -33,6 +33,28 @@ def test_focused_omp_that_owns_the_legacy_port_uses_it() -> None:
     assert dest["pid"] == 13703
 
 
+def test_editable_control_outside_the_role_list_is_a_paste() -> None:
+    dest = controller.choose_delivery(
+        {"role": "AXGroup", "editable": True, "tty": None},
+        [THIS, OTHER],
+        legacy_owner_pid=21526,
+    )
+    assert dest["mode"] == "paste", dest
+    assert dest["focused_text"] is True
+    assert dest["pid"] is None
+
+
+def test_secure_field_in_any_app_is_a_paste() -> None:
+    dest = controller.choose_delivery(
+        {"role": "AXSecureTextField", "tty": None},
+        [THIS, OTHER],
+        legacy_owner_pid=21526,
+    )
+    assert dest["mode"] == "paste", dest
+    assert dest["focused_text"] is True
+    assert dest["pid"] is None
+
+
 def test_other_apps_text_field_is_a_paste() -> None:
     dest = controller.choose_delivery(
         {"role": "AXTextField", "tty": None},
@@ -56,6 +78,27 @@ def test_non_text_focus_uses_legacy_port_when_newest_owns_it() -> None:
     assert dest["port"] == 17494
 
 
+def test_send_it_in_a_text_field_is_enter() -> None:
+    plan = controller.focused_paste_plan("Send it.")
+    assert plan["action"] == "sent", plan
+    assert plan["text"] == ""
+    assert plan["phrase"] == "send it"
+
+
+def test_words_before_send_it_are_typed_then_enter() -> None:
+    plan = controller.focused_paste_plan("See you send it")
+    assert plan == {"action": "sent", "text": "See you", "phrase": "send it"}
+    punctuated = controller.focused_paste_plan("See you, send it.")
+    assert punctuated["text"] == "See you"
+    assert punctuated["action"] == "sent"
+
+
+def test_plain_dictation_stays_typed() -> None:
+    plan = controller.focused_paste_plan("See you tomorrow")
+    assert plan["action"] == "appended"
+    assert plan["text"] == "See you tomorrow"
+
+
 def test_list_role_is_not_text() -> None:
     dest = controller.choose_delivery(
         {"role": "AXList", "tty": None},
@@ -70,8 +113,13 @@ if __name__ == "__main__":
     test_focused_omp_tab_without_its_own_port_is_a_paste()
     test_focused_omp_tab_uses_its_registered_port()
     test_focused_omp_that_owns_the_legacy_port_uses_it()
+    test_editable_control_outside_the_role_list_is_a_paste()
+    test_secure_field_in_any_app_is_a_paste()
     test_other_apps_text_field_is_a_paste()
     test_non_text_focus_goes_to_the_newest_session()
     test_non_text_focus_uses_legacy_port_when_newest_owns_it()
+    test_send_it_in_a_text_field_is_enter()
+    test_words_before_send_it_are_typed_then_enter()
+    test_plain_dictation_stays_typed()
     test_list_role_is_not_text()
     print("ok")
