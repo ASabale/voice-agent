@@ -77,7 +77,16 @@ SOUND_CANCEL = "/System/Library/Sounds/Basso.aiff"
 STATE_DIR = Path.home() / ".local" / "state" / "omp-voice"
 SESSION_DIR = STATE_DIR / "sessions"
 PID_FILE = STATE_DIR / "controller.pid"
-TEXT_ROLES = frozenset({"AXTextArea", "AXTextField", "AXComboBox", "AXSearchField"})
+TEXT_ROLES = frozenset(
+    {
+        "AXTextArea",
+        "AXTextField",
+        "AXComboBox",
+        "AXSearchField",
+        "AXTextView",
+        "AXSecureTextField",
+    }
+)
 STATUS_FILE = STATE_DIR / "status.json"
 LOG_FILE = STATE_DIR / "controller.log"
 TTS_STATE_FILE = STATE_DIR / "tts-playing.json"
@@ -254,7 +263,7 @@ def choose_delivery(
     transcript through that bridge. Any other text control is a paste.
     When the focused control is not text, the newest omp session gets it.
     """
-    text_role = bool(focus) and focus.get("role") in TEXT_ROLES
+    text_role = focus_is_text(focus)
     tty = normalize_tty(focus.get("tty")) if focus else None
     usable: list[dict] = []
     for session in sessions:
@@ -296,6 +305,14 @@ def choose_delivery(
     if legacy_owner_pid == newest["pid"]:
         return bridge(newest, 17494)
     return paste(newest["pid"])
+
+
+def focus_is_text(focus: dict | None) -> bool:
+    if not focus:
+        return False
+    if focus.get("editable") is True:
+        return True
+    return focus.get("role") in TEXT_ROLES
 
 
 def pid_alive(pid: int) -> bool:
@@ -408,13 +425,56 @@ _FOCUSED_TEXT_SCRIPT = """
 tell application "System Events"
   set frontApp to first application process whose frontmost is true
   set appName to name of frontApp
-  set roleName to ""
   try
-    set focusedElem to value of attribute "AXFocusedUIElement" of frontApp
-    set roleName to role of focusedElem
+    -- Chromium and Electron hide a web text box until this is on. Native
+    -- AppKit fields already report a text role. Either way this is the front
+    -- app, not one browser.
+    set value of attribute "AXEnhancedUserInterface" of frontApp to true
   end try
+  try
+    set value of attribute "AXManualAccessibility" of frontApp to true
+  end try
+  set roleName to ""
+  set editable to "no"
+  set textRoles to {"AXTextArea", "AXTextField", "AXComboBox", "AXSearchField", "AXTextView", "AXSecureTextField"}
+  repeat 6 times
+    try
+      set focusedElem to value of attribute "AXFocusedUIElement" of frontApp
+      if focusedElem is not missing value then
+        try
+          set roleName to role of focusedElem
+        end try
+        set subName to ""
+        try
+          set subName to subrole of focusedElem
+        end try
+        if roleName is in textRoles or subName is in {"AXSecureTextField", "AXSearchField"} then
+          set editable to "yes"
+        else
+          try
+            set selRange to value of attribute "AXSelectedTextRange" of focusedElem
+            set editable to "yes"
+          end try
+          if editable is "no" then
+            try
+              set anc to value of attribute "AXHighestEditableAncestor" of focusedElem
+              if anc is not missing value then
+                set ancRole to role of anc
+                if ancRole is in textRoles then
+                  set editable to "yes"
+                  if roleName is "" then set roleName to ancRole
+                end if
+              end if
+            end try
+          end if
+        end if
+        exit repeat
+      end if
+    end try
+    delay 0.05
+  end repeat
 end tell
-return appName & linefeed & roleName
+return appName & linefeed & roleName & linefeed & editable
 """
 
 
@@ -426,12 +486,16 @@ def focused_text_context() -> dict | None:
         check=False,
     )
     if raw.returncode != 0:
+        log(f"Focus lookup failed ({raw.stderr.strip() or raw.returncode})")
         return None
     lines = [line.strip() for line in raw.stdout.splitlines()]
     app = lines[0] if lines else ""
     role = lines[1] if len(lines) > 1 else ""
-    if role not in TEXT_ROLES:
+    editable = len(lines) > 2 and lines[2] == "yes"
+    if role not in TEXT_ROLES and not editable:
+        log(f"Focus is not a text box app={app!r} role={role!r}")
         return None
+    log(f"Focus text box app={app!r} role={role!r}")
     tty_script = None
     if app == "Terminal":
         tty_script = 'tell application "Terminal" to tty of selected tab of front window'
@@ -447,7 +511,7 @@ def focused_text_context() -> dict | None:
         )
         if tty_run.returncode == 0:
             tty = tty_run.stdout.strip()
-    return {"app": app, "role": role, "tty": tty}
+    return {"app": app, "role": role, "tty": tty, "editable": editable}
 
 
 def resolve_delivery() -> dict:
@@ -923,8 +987,43 @@ def silence_speech(abort_agent: bool) -> None:
     threading.Thread(target=keep_killing, daemon=True).start()
 
 
+def focused_paste_plan(original: str) -> dict:
+    """A trailing send phrase presses Enter. Any words before it are typed first.
+
+    The command matcher lowercases its prefix. Keep the spoken capitalization
+    by cutting that many words off the original line instead.
+    """
+    matched = match_command(original)
+    if matched and matched["action"] == "sent":
+        phrase_words = matched["phrase"].split()
+        spoken = original.split()
+        head = spoken[: len(spoken) - len(phrase_words)] if phrase_words else spoken
+        typed = " ".join(head).strip(" .,!?;:")
+        return {"action": "sent", "text": typed, "phrase": matched["phrase"]}
+    return {"action": "appended", "text": original.strip(), "phrase": ""}
+
+
+def paste_into_focus(original: str) -> dict:
+    plan = focused_paste_plan(original)
+    if plan["action"] == "sent":
+        fallback_macos_inject(plan["text"], "sent")
+        return {
+            "action": "sent",
+            "draft": plan["text"],
+            "strippedCommand": plan["phrase"],
+            "via": "focus",
+        }
+    typed = plan["text"] + (" " if plan["text"] else "")
+    fallback_macos_inject(typed, "appended")
+    return {"action": "appended", "draft": plan["text"], "via": "focus"}
+
+
 def dispatch_transcript(text: str) -> dict:
-    """Paste into the focused text control, or send to the newest omp when focus is not text."""
+    """Paste into the focused text control, or send to the newest omp when focus is not text.
+
+    In a text field, a trailing send phrase ("send it", "send that") is Enter,
+    not more typed words. Anywhere else, that phrase still submits the omp draft.
+    """
     original = " ".join(text.strip().split())
     if not original:
         return {"action": "noop", "draft": ""}
@@ -939,8 +1038,7 @@ def dispatch_transcript(text: str) -> dict:
         f"focused_text={dest.get('focused_text')}"
     )
     if dest.get("mode") == "paste":
-        fallback_macos_inject(original + " ", "appended")
-        return {"action": "appended", "draft": original, "via": "focus"}
+        return paste_into_focus(original)
 
     base = bridge_base(dest)
     text = canonicalize_transcript(text)
@@ -990,8 +1088,7 @@ def dispatch_transcript(text: str) -> dict:
                 return resp
 
     if dest.get("focused_text"):
-        fallback_macos_inject(original + " ", "appended")
-        return {"action": "appended", "draft": original, "via": "focus"}
+        return paste_into_focus(original)
 
     matched = match_command(cleaned)
     if matched and matched["action"] == "cancelled":
