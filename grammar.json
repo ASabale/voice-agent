@@ -4,9 +4,21 @@
     {
       "action": "sent",
       "slots": [
-        ["send", "submit", "press", "ship", "prompt", "said", "sent", "friend"],
-        ["prompt", "that", "it", "message", "enter", "this"]
+        ["send", "submit", "prompt"],
+        ["prompt", "that", "it", "message", "enter", "this", "now"]
       ]
+    },
+    {
+      "action": "sent",
+      "slots": [["submit"]]
+    },
+    {
+      "action": "sent",
+      "slots": [["over"]]
+    },
+    {
+      "action": "sent",
+      "slots": [["all"], ["done"]]
     },
     {
       "action": "paused",
@@ -31,10 +43,14 @@
       ]
     },
     {
+      "action": "scratched",
+      "slots": [["undo"]]
+    },
+    {
       "action": "cleared",
       "slots": [
         ["clear", "scratch", "start"],
-        ["draft", "all", "text", "box", "over"]
+        ["draft", "all", "text", "box", "over", "everything", "on"]
       ]
     },
     {
@@ -43,6 +59,10 @@
         ["cancel", "discard"],
         ["that", "dictation", "chunk"]
       ]
+    },
+    {
+      "action": "cancelled",
+      "slots": [["discard"]]
     }
   ]
 }

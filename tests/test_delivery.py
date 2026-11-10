@@ -102,6 +102,18 @@ def test_words_before_send_it_are_typed_then_enter() -> None:
     assert punctuated["action"] == "sent"
 
 
+def test_draft_commands_are_not_typed_into_the_text_field() -> None:
+    for phrase, action in (
+        ("Cancel that.", "cancelled"),
+        ("Clear draft.", "cleared"),
+        ("Clear on.", "cleared"),
+        ("Clear all.", "cleared"),
+    ):
+        plan = controller.focused_paste_plan(phrase)
+        assert plan["action"] == action, plan
+        assert plan["text"] == ""
+
+
 def test_plain_dictation_stays_typed() -> None:
     plan = controller.focused_paste_plan("See you tomorrow")
     assert plan["action"] == "appended"

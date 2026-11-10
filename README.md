@@ -1,16 +1,28 @@
 # voice-agent
 
-Hands-free voice for a local [OMP](https://github.com/can1357/omp) session on a Mac.
+Hands-free voice for a local [OMP](https://github.com/can1357/omp) (`oh-my-pi`) session on a Mac.
 
-You say **Hey Jarvis**, dictate, and say **send prompt**. The words land in the OMP draft and are submitted from there. OMP’s reply is spoken back on this Mac. Saying **Hey Jarvis** again stops playback so you can talk over it.
+You say **Hey Jarvis**, dictate across pauses, and say **send prompt**. The words land in the OMP draft and are submitted from there. OMP’s reply is spoken back on this Mac in your cloned voice. Saying **Hey Jarvis** again stops playback so you can talk over it.
 
-This is a listener and an OMP extension. It does not ship its own speech engine. Three apps you install yourself do the work:
+## Why this exists
+
+Working with an OMP agent on a MacBook usually means typing into the terminal, watching the output on screen, and typing the next response. Dictation tools like Wispr Flow speed up the typing part, and [Handy](https://github.com/cjpais/Handy) makes speech-to-text completely local by typing spoken thoughts into the focused text box. Pairing that with [VoiceBox](https://github.com/jamiepine/voicebox) — which clones your voice locally across multiple languages and model quality tiers — completes the loop so the OMP agent can both hear you and speak back.
+
+`voice-agent` connects those pieces so you can work with your OMP session completely hands-free without looking at the screen:
+
+1. **Hands-free command grammar (`grammar.json`)**: Wake Handy by voice (**Hey Jarvis**), dictate in chunks where each ~5-second pause appends to the OMP draft without submitting, recover from mistakes or misinterpretations (**scratch that**, **clear draft**, **cancel that**), and submit when ready (**send prompt**).
+2. **Memory-aware model tiering (`1.7B ↔ 0.6B`)**: When an online model is unavailable or you run a large local model as the OMP agent's brain, unified memory gets tight. When `~/.local/state/strata/omp-autostart.json` reports `"engine": "flash"`, the controller automatically switches both Handy and VoiceBox down to their **0.6B** models so the entire stack (LLM + STT + TTS) fits in memory and runs 100% locally. When the large local model unloads, it restores both to **1.7B** quality.
+3. **Screen-free conversational collaboration (`skills/conversational-collaboration/`)**: Terminal output full of tables, diffs, and file paths does not work when read aloud. The bundled `conversational-collaboration` skill shapes how the agent speaks while you are away from the screen — staying silent during routine work and speaking short, high-signal beats only when a finding, milestone, or decision needs your input.
+
+## Architecture
+
+This is a local listener and an OMP extension. It does not ship its own speech engine or a separate middleman LLM. Three apps you install yourself do the work:
 
 | App | What it does here |
 |---|---|
 | [OMP](https://github.com/can1357/omp) (oh-my-pi) | The terminal session you are talking to. The extension in this repo types into its draft, submits, and speaks the reply. |
-| [Handy](https://github.com/cjpais/Handy) | Speech to text. The listener starts and stops recording. You do not have to keep Handy’s window open. |
-| [VoiceBox](https://github.com/jamiepine/voicebox) | Text to speech. One voice profile on this Mac speaks the reply. The profile name is local; this repo does not store it. |
+| [Handy](https://github.com/cjpais/Handy) | Local speech to text. The listener starts and stops recording. You do not have to keep Handy’s window open. |
+| [VoiceBox](https://github.com/jamiepine/voicebox) | Local text to speech. One cloned voice profile on this Mac speaks the reply across configurable quality tiers (`1.7B` / `0.6B`). The profile name is local; this repo does not store it. |
 
 ```mermaid
 flowchart LR
@@ -52,7 +64,7 @@ Install [Handy](https://github.com/cjpais/Handy) so `Handy.app` is in `/Applicat
 
 Install [VoiceBox](https://github.com/jamiepine/voicebox) and leave it running at `http://127.0.0.1:17493`. Create one voice profile in the app and remember its **name**.
 
-Download a Qwen text-to-speech model in VoiceBox (0.6B or 1.7B). The listener uses **1.7B** by default. If a local model state file at `~/.local/state/strata/omp-autostart.json` says `"engine": "flash"`, it switches Handy and VoiceBox to the **0.6B** models so they can sit beside a large local model, and switches both back to 1.7B when that file no longer says `flash`. Without that file, both stay on 1.7B. Download both sizes only if you use that switch.
+Download a Qwen text-to-speech model in VoiceBox (0.6B or 1.7B). The listener uses **1.7B** by default. If a local model state file at `~/.local/state/strata/omp-autostart.json` says `"engine": "flash"`, it switches Handy and VoiceBox to the **0.6B** models so they can sit beside a large local model in memory, and switches both back to **1.7B** when that file no longer says `flash`. Without that file, both stay on 1.7B. Download both sizes only if you use that switch.
 
 ### 4. This repository
 
@@ -72,7 +84,7 @@ cd voice-agent
 
 `OMP_VOICEBOX_PROFILE` overrides the profile file when it is set. Edit this checkout. Do not keep a second copy under `~/.local` or `~/.omp`.
 
-Reload the OMP session so it picks up the extension (`/reload-runtime` inside OMP). Then:
+Restart the OMP session so it picks up the extension (`/restart` inside OMP). There is no reload command. Then:
 
 ```sh
 omp-voice-controller start
@@ -86,10 +98,11 @@ Say **Hey Jarvis**, speak, pause, and say **send prompt**.
 |---|---|
 | Hey Jarvis | Playback stops, if any, and dictation starts |
 | a pause of about 5 seconds | The chunk is transcribed into the OMP draft and dictation continues |
-| send prompt | The draft is submitted |
+| send prompt / send now / submit / all done / over | The draft is submitted. Words before `over` are kept |
 | stop / pause listening / go to sleep | Dictation stops and the draft is kept |
-| scratch that | The last chunk is removed |
-| clear draft | The draft is emptied |
+| scratch that / undo | The last chunk is removed |
+| clear draft / clear everything | The draft is emptied |
+| cancel that / discard | The current unpasted chunk is discarded and the listener returns to idle |
 
 Command phrases are matched from `grammar.json`: one word from each slot, in order. Closing Handy’s window returns the listener to idle and does not open it again.
 
@@ -104,19 +117,18 @@ Logs and status stay on the machine, under `~/.local/state/omp-voice/`. Handy’
 
 | Path | Role |
 |---|---|
-| `bin/omp-voice-controller` | Wake word, silence chunking, Handy, model tier, microphone |
+| `bin/omp-voice-controller` | Wake word, silence chunking, Handy, memory-aware model tiering (`1.7B ↔ 0.6B`), microphone |
 | `bin/omp-handy-hook` | Forwards one Handy transcript into the controller |
-| `extension/voicebox-speech.ts` | OMP extension: draft, submit, barge-in, speech |
-| `grammar.json` | Ordered command slots |
-| `skills/conversational-collaboration/` | How a spoken reply should behave while someone is talking |
+| `extension/voicebox-speech.ts` | OMP extension: draft history, submit, barge-in, VoiceBox speech |
+| `grammar.json` | Ordered command slots for wake, submit, undo, clear, pause, and cancel |
+| `skills/conversational-collaboration/` | Skill that keeps spoken replies concise and actionable when you are not looking at the screen |
 | `docs/setup.md` | The same first-time steps, in longer form |
 
-## What is not built
+## Roadmap (Next Stages)
 
-1. A phone bridge
-2. Memory that survives across OMP sessions
-3. A directory sandbox for remote use
-4. A second model that holds a full-duplex conversation
+1. **Remote session control (away from the laptop)**: Bridge voice and session control over a private network (such as Tailscale) so you can talk to your MacBook's OMP agent and get work done while away from your desk or laptop.
+2. **Command authorization & sandboxing**: Rather than inventing a second sandbox layer, wire voice command authorizations directly into OMP's built-in sandboxing and approval gates so remote/hands-free execution stays safe and reliable.
+3. **Cross-session memory**: Persist structured context across OMP sessions automatically.
 
 ## License
 
