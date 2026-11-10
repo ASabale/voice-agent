@@ -6,5 +6,17 @@
   {"raw": "scratch that", "action": "scratched", "prefix": "", "phrase": "scratch that"},
   {"raw": "clear draft", "action": "cleared", "prefix": "", "phrase": "clear draft"},
   {"raw": "cancel that", "action": "cancelled", "prefix": "", "phrase": "cancel that"},
-  {"raw": "not a command", "action": null, "prefix": "", "phrase": ""}
+  {"raw": "not a command", "action": null, "prefix": "", "phrase": ""},
+  {"raw": "over", "action": "sent", "prefix": "", "phrase": "over"},
+  {"raw": "see you over", "action": "sent", "prefix": "see you", "phrase": "over"},
+  {"raw": "submit", "action": "sent", "prefix": "", "phrase": "submit"},
+  {"raw": "all done", "action": "sent", "prefix": "", "phrase": "all done"},
+  {"raw": "send now", "action": "sent", "prefix": "", "phrase": "send now"},
+  {"raw": "clear everything", "action": "cleared", "prefix": "", "phrase": "clear everything"},
+  {"raw": "clear on", "action": "cleared", "prefix": "", "phrase": "clear on"},
+  {"raw": "undo", "action": "scratched", "prefix": "", "phrase": "undo"},
+  {"raw": "undo that", "action": "scratched", "prefix": "", "phrase": "undo that"},
+  {"raw": "discard", "action": "cancelled", "prefix": "", "phrase": "discard"},
+  {"raw": "start over", "action": "cleared", "prefix": "", "phrase": "start over"},
+  {"raw": "said that", "action": null, "prefix": "", "phrase": ""}
 ]
