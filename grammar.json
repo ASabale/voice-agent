@@ -4,7 +4,7 @@
     {
       "action": "sent",
       "slots": [
-        ["send", "submit", "prompt"],
+        ["send", "sent", "submit", "prompt"],
         ["prompt", "that", "it", "message", "enter", "this", "now"]
       ]
     },
@@ -23,6 +23,10 @@
     {
       "action": "paused",
       "slots": [["stop"]]
+    },
+    {
+      "action": "paused",
+      "slots": [["pause"]]
     },
     {
       "action": "paused",
@@ -50,8 +54,12 @@
       "action": "cleared",
       "slots": [
         ["clear", "scratch", "start"],
-        ["draft", "all", "text", "box", "over", "everything", "on"]
+        ["draft", "dress", "drive", "all", "text", "box", "over", "everything", "on"]
       ]
+    },
+    {
+      "action": "cleared",
+      "slots": [["near", "air", "here"], ["draft", "drive"]]
     },
     {
       "action": "cancelled",
@@ -63,6 +71,10 @@
     {
       "action": "cancelled",
       "slots": [["discard"]]
+    },
+    {
+      "action": "cancelled",
+      "slots": [["cancel", "canceled", "cancelled"]]
     }
   ]
 }
