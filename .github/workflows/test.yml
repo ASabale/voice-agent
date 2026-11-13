@@ -20,4 +20,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --experimental-strip-types --test tests/match_command.test.ts
+      - run: node --experimental-strip-types --test tests/match_command.test.ts tests/playback-state.test.ts tests/speech-queue.test.ts

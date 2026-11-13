@@ -120,6 +120,102 @@ def test_plain_dictation_stays_typed() -> None:
     assert plan["text"] == "See you tomorrow"
 
 
+def test_status_targets_one_session_port_and_no_legacy() -> None:
+    targets = controller.bridge_status_targets([{"port": 56876}], None)
+    assert targets == ["http://127.0.0.1:56876"]
+    assert "http://127.0.0.1:17494" not in targets
+
+
+def test_status_targets_empty_when_nothing_is_listening() -> None:
+    assert controller.bridge_status_targets([], None) == []
+
+
+def test_status_targets_legacy_when_session_has_no_port() -> None:
+    assert controller.bridge_status_targets([{"pid": 5}], 5) == ["http://127.0.0.1:17494"]
+
+
+def test_status_targets_session_ports_then_legacy() -> None:
+    sessions = [{"port": 1111}, {"port": 2222}]
+    assert controller.bridge_status_targets(sessions, 9) == [
+        "http://127.0.0.1:1111",
+        "http://127.0.0.1:2222",
+        "http://127.0.0.1:17494",
+    ]
+
+
+def test_status_targets_legacy_port_on_a_session_is_not_repeated() -> None:
+    assert controller.bridge_status_targets([{"port": 17494}], 9) == ["http://127.0.0.1:17494"]
+
+
+def test_probe_reports_the_session_bridge_and_skips_the_legacy_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str | None] = []
+
+    def fake_request(
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 1,
+        base: str | None = None,
+    ) -> dict | None:
+        del path, method, body, timeout
+        seen.append(base)
+        if base == "http://127.0.0.1:56876":
+            return {"ok": True, "pid": 80894, "speaking": False}
+        return None
+
+    monkeypatch.setattr(controller, "bridge_request", fake_request)
+    report = controller.probe_bridge_status(
+        {"mode": "bridge", "port": 56876},
+        ["http://127.0.0.1:56876"],
+    )
+    assert seen == ["http://127.0.0.1:56876"]
+    assert report["ok"] is True
+    assert report["url"] == "http://127.0.0.1:56876"
+    assert report["pid"] == 80894
+
+
+def test_probe_asks_the_delivery_port_before_other_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str | None] = []
+
+    def fake_request(
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 1,
+        base: str | None = None,
+    ) -> dict | None:
+        del path, method, body, timeout
+        seen.append(base)
+        if base == "http://127.0.0.1:56876":
+            return {"ok": True}
+        return None
+
+    monkeypatch.setattr(controller, "bridge_request", fake_request)
+    report = controller.probe_bridge_status(
+        {"mode": "bridge", "port": 56876},
+        ["http://127.0.0.1:1111", "http://127.0.0.1:56876"],
+    )
+    assert seen == ["http://127.0.0.1:56876"]
+    assert report["url"] == "http://127.0.0.1:56876"
+
+
+def test_probe_down_omits_the_legacy_port_when_it_is_not_a_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(controller, "bridge_request", lambda *args, **kwargs: None)
+    report = controller.probe_bridge_status({"mode": "paste", "port": None}, [])
+    assert report == {"ok": False, "note": "No session bridge responded", "targets": []}
+
+
+def test_probe_down_names_the_legacy_bind_when_17494_was_probed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(controller, "bridge_request", lambda *args, **kwargs: None)
+    report = controller.probe_bridge_status(
+        {"mode": "bridge", "port": 17494},
+        ["http://127.0.0.1:17494"],
+    )
+    assert report["ok"] is False
+    assert report["targets"] == ["http://127.0.0.1:17494"]
+    assert "17494" in report["note"]
+
+
 def test_list_role_is_not_text() -> None:
     dest = controller.choose_delivery(
         {"role": "AXList", "tty": None},
