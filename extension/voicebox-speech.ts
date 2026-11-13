@@ -430,15 +430,19 @@ export function takeSentences(fresh: string, flush: boolean): string[] {
 }
 
 let cachedProfileId = "";
+let cachedProfileName = "";
 
 async function profileId(): Promise<string | undefined> {
-  if (cachedProfileId) return cachedProfileId;
+  const name = profileName();
+  if (!name) return undefined;
+  if (cachedProfileId && cachedProfileName === name) return cachedProfileId;
   const res = await fetch(`${API}/profiles`);
   const rows: unknown = await res.json().catch(() => null);
   if (!Array.isArray(rows)) return undefined;
   for (const row of rows) {
     if (!row || typeof row !== "object" || !("name" in row) || !("id" in row)) continue;
-    if (row.name === profileName() && typeof row.id === "string") {
+    if (row.name === name && typeof row.id === "string") {
+      cachedProfileName = name;
       cachedProfileId = row.id;
       return row.id;
     }

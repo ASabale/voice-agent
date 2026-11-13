@@ -3,6 +3,8 @@
   {"raw": "hey jarvis stop", "action": "paused", "prefix": "", "phrase": "hey jarvis stop"},
   {"raw": "please stop listening", "action": "paused", "prefix": "please", "phrase": "stop listening"},
   {"raw": "stop", "action": "paused", "prefix": "", "phrase": "stop"},
+  {"raw": "pause", "action": "paused", "prefix": "", "phrase": "pause"},
+  {"raw": "pause listening", "action": "paused", "prefix": "", "phrase": "pause listening"},
   {"raw": "scratch that", "action": "scratched", "prefix": "", "phrase": "scratch that"},
   {"raw": "clear draft", "action": "cleared", "prefix": "", "phrase": "clear draft"},
   {"raw": "cancel that", "action": "cancelled", "prefix": "", "phrase": "cancel that"},
@@ -17,6 +19,8 @@
   {"raw": "undo", "action": "scratched", "prefix": "", "phrase": "undo"},
   {"raw": "undo that", "action": "scratched", "prefix": "", "phrase": "undo that"},
   {"raw": "discard", "action": "cancelled", "prefix": "", "phrase": "discard"},
+  {"raw": "cancel", "action": "cancelled", "prefix": "", "phrase": "cancel"},
+  {"raw": "canceled", "action": "cancelled", "prefix": "", "phrase": "canceled"},
   {"raw": "start over", "action": "cleared", "prefix": "", "phrase": "start over"},
   {"raw": "said that", "action": null, "prefix": "", "phrase": ""}
 ]
