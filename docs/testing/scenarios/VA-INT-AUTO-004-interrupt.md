@@ -1,0 +1,10 @@
+# VA-INT-AUTO-004 — Interrupt one isolated session
+
+1. **ID:** VA-INT-AUTO-004
+2. **Level:** LEVEL 3. Not a microphone test. The controller log has no line after 14:27:42, so this did not go through Handy.
+3. **Do not:** POST to pid 16590. `silence_speech` in the controller posts `/barge-in` to every live bridge and kills every TTS clip. This test posted only to the isolated port.
+4. **Session:** Pid 26348, bridge `63609`, file `.local/voice-agent/omp-test-sessions/2026-11-13T20-07-37-921Z_01a1d685-d6c1-7787-8f89-62a5731f114e.jsonl`.
+5. **Playback:** VoiceBox generated `omp-vb-26348-1.wav` at 20:07:46Z, 34 characters, 53760 frames, 24 kHz (2.24 s). `afplay` pid 26669. `POST /barge-in` with `{}` returned `stopped: true`, `abortedTurn: false`. The slot ended 78 ms after `started_at` (1794600466.007 to 1794600466.085). `afplay` was gone. No second file from that reply was generated, so the rest of the paragraph did not play.
+6. **Next turn:** After `agentBusy` was false, `POST /transcript` on port 63609 sent `Reply with exactly: After the stop. Send that.` Result `action: sent`. Assistant text was `after the stop`. A new file `omp-vb-26348-2.wav` (44160 frames) played on `afplay` 26796 from 1794600473.902 to 1794600476.526. That is a different clip, not the first file resumed. The generate log says 27 characters. That is `forSpeech("after the stop")`: the word `stop` is rewritten to `the pause command`, so the spoken string is `after the the pause command`. The assistant text stayed `after the stop`. The first clip's 34 characters are the first sentence, `Voice integration interrupt check.` The rest of that paragraph was requested as 152 characters and aborted (`AbortError`) when `/barge-in` landed.
+7. **User session:** `sessions/16590.json` was unchanged. No POST to port 62283. At the start, pid 16590 was `speaking: true`. Its slot `afplay` 26339 ended at 1794600466.192, 107 ms after the test slot ended. The controller did not log a barge. This test did not call `kill_tts_clips`.
+8. **Not done:** No wake word, no Handy transcript, no proof a person heard the cut.

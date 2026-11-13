@@ -7,3 +7,4 @@ __pycache__/
 controller.pid
 status.json
 tts-playing.json
+brag-output/

@@ -3,3 +3,4 @@ sounddevice>=0.4,<1
 faster-whisper>=1.0,<2
 openwakeword>=0.6,<1
 onnxruntime>=1.16,<2
+aec-audio-processing==1.0.0

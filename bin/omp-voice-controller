@@ -140,7 +140,7 @@ SOUND_SEND = "/Applications/Handy.app/Contents/Resources/resources/marimba_stop.
 SOUND_PAUSE = "/System/Library/Sounds/Pop.aiff"
 SOUND_CANCEL = "/System/Library/Sounds/Basso.aiff"
 
-STATE_DIR = Path.home() / ".local" / "state" / "omp-voice"
+STATE_DIR = Path(os.environ.get("OMP_VOICE_STATE_DIR", str(Path.home() / ".local" / "state" / "omp-voice")))
 SESSION_DIR = STATE_DIR / "sessions"
 PID_FILE = STATE_DIR / "controller.pid"
 TEXT_ROLES = frozenset(
@@ -364,6 +364,21 @@ def resample_to_mic_rate(pcm: np.ndarray, src_rate: int, dst_rate: int = 16000) 
     i1 = np.minimum(i0 + 1, len(samples) - 1)
     frac = (pos - i0).astype(np.float32)
     mixed = samples[i0].astype(np.float32) * (1.0 - frac) + samples[i1].astype(np.float32) * frac
+    return np.clip(np.rint(mixed), -32768, 32767).astype(np.int16)
+
+
+def downmix_to_mono(pcm: np.ndarray, channels: int) -> np.ndarray:
+    """Average interleaved channels onto one. Mono passes through unchanged.
+
+    afplay sends stereo to both speakers and the microphone hears their sum,
+    so the averaged pair is the render reference for a stereo clip.
+    """
+    if channels <= 1:
+        return pcm
+    frames = len(pcm) // channels
+    if frames <= 0:
+        return np.zeros(0, dtype=np.int16)
+    mixed = pcm[: frames * channels].reshape(frames, channels).mean(axis=1)
     return np.clip(np.rint(mixed), -32768, 32767).astype(np.int16)
 
 
@@ -649,6 +664,128 @@ def apply_render_subtraction(frame: np.ndarray, captured_at: float | None = None
     return cleaned
 
 
+AEC_FRAME_SAMPLES = 160
+_echo_ap = None
+_echo_key = None
+_echo_unavailable = False
+
+
+def make_echo_canceller(delay_ms: int = 0):
+    """Desktop echo control only. Noise suppression and gain control stay off.
+
+    The barge path reads RMS. A gain controller would move those gates.
+    delay_ms is the starting hint. The canceller estimates the rest.
+    """
+    from aec_audio_processing import AudioProcessor
+
+    processor = AudioProcessor(
+        enable_aec=True,
+        enable_ns=False,
+        enable_agc=False,
+        enable_vad=False,
+    )
+    processor.set_stream_format(16000, 1)
+    processor.set_reverse_stream_format(16000, 1)
+    processor.set_stream_delay(delay_ms)
+    return processor
+
+
+def render_block_at(
+    render: np.ndarray,
+    started_at: float,
+    captured_at: float,
+    n: int,
+    playback_rate: float,
+    paused_seconds: float,
+) -> np.ndarray:
+    """Far-end samples for one mic block, lined up with render_cursor.
+
+    Sample zero of the block is the file sample at the start of the capture.
+    Samples outside the file are silence. This is not an acoustic delay.
+    """
+    end_position = render_cursor(started_at, captured_at - paused_seconds, 16000, playback_rate)
+    origin = end_position - n
+    block = np.zeros(n, dtype=np.int16)
+    src_lo = max(0, origin)
+    src_hi = min(len(render), origin + n)
+    if src_hi > src_lo:
+        dst_lo = src_lo - origin
+        block[dst_lo : dst_lo + (src_hi - src_lo)] = render[src_lo:src_hi]
+    return block
+
+
+def process_echo_block(processor, mic: np.ndarray, reverse: np.ndarray) -> np.ndarray:
+    """10 ms frames, reverse then capture, joined back in order.
+
+    A length that is not a whole number of frames is returned unchanged.
+    """
+    mic_i = np.asarray(mic, dtype=np.int16).reshape(-1)
+    reverse_i = np.asarray(reverse, dtype=np.int16).reshape(-1)
+    if len(mic_i) != len(reverse_i) or len(mic_i) == 0 or len(mic_i) % AEC_FRAME_SAMPLES:
+        return mic_i
+    out = np.empty(len(mic_i), dtype=np.int16)
+    for start in range(0, len(mic_i), AEC_FRAME_SAMPLES):
+        stop = start + AEC_FRAME_SAMPLES
+        processor.process_reverse_stream(reverse_i[start:stop].tobytes())
+        cleaned = np.frombuffer(
+            processor.process_stream(mic_i[start:stop].tobytes()),
+            dtype=np.int16,
+        )
+        out[start:stop] = cleaned
+    return out
+
+
+def playback_echo_canceller(file_key):
+    """One canceller per clip. A new file starts from an empty filter."""
+    global _echo_ap, _echo_key, _echo_unavailable
+    if _echo_unavailable:
+        return None
+    if _echo_ap is not None and _echo_key == file_key:
+        return _echo_ap
+    try:
+        processor = make_echo_canceller()
+    except ImportError:
+        _echo_unavailable = True
+        _echo_ap = None
+        log_once("echo-cancel-missing", "WebRTC echo control unavailable; using the short render fit")
+        return None
+    _echo_ap = processor
+    _echo_key = file_key
+    log_once("echo-cancel", "WebRTC echo control on the playback reference")
+    return processor
+
+
+def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) -> np.ndarray:
+    """Remove our playback before VAD. The short fit runs only if this module is missing.
+
+    No reference means the block is unchanged. Idle audio is not filtered.
+    """
+    parsed = _render_parsed
+    samples = _render_samples
+    if not parsed or samples is None or not parsed.get("aligned"):
+        return frame
+    started = parsed.get("started_at")
+    if not isinstance(started, float):
+        return frame
+    processor = playback_echo_canceller(_render_file_key)
+    if processor is None:
+        return apply_render_subtraction(frame, captured_at)
+    when = time.time() if captured_at is None else captured_at
+    rate = parsed.get("playback_rate")
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        rate = 1.0
+    mic = np.asarray(frame, dtype=np.int16).reshape(-1)
+    reverse = render_block_at(
+        samples,
+        started,
+        when,
+        len(mic),
+        float(rate),
+        paused_playback_seconds(when),
+    )
+    return process_echo_block(processor, mic, reverse)
+
+
 def render_status_fields(connected: dict | None) -> dict:
     if not connected:
         return {"render_connected": False}
@@ -749,11 +886,9 @@ def refresh_render_reference(now: float | None = None) -> dict:
         _render_pcm = connected["pcm"]
         raw = np.frombuffer(connected["pcm"], dtype="<i2").copy()
         _render_parsed = {key: value for key, value in connected.items() if key != "pcm"}
-        if connected["channels"] == 1:
-            _render_samples = resample_to_mic_rate(raw, int(connected["sample_rate"]))
-            _render_parsed["aligned"] = _render_samples.size > 0
-        else:
-            _render_samples = raw
+        mono = downmix_to_mono(raw, int(connected["channels"]))
+        _render_samples = resample_to_mic_rate(mono, int(connected["sample_rate"]))
+        _render_parsed["aligned"] = _render_samples.size > 0
     elif _render_parsed is None:
         _render_fields = render_status_fields(None)
         return _render_fields
@@ -853,12 +988,15 @@ def playback_sources_speaking(slots, legacy, now: float, pid_alive_fn, tail: flo
 
 
 def _read_playback_slots() -> list[dict] | None:
-    slot_dir = STATE_DIR / "tts-playing"
+    slot_dir = playback_slot_dir()
     if not slot_dir.is_dir():
         return None
+    owner = playback_owner_pid()
     found: list[dict] = []
     for path in slot_dir.glob("*.json"):
         if not path.stem.isdigit():
+            continue
+        if owner and path.stem != owner:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -1222,6 +1360,46 @@ def load_session_registry() -> dict[int, dict]:
     return found
 
 
+def loopback_listen_port(lsof_text: str) -> int | None:
+    """The one 127.0.0.1 listen port in lsof -F n output. Two different ports is no guess."""
+    ports: list[int] = []
+    for line in lsof_text.splitlines():
+        if not line.startswith("n"):
+            continue
+        host, sep, port = line[1:].rpartition(":")
+        if not sep or host not in {"127.0.0.1", "localhost"} or not port.isdigit():
+            continue
+        number = int(port)
+        if number not in ports:
+            ports.append(number)
+    if len(ports) != 1:
+        return None
+    return ports[0]
+
+
+def pid_bridge_port(pid: int) -> int | None:
+    """Registry files disappear while the bridge is still listening. One loopback port that answers /status is that bridge."""
+    try:
+        text = subprocess.check_output(
+            ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-F", "n"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    port = loopback_listen_port(text)
+    if port is None:
+        return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=1) as res:
+            data = json.loads(res.read().decode())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("ok") is not True or data.get("pid") != pid:
+        return None
+    return port
+
+
 def omp_session_records() -> list[dict]:
     records = load_session_registry()
     for pid in omp_ui_pids():
@@ -1232,6 +1410,8 @@ def omp_session_records() -> list[dict]:
             current["tty"] = pid_tty(pid)
         if not current.get("started_at"):
             current["started_at"] = pid_started_at(pid)
+        if not current.get("port"):
+            current["port"] = pid_bridge_port(pid)
         records[pid] = current
     return list(records.values())
 
@@ -1330,6 +1510,12 @@ def focused_text_context() -> dict | None:
 
 
 def resolve_delivery() -> dict:
+    only = bridge_only_base()
+    if only:
+        port = int(only.rsplit(":", 1)[-1])
+        pid_text = playback_owner_pid()
+        pid = int(pid_text) if pid_text.isdigit() else None
+        return {"mode": "bridge", "port": port, "pid": pid, "focused_text": False}
     return choose_delivery(focused_text_context(), omp_session_records(), legacy_bridge_owner_pid())
 
 
@@ -1354,6 +1540,9 @@ def bridge_status_targets(sessions: list[dict], legacy_owner_pid: int | None) ->
 
 
 def live_bridge_bases() -> list[str]:
+    only = bridge_only_base()
+    if only:
+        return [only]
     return bridge_status_targets(omp_session_records(), legacy_bridge_owner_pid())
 
 
@@ -1532,9 +1721,13 @@ VOICEBOX_HEALTH_RETRY_SECONDS = 5.0
 def sync_speech_tier(now: float) -> None:
     """Keep Handy on the Strata tier. Ask VoiceBox again 5 s after a refusal.
 
+    File mode must not get here: apply_handy_model kills the shared Handy app.
+
     A down VoiceBox used to invert the Handy flag, so the next mic frame tried
     again. That was a health check and a log line about twelve times a second.
     """
+    if handy_file_mode():
+        return
     global _voicebox_want, _voicebox_ok, _voicebox_retry_at
     strata_running = _strata_loaded.is_set()
     if strata_running != _handy_on_light:
@@ -1592,6 +1785,72 @@ def _watch_strata() -> None:
             time.sleep(5)
         finally:
             os.close(fd)
+
+
+def handy_file_mode() -> bool:
+    """Transcribe captured frames with handy --transcribe-file.
+
+    The GUI recorder and history.db are shared with the live controller.
+    Toggling them from a test would submit the user's speech. File mode
+    never launches or cancels that app.
+    """
+    return os.environ.get("OMP_VOICE_HANDY", "") == "transcribe-file"
+
+
+def transcribe_handy_file(frames: list[np.ndarray]) -> str:
+    """Run Handy's batch ASR on frames the controller already captured. No microphone."""
+    if not frames:
+        return ""
+    audio = np.concatenate(frames).astype(np.int16, copy=False)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / f"handy-capture-{time.time_ns()}.wav"
+    import wave
+
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(audio.tobytes())
+    try:
+        proc = subprocess.run(
+            [HANDY_BIN, "--transcribe-file", str(path), "--json"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"handy --transcribe-file failed: {exc}")
+        return ""
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        log(f"handy --transcribe-file returned no JSON (exit {proc.returncode})")
+        return ""
+    text = str(data.get("text") or "").strip()
+    log(f"Handy file transcript: {text!r} model={data.get('model')}")
+    return text
+
+
+def bridge_only_base() -> str | None:
+    """When set, delivery and barge-in stay on this one bridge."""
+    raw = os.environ.get("OMP_VOICE_BRIDGE_ONLY", "").strip()
+    if not raw:
+        return None
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw.rstrip("/")
+    return f"http://127.0.0.1:{int(raw)}"
+
+
+def playback_owner_pid() -> str:
+    return os.environ.get("OMP_VOICE_PLAYBACK_PID", "").strip()
+
+
+def playback_slot_dir() -> Path:
+    override = os.environ.get("OMP_VOICE_PLAYBACK_DIR", "").strip()
+    if override:
+        return Path(override)
+    return STATE_DIR / "tts-playing"
 
 
 def handy_model_id() -> str:
@@ -1839,10 +2098,12 @@ def _omp_vb_pids() -> list[str]:
     except Exception as exc:
         log_once("kill-tts", f"kill_tts_clips probe failed: {exc}")
         return []
+    owner = playback_owner_pid()
+    needle = f"omp-vb-{owner}-" if owner else "omp-vb-"
     return [
         line.split(None, 1)[0]
         for line in listing.splitlines()
-        if "afplay" in line and "omp-vb-" in line
+        if "afplay" in line and needle in line
     ]
 
 
@@ -2106,6 +2367,106 @@ def paste_into_focus(original: str, preserved: str = "") -> dict:
     return {"action": "appended", "draft": plan["text"], "via": "focus"}
 
 
+_undelivered_transcript = ""
+_pending_send_prefix = ""
+
+
+_ASIDE_ACTIONS = {"paused", "scratched", "cleared", "cancelled"}
+
+
+def _command_leaves_hold(text: str) -> bool:
+    """Pause, scratch, clear, and cancel must not consume a sentence that is waiting."""
+    matched = match_command(text)
+    return bool(matched and matched["action"] in _ASIDE_ACTIONS)
+
+
+def _visible_hold() -> str:
+    sentence = _undelivered_transcript
+    prefix = _pending_send_prefix
+    if not prefix:
+        return sentence
+    if not sentence or sentence == prefix or sentence.endswith(" " + prefix):
+        return sentence or prefix
+    return f"{sentence} {prefix}"
+
+
+def _remember_send_prefix(prefix: str) -> None:
+    """Keep words that were in front of a send. A later sentence must not consume them."""
+    global _pending_send_prefix
+    piece = " ".join(prefix.split())
+    if not piece:
+        return
+    current = _pending_send_prefix
+    if not current or piece == current or current.endswith(" " + piece):
+        _pending_send_prefix = piece if not current else current
+        return
+    if piece.endswith(" " + current):
+        _pending_send_prefix = piece
+        return
+    _pending_send_prefix = f"{current} {piece}".strip()
+
+
+def _with_undelivered(text: str) -> str:
+    sentence = _undelivered_transcript
+    matched = match_command(text)
+    if not (matched and matched["action"] == "sent"):
+        if not sentence or text == sentence or text.startswith(sentence + " "):
+            return text
+        return f"{sentence} {text}".strip()
+    prefix = matched["prefix"]
+    stored = _pending_send_prefix
+    if stored and not prefix:
+        prefix = stored
+    elif stored and prefix and stored.endswith(" " + prefix):
+        prefix = stored
+    elif stored and prefix and not (prefix == stored or prefix.endswith(" " + stored)):
+        prefix = f"{stored} {prefix}".strip()
+    command = f"{prefix} send prompt".strip() if prefix else "send prompt"
+    if not sentence:
+        return command
+    if command == sentence or command.startswith(sentence + " "):
+        return command
+    if prefix and (sentence == prefix or sentence.endswith(" " + prefix)):
+        return f"{sentence} send prompt"
+    return f"{sentence} {command}".strip()
+
+
+def _remember_undelivered(text: str) -> str:
+    """Keep a bridge transcript that could not be posted. The same text is stored once."""
+    global _undelivered_transcript
+    piece = " ".join(text.split())
+    if not piece:
+        return _undelivered_transcript
+    if piece == _undelivered_transcript or _undelivered_transcript.endswith(" " + piece):
+        return _undelivered_transcript
+    _undelivered_transcript = f"{_undelivered_transcript} {piece}".strip()
+    return _undelivered_transcript
+
+
+def _clear_undelivered() -> None:
+    global _undelivered_transcript
+    _undelivered_transcript = ""
+
+
+def _clear_delivery(text: str) -> None:
+    """A sent or clear command also drops the prefix. A clear also drops a saved pause line."""
+    global _pending_send_prefix, PRESERVED_PAUSE
+    _clear_undelivered()
+    matched = match_command(text)
+    if matched and matched["action"] in {"sent", "cleared"}:
+        _pending_send_prefix = ""
+    if matched and matched["action"] == "cleared":
+        PRESERVED_PAUSE = ""
+
+
+def _hold_failed_send(prefix: str) -> dict:
+    """A send that did not post keeps the words in front of the command. The command itself is not stored."""
+    if prefix.strip():
+        _remember_send_prefix(prefix)
+    log("Send post failed; keeping the held sentence")
+    return {"action": "held", "draft": _visible_hold()}
+
+
 def dispatch_transcript(text: str) -> dict:
     """Paste into the focused text control, or send to the newest omp when focus is not text.
 
@@ -2170,9 +2531,33 @@ def dispatch_transcript(text: str) -> dict:
     status = bridge_request("/status", method="GET", base=base)
     if status and status.get("ok"):
         if status.get("version", 1) >= 2:
-            resp = bridge_request("/transcript", method="POST", body={"text": text}, base=base)
+            aside = _command_leaves_hold(text)
+            payload = text if aside else _with_undelivered(text)
+            resp = bridge_request("/transcript", method="POST", body={"text": payload}, base=base)
             if resp and resp.get("ok"):
+                cleared = match_command(text)
+                if not aside or (cleared and cleared["action"] == "cleared"):
+                    _clear_delivery(text)
                 return resp
+            sent = match_command(text)
+            if not aside and sent and sent["action"] == "sent":
+                return _hold_failed_send(sent["prefix"])
+            if sent and sent["action"] == "paused":
+                log("Pause post failed; keeping the held sentence")
+                return {"action": "held", "draft": _visible_hold()}
+            if sent and sent["action"] == "scratched":
+                log("Scratch post failed; keeping the held sentence")
+                return {"action": "held", "draft": _visible_hold()}
+            if sent and sent["action"] == "cleared":
+                log("Clear post failed; keeping the held sentence")
+                return {"action": "held", "draft": _visible_hold()}
+            if sent and sent["action"] == "cancelled":
+                log("Cancel post failed; keeping the held sentence")
+                return {
+                    "action": "cancelled",
+                    "draft": _visible_hold(),
+                    "strippedCommand": sent["phrase"],
+                }
         else:
             # v1 bridge compatibility (before the OMP session was restarted):
             # Handy's Cmd+V already pasted `text` into the focused OMP editor if `draft` ends with `text`.
@@ -2199,14 +2584,37 @@ def dispatch_transcript(text: str) -> dict:
                 resp = bridge_request("/transcript", method="POST", body={"text": mapped}, base=base)
                 if resp and resp.get("ok"):
                     return resp
+                log("Pause post failed; keeping the held sentence")
+                return {"action": "held", "draft": _visible_hold()}
             if matched and matched["action"] == "sent":
-                mapped = f"{matched['prefix']} send prompt".strip()
+                mapped = _with_undelivered(f"{matched['prefix']} send prompt".strip())
                 resp = bridge_request("/transcript", method="POST", body={"text": mapped}, base=base)
                 if resp and resp.get("ok"):
+                    _clear_delivery(text)
                     return resp
-            resp = bridge_request("/transcript", method="POST", body={"text": text}, base=base)
+                return _hold_failed_send(matched["prefix"])
+            aside = _command_leaves_hold(text)
+            payload = text if aside else _with_undelivered(text)
+            resp = bridge_request("/transcript", method="POST", body={"text": payload}, base=base)
             if resp and resp.get("ok"):
+                if not aside or (matched and matched["action"] == "cleared"):
+                    _clear_delivery(text)
                 return resp
+            if aside and matched and matched["action"] == "cancelled":
+                log("Cancel post failed; keeping the held sentence")
+                return {
+                    "action": "cancelled",
+                    "draft": _visible_hold(),
+                    "strippedCommand": matched["phrase"],
+                }
+            if aside and matched and matched["action"] in {"scratched", "cleared"}:
+                log("Command post failed; keeping the held sentence")
+                return {"action": "held", "draft": _visible_hold()}
+
+    if dest.get("mode") == "bridge" and not dest.get("focused_text") and match_command(cleaned) is None:
+        held = _remember_undelivered(cleaned)
+        log(f"Bridge status failed; holding {len(held)} chars")
+        return {"action": "held", "draft": held}
 
     if dest.get("focused_text"):
         return paste_into_focus(original)
@@ -2218,6 +2626,11 @@ def dispatch_transcript(text: str) -> dict:
         fallback_macos_inject(matched["prefix"] + (" " if matched["prefix"] else ""), "paused")
         return {"action": "paused", "strippedCommand": matched["phrase"]}
     if matched and matched["action"] == "sent":
+        if _pending_send_prefix:
+            if matched["prefix"]:
+                _remember_send_prefix(matched["prefix"])
+            log("Send status failed; keeping the held prefix")
+            return {"action": "held", "draft": _visible_hold()}
         fallback_macos_inject(matched["prefix"], "sent")
         return {"action": "sent", "strippedCommand": matched["phrase"]}
 
@@ -2293,6 +2706,27 @@ def _open_pid_lock(block: bool) -> object | None:
     return handle
 
 
+def barge_note(mic: "MicState", stage: str, **fields) -> None:
+    """One stage change. Frame rows are written only while a hold is open and tracing is on."""
+    if os.environ.get("OMP_VOICE_BARGE_TRACE", "") != "1":
+        return
+    event = {"t": round(time.time(), 3), "stage": stage}
+    for key, value in fields.items():
+        if isinstance(value, float):
+            event[key] = round(value, 3)
+        else:
+            event[key] = value
+    mic.barge_trace.append(event)
+    if len(mic.barge_trace) > 80:
+        del mic.barge_trace[:-80]
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with (STATE_DIR / "barge-trace.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except OSError:
+        return
+
+
 def stop_playback(reason: str) -> None:
     # Kill the clip and the turn. Stopping only afplay leaves the agent
     # streaming, and the next sentence starts the loop again.
@@ -2346,6 +2780,10 @@ class MicState:
     tts_barge_next: tuple | None = None
     tts_barge_cool_until: float = 0.0
     tts_floor_holdoff: int = 0
+    tts_pre_roll: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=8))
+    tts_barge_waiting: bool = False
+    barge_trace: list = field(default_factory=list)
+    barge_onset_wall: float = 0.0
     idle_pre_roll: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=6))  # 480ms pre-roll
     idle_speech_frames: list[np.ndarray] = field(default_factory=list)
     dict_tail_frames: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=38))
@@ -2491,10 +2929,13 @@ class MicState:
         # 3. Start Handy recording off the mic thread. This is the only path
         # allowed to launch the app. fresh=True skips cancel so the words
         # after the wake are not dropped while Handy is contacted.
-        threading.Thread(
-            target=lambda: handy_start_recording(allow_launch=True, fresh=True),
-            daemon=True,
-        ).start()
+        if handy_file_mode():
+            log("Wake handler: capturing PCM for handy --transcribe-file, not toggling Handy")
+        else:
+            threading.Thread(
+                target=lambda: handy_start_recording(allow_launch=True, fresh=True),
+                daemon=True,
+            ).start()
         self.forget_handy_window()
         self.state = "DICTATING"
         self.partial_shown = ""
@@ -2621,9 +3062,13 @@ class MicState:
             # burst may be heard once or several times; every token has to
             # be the word stop. "Hold on a second" is the same barge.
             stop_tokens = _command_tokens(heard)
+            barge_note(self, "whisper", text=heard, barge=_is_playback_barge(stop_tokens))
             if _is_playback_barge(stop_tokens):
                 self.tts_barge_held = False
+                self.tts_barge_waiting = False
                 self.tts_barge_next = None
+                latency = round(time.time() - self.barge_onset_wall, 3) if self.barge_onset_wall else None
+                barge_note(self, "stop_playback", latency_s=latency, text=heard)
                 stop_playback(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy")
                 self.tts_loud_run = 0
                 self.tts_rms_floor.clear()
@@ -2637,10 +3082,11 @@ class MicState:
                     return True
                 if self.tts_barge_next is None:
                     self.tts_barge_next = (audio, prompt)
-            if self.tts_barge_held and self.tts_barge_next is None:
-                resume_tts_clips()
+            if (self.tts_barge_held or self.tts_barge_waiting) and self.tts_barge_next is None:
                 self.tts_barge_held = False
+                self.tts_barge_waiting = False
                 self.note_barge_release()
+                barge_note(self, "resume", reason="not a stop")
             if is_wake_phrase(heard):
                 log(f"Ignored wake {heard!r} over TTS")
                 return True
@@ -2676,7 +3122,7 @@ class MicState:
         global _handy_on_light
         self.release_idle_utterance(jobs)
         sync_speech_tier(now)
-        if (now - self.last_manual_check) >= 1.0:
+        if not handy_file_mode() and (now - self.last_manual_check) >= 1.0:
             self.last_manual_check = now
             manual_id, manual_txt = latest_history_row()
             if manual_id > self.last_history_id and manual_id <= self.fn_ignore_through:
@@ -2693,13 +3139,22 @@ class MicState:
                 elif manual_action in ("paused", "cancelled", "scratched", "cleared"):
                     play_cue(SOUND_CANCEL if manual_action in ("scratched", "cleared") else SOUND_PAUSE, wait=False)
         if (now - self.last_tts_check) >= 0.24:
+            was_speaking = self.tts_active
             self.last_tts_check = now
             self.tts_active = is_voicebox_speaking()
+            if self.tts_active != was_speaking:
+                barge_note(self, "speaking", speaking=self.tts_active)
         # Handy starts recording on fn. That used to keep the reply that was
         # still coming out of the speakers. Cut the speakers on the key edge,
         # throw away that take, and record again only if fn is still held.
         fn_down = fn_held()
-        if fn_down and not self.fn_was_down and not self.fn_cut_busy and (self.tts_active or is_voicebox_speaking()):
+        if (
+            not handy_file_mode()
+            and fn_down
+            and not self.fn_was_down
+            and not self.fn_cut_busy
+            and (self.tts_active or is_voicebox_speaking())
+        ):
             self.fn_cut_busy = True
             self.tts_active = False
             kill_tts_clips()
@@ -2744,14 +3199,16 @@ class MicState:
             oww.reset()
             floor = sorted(self.tts_rms_floor)[len(self.tts_rms_floor) // 2] if self.tts_rms_floor else 0.0
             if self.on_headphones:
-                user_voice = vad_score >= 0.25 and rms >= 180.0
+                hot = vad_score >= 0.25 and rms >= 180.0
+                user_voice = hot
                 clip_limit = 18
                 clip_floor = 250.0
             else:
                 # Measured speaker bleed on this laptop peaks near rms 175
                 # with VAD above 0.9. Pausing on that bleed stops the clip
                 # and starts it again, which is the echo. A pause now needs
-                # three frames well above that bleed.
+                # three frames well above that bleed. Those frames are the
+                # person, so they must not become the next floor.
                 hot = (
                     vad_score >= 0.55
                     and rms >= max(320.0, floor * 2.4)
@@ -2762,15 +3219,36 @@ class MicState:
                 clip_limit = 10
                 clip_floor = 80.0
             just_held = False
+            if self.tts_barge_waiting:
+                return True
+            if not self.tts_barge_held:
+                self.tts_pre_roll.append(frame.copy())
             if user_voice and not self.tts_stop_frames and not self.tts_barge_held:
-                pause_tts_clips()
+                # Do not SIGSTOP the clip here. The words are not known yet, and
+                # pausing speaker bleed stops the reply and starts it again.
+                # A confirmed stop calls stop_playback. Anything else leaves it playing.
                 self.tts_barge_held = True
                 self.tts_barge_voice = False
                 self.tts_barge_quiet = 0
                 self.tts_barge_skip = 2
                 self.tts_barge_loud = 0
                 just_held = True
-                log("TTS barge hold")
+                self.tts_stop_frames = [chunk.copy() for chunk in self.tts_pre_roll]
+                self.barge_onset_wall = time.time()
+                log(
+                    f"TTS barge hold rms={rms:.0f} vad={vad_score:.2f} floor={floor:.0f} "
+                    f"hot={self.tts_loud_run} frames={len(self.tts_stop_frames)}"
+                )
+                barge_note(
+                    self,
+                    "hold",
+                    speaking=True,
+                    rms=rms,
+                    vad=vad_score,
+                    floor=floor,
+                    hot=self.tts_loud_run,
+                    frames=len(self.tts_stop_frames),
+                )
             keep = False
             if self.tts_barge_held and not just_held:
                 if self.tts_barge_skip > 0:
@@ -2780,6 +3258,7 @@ class MicState:
                     self.tts_barge_quiet = 0
                     if self.tts_barge_loud >= 3:
                         self.tts_barge_voice = True
+                        barge_note(self, "voice", rms=rms, vad=vad_score, loud=self.tts_barge_loud)
                     keep = True
                 else:
                     self.tts_barge_quiet += 1
@@ -2792,49 +3271,66 @@ class MicState:
                 flush_clip = self.tts_stop_silence >= 4
             else:
                 flush_clip = False
-            if self.tts_barge_held and not self.tts_barge_voice and self.tts_barge_quiet >= 2:
-                self.tts_stop_frames.clear()
-                self.tts_stop_silence = 0
-                self.tts_barge_quiet = 0
-                self.tts_barge_loud = 0
+            # A short word ends before three more loud frames. The onset audio is
+            # already in the clip. Ask Whisper. Do not resume the player from here.
+            if (
+                self.tts_barge_held
+                and not self.tts_barge_voice
+                and self.tts_barge_quiet >= 2
+                and self.tts_stop_frames
+            ):
+                flush_clip = True
+            elif (
+                self.tts_barge_held
+                and not self.tts_stop_frames
+                and self.tts_barge_skip == 0
+                and self.tts_barge_quiet >= 4
+            ):
                 self.tts_barge_held = False
-                resume_tts_clips()
+                self.tts_barge_quiet = 0
                 flush_clip = False
                 self.note_barge_release()
                 log("TTS barge release")
-            if flush_clip and self.tts_stop_frames and self.tts_barge_voice:
+                barge_note(self, "resume", reason="empty hold")
+            if flush_clip and self.tts_stop_frames:
                     clip = np.concatenate(self.tts_stop_frames)
                     n_frames = len(self.tts_stop_frames)
                     self.tts_stop_frames.clear()
                     self.tts_stop_silence = 0
                     peak = float(np.max(np.abs(clip)))
-                    log(f"TTS barge clip frames={n_frames} peak={peak:.0f}")
+                    log(
+                        f"TTS barge clip frames={n_frames} peak={peak:.0f} "
+                        f"voice={self.tts_barge_voice} quiet={self.tts_barge_quiet}"
+                    )
+                    barge_note(
+                        self,
+                        "clip",
+                        frames=n_frames,
+                        peak=peak,
+                        voice=self.tts_barge_voice,
+                        quiet=self.tts_barge_quiet,
+                    )
                     if 2 <= n_frames <= 16 and peak >= clip_floor:
                         audio_f32 = clip_for_whisper(clip.astype(np.float32) / 32768.0, 6.0)
+                        self.tts_barge_waiting = True
                         if not self.kick_whisper(jobs, "tts_barge", audio_f32, "Hey Jarvis. stop."):
                             if self.tts_barge_next is not None:
                                 log("whisper busy; held TTS barge clip")
                             else:
                                 log("whisper busy; skipped TTS barge clip")
+                                self.tts_barge_waiting = False
                                 if self.tts_barge_held:
-                                    resume_tts_clips()
                                     self.tts_barge_held = False
                                     self.note_barge_release()
+                                    barge_note(self, "resume", reason="whisper skipped")
                     elif self.tts_barge_held:
-                        resume_tts_clips()
+                        self.tts_barge_waiting = False
                         self.tts_barge_held = False
                         self.note_barge_release()
-            elif flush_clip and self.tts_stop_frames and not self.tts_barge_voice:
-                    self.tts_stop_frames.clear()
-                    self.tts_stop_silence = 0
-                    if self.tts_barge_held:
-                        resume_tts_clips()
-                        self.tts_barge_held = False
-                        self.note_barge_release()
-                    log("TTS barge release")
+                        barge_note(self, "resume", reason="clip rejected")
             if self.tts_floor_holdoff > 0:
                 self.tts_floor_holdoff -= 1
-            elif not self.tts_barge_held:
+            elif not self.tts_barge_held and not hot:
                 self.tts_rms_floor.append(rms)
             return True
         if self.tts_barge_held:
@@ -2898,14 +3394,14 @@ class MicState:
         """One DICTATING mic frame. True means skip the rest of this iteration."""
         # Quitting Handy, or closing its window, must not launch it again.
         # Skip the first 1.5s so the window we just opened can appear.
-        fn_down = fn_held()
+        fn_down = False if handy_file_mode() else fn_held()
         fn_released = self.fn_was_down and not fn_down
         self.fn_was_down = fn_down
-        if fn_released and (now - self.chunk_started_at) > 0.4:
+        if not handy_file_mode() and fn_released and (now - self.chunk_started_at) > 0.4:
             log("fn released during dictation -> closing Handy and returning to IDLE")
             self.finish_fn_take(oww, vad)
             return True
-        if (now - self.chunk_started_at) > 1.5 and (now - self.last_handy_ui_check) >= 1.0:
+        if not handy_file_mode() and (now - self.chunk_started_at) > 1.5 and (now - self.last_handy_ui_check) >= 1.0:
             self.last_handy_ui_check = now
             # --start-hidden has no window until the overlay appears. A zero
             # count before we have seen one is not the user closing it.
@@ -2922,7 +3418,7 @@ class MicState:
             return True
         # If the user manually pressed `fn` and Handy already finished a new row while we were waiting,
         # consume and dispatch it immediately so we never re-toggle Handy out of sync!
-        live_id, live_txt = latest_history_row()
+        live_id, live_txt = (0, "") if handy_file_mode() else latest_history_row()
         if live_id > self.last_history_id:
             self.last_history_id = live_id
             log(f"Detected manual Handy transcription #{live_id} during DICTATING: {live_txt!r}")
@@ -2938,11 +3434,18 @@ class MicState:
             self.checked_fast_cmd = False
             self.speech_seen_in_chunk = False
             if action in ("sent", "paused", "cancelled"):
-                self.transition_to_idle(action, SOUND_SEND if action == "sent" else SOUND_PAUSE, oww, vad)
+                if action == "sent":
+                    cue = SOUND_SEND
+                elif action == "cancelled":
+                    cue = SOUND_CANCEL
+                else:
+                    cue = SOUND_PAUSE
+                self.transition_to_idle(action, cue, oww, vad)
             else:
                 play_cue(SOUND_CHUNK_TICK, wait=False)
                 self.forget_handy_window()
-                handy_start_recording()
+                if not handy_file_mode():
+                    handy_start_recording()
                 self.chunk_started_at = time.monotonic()
                 self.last_speech_at = self.chunk_started_at
                 self.cooldown_until = self.chunk_started_at + 0.25
@@ -2991,7 +3494,10 @@ class MicState:
                     self.show_closing_partial(jobs)
                     log(f"Pause of {silence_dur:.1f}s detected -> flushing chunk via Handy")
                     prev_id = self.last_history_id
-                    if not handy_stop_recording():
+                    if handy_file_mode():
+                        transcript = transcribe_handy_file(list(self.dict_speech_frames))
+                        row = (prev_id, transcript) if transcript else None
+                    elif not handy_stop_recording():
                         log("Handy is not running -> not launching it to flush")
                         action = "handy_stopped"
                         row = None
@@ -3031,9 +3537,9 @@ class MicState:
                     elif action in ("scratched", "cleared"):
                         # Play cancel/undo tone, keep DICTATING active so the user can immediately re-speak the corrected thought!
                         play_cue(SOUND_CANCEL, wait=False)
-                        self.last_history_id, _ = latest_history_row()
                         self.forget_handy_window()
-                        handy_start_recording()
+                        if not handy_file_mode():
+                            handy_start_recording()
                         vad.reset_states()
                         self.dict_tail_frames.clear()
                         self.checked_fast_cmd = False
@@ -3053,9 +3559,9 @@ class MicState:
                         log("Handy stopped -> returned to IDLE without restarting it")
                     else:
                         play_cue(SOUND_CHUNK_TICK, wait=False)
-                        self.last_history_id, _ = latest_history_row()
                         self.forget_handy_window()
-                        handy_start_recording()
+                        if not handy_file_mode():
+                            handy_start_recording()
                         vad.reset_states()
                         self.dict_tail_frames.clear()
                         self.checked_fast_cmd = False
@@ -3063,14 +3569,208 @@ class MicState:
                         self.chunk_started_at = time.monotonic()
                         self.last_speech_at = self.chunk_started_at
                         self.cooldown_until = self.chunk_started_at + 0.25
-                        write_status(self.state, {"last_action": "appended"})
+                        write_status(self.state, {"last_action": action})
                         log("Continuing DICTATING for next chunk...")
             else:
                 if (now - self.chunk_started_at) >= idle_timeout_seconds:
                     log(f"No speech for {idle_timeout_seconds:.0f}s in DICTATING -> cancelling Handy & returning to IDLE")
-                    handy_cancel()
+                    self.retract_partial()
+                    if not handy_file_mode():
+                        handy_cancel()
                     self.transition_to_idle("idle_timeout", SOUND_PAUSE, oww, vad, cooldown=IDLE_TIMEOUT_COOLDOWN_SECONDS)
         return False
+
+MIC_RATE = 16000
+MIC_CHUNK = 1280
+
+
+class SoundDeviceAudioSource:
+    """Production input. Opens the default microphone and nothing else."""
+
+    name = "sounddevice"
+
+    def __init__(self, sample_rate: int = MIC_RATE, chunk_samples: int = MIC_CHUNK) -> None:
+        self.sample_rate = sample_rate
+        self.chunk_samples = chunk_samples
+        self.frames: queue.Queue = queue.Queue(maxsize=32)
+        self._stream = None
+
+    def __enter__(self) -> "SoundDeviceAudioSource":
+        import sounddevice as sd
+
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+        sample_rate = self.sample_rate
+        frames = self.frames
+
+        def on_mic(indata, block_frames, time_info, status) -> None:
+            block = indata.copy()
+            captured = block_end_wall_time(
+                time.time(),
+                getattr(time_info, "inputBufferAdcTime", None),
+                getattr(time_info, "currentTime", None),
+                int(block_frames),
+                sample_rate,
+            )
+            dropped, invalid = offer_mic_frame(frames, stamp_mic_block(block, captured), status)
+            record_mic_offer(dropped, invalid)
+
+        self._stream = sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=self.chunk_samples,
+            callback=on_mic,
+        )
+        self._stream.__enter__()
+        log(f"Audio source {self.name}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._stream is not None:
+            self._stream.__exit__(exc_type, exc, tb)
+            self._stream = None
+
+
+class FixtureAudioSource:
+    """PCM fixtures in frame order. Does not open a microphone."""
+
+    name = "fixture"
+
+    def __init__(
+        self,
+        segments: list[tuple[np.ndarray, float]],
+        *,
+        chunk_samples: int = MIC_CHUNK,
+        sample_rate: int = MIC_RATE,
+        pace: bool = True,
+    ) -> None:
+        frames: list[np.ndarray] = []
+        for pcm, trailing_silence in segments:
+            audio = np.asarray(pcm, dtype=np.int16).reshape(-1)
+            gap = np.zeros(int(trailing_silence * sample_rate), dtype=np.int16)
+            audio = np.concatenate([audio, gap])
+            pad = (-len(audio)) % chunk_samples
+            if pad:
+                audio = np.concatenate([audio, np.zeros(pad, dtype=np.int16)])
+            for start in range(0, len(audio), chunk_samples):
+                frames.append(audio[start : start + chunk_samples])
+        self.frames = frames
+        self._index = 0
+        self.pace = pace
+        self.chunk_samples = chunk_samples
+        self.sample_rate = sample_rate
+
+    def __enter__(self) -> "FixtureAudioSource":
+        log(f"Audio source {self.name} ({len(self.frames)} frames, microphone not opened)")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def read(self) -> np.ndarray | None:
+        if self._index >= len(self.frames):
+            return None
+        frame = self.frames[self._index]
+        self._index += 1
+        if self.pace:
+            time.sleep(self.chunk_samples / self.sample_rate)
+        return frame
+
+
+def handle_captured_frame(
+    mic: MicState,
+    frame: np.ndarray,
+    captured_at: float | None,
+    dev_name: str,
+    oww,
+    vad,
+    vad_threshold: float,
+    wake_word: str,
+    wake_threshold: float,
+    pause_seconds: float,
+    idle_timeout_seconds: float,
+    whisper_jobs: queue.Queue,
+) -> None:
+    """One captured block. The microphone and the fixture source both call this."""
+    refresh_render_reference()
+    frame = cancel_playback_echo(np.asarray(frame), captured_at)
+    now = time.monotonic()
+    if now < mic.cooldown_until:
+        # The tail of "cancel that" must not open a new utterance. A wake
+        # score still does: the phrase is often shorter than this window.
+        rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+        boosted = np.clip(frame.astype(np.float32) * 3.0, -32768, 32767).astype(np.int16) if rms < 1200 else frame
+        preds = oww.predict(boosted)
+        score = float(preds.get(wake_word, 0.0) or 0.0)
+        if mic.state == "IDLE" and score >= wake_threshold and now >= mic.score_wake_blocked_until:
+            mic.enter_dictating(f"openWakeWord score={score:.2f} during cooldown", oww, vad)
+        return
+    rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+    vad_score = float(vad.predict(frame))
+    is_speech = (vad_score >= vad_threshold) or (rms >= RMS_SPEECH_FLOOR)
+    polled = mic.take_whisper()
+    if polled:
+        heard_kind, heard = polled
+        if mic.apply_whisper(heard_kind, heard, oww, vad, whisper_jobs):
+            return
+    mic.release_barge_clip(whisper_jobs)
+    if mic.barge_mute and (now - mic.last_tts_mute) >= 0.25:
+        mic.last_tts_mute = now
+        kill_tts_clips()
+        if not is_voicebox_speaking():
+            mic.barge_mute = False
+    if mic.state == "IDLE":
+        mic.handle_idle_frame(
+            frame, now, rms, vad_score, is_speech, dev_name, oww, vad, wake_word, wake_threshold, whisper_jobs
+        )
+    elif mic.state == "DICTATING":
+        mic.handle_dictating_frame(
+            frame, now, rms, vad_score, is_speech, oww, vad, pause_seconds, idle_timeout_seconds, whisper_jobs
+        )
+
+
+def load_fixture_listeners():
+    """Wake, VAD, and the Whisper worker. Does not open a microphone or Handy."""
+    from faster_whisper import WhisperModel
+    from openwakeword.model import Model
+    from openwakeword.vad import VAD
+
+    oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+    vad = VAD()
+    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+
+    def _whisper_text(audio_f32: np.ndarray, prompt: str) -> str:
+        segments, _info = whisper.transcribe(
+            audio_f32,
+            language="en",
+            beam_size=1,
+            without_timestamps=True,
+            initial_prompt=prompt,
+        )
+        return " ".join(segment.text for segment in segments).strip()
+
+    def _whisper_worker() -> None:
+        while _daemon_running.is_set() or not jobs.empty():
+            try:
+                job = jobs.get(timeout=WATCH_POLL_SECONDS)
+            except queue.Empty:
+                continue
+            try:
+                text = _whisper_text(job["audio"], job["prompt"])
+            except Exception as exc:
+                log(f"whisper worker failed: {exc}")
+                text = ""
+            job["slot"].put(text)
+
+    _daemon_running.set()
+    threading.Thread(target=_whisper_worker, daemon=True).start()
+    return oww, vad, jobs
+
 
 def run_daemon(
     wake_word: str = "hey_jarvis",
@@ -3179,33 +3879,12 @@ def run_daemon(
         last_dev_check = time.monotonic()
 
         try:
-            mic_frames: queue.Queue = queue.Queue(maxsize=32)
-
-            def on_mic(indata, frames, time_info, _status) -> None:
-                block = indata.copy()
-                captured = block_end_wall_time(
-                    time.time(),
-                    getattr(time_info, "inputBufferAdcTime", None),
-                    getattr(time_info, "currentTime", None),
-                    int(frames),
-                    sample_rate,
-                )
-                dropped, invalid = offer_mic_frame(
-                    mic_frames, stamp_mic_block(block, captured), _status
-                )
-                record_mic_offer(dropped, invalid)
-
-            with sd.InputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype="int16",
-                blocksize=chunk_samples,
-                callback=on_mic,
-            ):
+            source = SoundDeviceAudioSource(sample_rate, chunk_samples)
+            with source:
                 last_capture_publish = 0.0
                 while running:
                     kind, pcm_block, last_dev_check = next_mic_frame(
-                        mic_frames,
+                        source.frames,
                         active_ca_dev,
                         coreaudio_default_input_device_id,
                         last_dev_check,
@@ -3228,38 +3907,20 @@ def run_daemon(
                         break
                     if kind != "frame" or pcm_block is None:
                         continue
-                    refresh_render_reference()
-                    frame = apply_render_subtraction(
+                    handle_captured_frame(
+                        mic,
                         mic_block_samples(pcm_block)[:, 0],
                         mic_block_captured_at(pcm_block),
+                        dev_name,
+                        oww,
+                        vad,
+                        vad_threshold,
+                        wake_word,
+                        wake_threshold,
+                        pause_seconds,
+                        idle_timeout_seconds,
+                        whisper_jobs,
                     )
-                    now = time.monotonic()
-
-                    if now < mic.cooldown_until:
-                        oww.predict(frame)
-                        continue
-
-                    rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
-                    vad_score = float(vad.predict(frame))
-                    is_speech = (vad_score >= vad_threshold) or (rms >= RMS_SPEECH_FLOOR)
-                    polled = mic.take_whisper()
-                    if polled:
-                        heard_kind, heard = polled
-                        if mic.apply_whisper(heard_kind, heard, oww, vad, whisper_jobs):
-                            continue
-                    mic.release_barge_clip(whisper_jobs)
-                    if mic.barge_mute and (now - mic.last_tts_mute) >= 0.25:
-                        mic.last_tts_mute = now
-                        kill_tts_clips()
-                        if not is_voicebox_speaking():
-                            mic.barge_mute = False
-
-                    if mic.state == "IDLE":
-                        if mic.handle_idle_frame(frame, now, rms, vad_score, is_speech, dev_name, oww, vad, wake_word, wake_threshold, whisper_jobs):
-                            continue
-                    elif mic.state == "DICTATING":
-                        if mic.handle_dictating_frame(frame, now, rms, vad_score, is_speech, oww, vad, pause_seconds, idle_timeout_seconds, whisper_jobs):
-                            continue
         except Exception as stream_err:
             log(f"Audio stream interrupted ({stream_err}); reconnecting in 1.0s...")
             time.sleep(1.0)

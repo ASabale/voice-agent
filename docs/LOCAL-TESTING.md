@@ -9,8 +9,8 @@ Discover the live process. Do not reuse a port from this file.
 - Node `v26.11.0` on `PATH`.
 - `~/.local/bin/omp-voice-controller` is a symlink to this repo's `bin/omp-voice-controller` (created by `./bin/install`). Editing the repo script changes the next status or start process. The already-running controller keeps the code it loaded.
 - Controller at check time: pid 64238, `IDLE`, `last_action` `sent`, `status.json` under `~/.local/state/omp-voice/`.
-- OMP pid 80894 was alive. Its registry file is `~/.local/state/omp-voice/sessions/80894.json` with `pid`, `port`, `tty`, `startedAt`. The port changed during the same hour (56876, then 57042) without this run restarting OMP. Read the file again.
-- VoiceBox.app pid 29277 was running. Nothing was listening on `127.0.0.1:17493`, and `curl http://127.0.0.1:17493/health` failed. The extension still calls `http://127.0.0.1:17493`. Do not restart VoiceBox from a test.
+- At 19:40 UTC the OMP process was pid 16590. `sessions/16590.json` said port 62283 and `tty` null. `GET http://127.0.0.1:62283/status` returned `ok: true`, `version: 2`, `pid: 16590`, `speaking: false`, `agentBusy: true`, `draftLength: 0`. Read the port again. Do not POST to that bridge while `agentBusy` is true. Pid 80894 and ports 56876 and 61963 are gone.
+- At 19:49 UTC VoiceBox GUI pid 20266 had `voicebox-server` pid 20305 listening on `127.0.0.1:17493`. `/health` was 200 with `model_loaded: true` and `model_size: 1.7B`. Do not exec another server. If that pid is gone, do not launch the binary. See `docs/testing/VOICEBOX-SERVICE-RUNBOOK.md`. The 10:12 EST SIGSEGV is history, not the current process.
 - `tts-playing.json` was `{"playing": false, "ended_at": ...}`. There was no `tts-playing/` directory. A new controller treats that directory as the only playback source when it exists. The process that is already running does not, until it is restarted.
 
 ## How to find the bridge

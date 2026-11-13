@@ -47,6 +47,18 @@ test("forSpeech returns the same string for the same text", () => {
   assert.equal(forSpeech(raw), forSpeech(raw));
 });
 
+test("forSpeech rewrites the word stop so the room mic does not hear the pause command", () => {
+  const spoken = forSpeech("after the stop");
+  assert.equal(spoken, "after the the pause command");
+  assert.equal(spoken.length, 27);
+});
+
+test("forSpeech leaves pause, resume, and hold on as spoken words", () => {
+  assert.equal(forSpeech("please pause"), "please pause");
+  assert.equal(forSpeech("hold on a second"), "hold on a second");
+  assert.equal(forSpeech("resume playback"), "resume playback");
+});
+
 test("takeSentences keeps a finished sentence and waits on a stub", () => {
   assert.deepEqual(takeSentences("Hello there. Still going", false), ["Hello there."]);
   assert.deepEqual(takeSentences("Hello there. Still going on", true), ["Hello there.", "Still going on"]);
