@@ -1,0 +1,184 @@
+[
+  {
+    "name": "legacy playing ignores dead pids",
+    "now": 1000,
+    "alive": [],
+    "tail": 0.6,
+    "slots": null,
+    "legacy": { "playing": true },
+    "expect": true
+  },
+  {
+    "name": "legacy tail still speaking",
+    "now": 1000,
+    "alive": [],
+    "tail": 0.6,
+    "slots": null,
+    "legacy": { "playing": false, "ended_at": 999.9 },
+    "expect": true
+  },
+  {
+    "name": "legacy tail expired",
+    "now": 1000,
+    "alive": [],
+    "tail": 0.6,
+    "slots": null,
+    "legacy": { "playing": false, "ended_at": 998 },
+    "expect": false
+  },
+  {
+    "name": "other session stays speaking",
+    "now": 1002,
+    "alive": [111],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin"
+      },
+      {
+        "playing": false,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 22,
+        "afplay_pid": 222,
+        "started_at": 1001,
+        "ended_at": 1002,
+        "reason": "end"
+      }
+    ],
+    "legacy": { "playing": true },
+    "expect": true
+  },
+  {
+    "name": "dead player is not speaking",
+    "now": 1000,
+    "alive": [],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin"
+      }
+    ],
+    "legacy": { "playing": true, "pid": 111 },
+    "expect": false
+  },
+  {
+    "name": "orphan afplay inside the lease",
+    "now": 1050,
+    "alive": [111],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin"
+      }
+    ],
+    "legacy": null,
+    "expect": true
+  },
+  {
+    "name": "orphan afplay past the lease",
+    "now": 1061,
+    "alive": [111],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin"
+      }
+    ],
+    "legacy": null,
+    "expect": false
+  },
+  {
+    "name": "writer lease without afplay",
+    "now": 1059,
+    "alive": [11],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin"
+      }
+    ],
+    "legacy": null,
+    "expect": true
+  },
+  {
+    "name": "writer lease expired",
+    "now": 1060,
+    "alive": [11],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin"
+      }
+    ],
+    "legacy": null,
+    "expect": false
+  },
+  {
+    "name": "empty slot directory beats a legacy playing flag",
+    "now": 1000,
+    "alive": [111],
+    "tail": 0.6,
+    "slots": [],
+    "legacy": { "playing": true },
+    "expect": false
+  },
+  {
+    "name": "ended slot stays in the tail",
+    "now": 1000.2,
+    "alive": [],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": false,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "ended_at": 1000,
+        "reason": "end"
+      }
+    ],
+    "legacy": null,
+    "expect": true
+  }
+]

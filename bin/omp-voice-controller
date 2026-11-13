@@ -50,6 +50,7 @@ import re
 import select
 import signal
 import sqlite3
+import struct
 import subprocess
 import queue
 import threading
@@ -224,19 +225,670 @@ def next_mic_frame(
     return "frame", block, last_check
 
 
-def _tts_file_says_speaking() -> bool:
-    """True while tts-playing.json says a clip is active or inside the reverb tail.
+def stamp_mic_block(block: object, captured_at: float) -> tuple[object, float]:
+    """Pair a callback block with the wall time it finished. The samples are not logged."""
+    return block, float(captured_at)
 
-    A new write must flip this immediately, so it is not cached. Other afplay
-    processes are not our voice.
+
+def block_end_wall_time(
+    wall_now: float,
+    adc_time: float | None,
+    stream_now: float | None,
+    frames: int,
+    sample_rate: int,
+) -> float:
+    """Wall time when the block ended, not when the callback ran.
+
+    adc_time and stream_now share PortAudio's clock. The gap from the end of
+    the ADC block to stream_now is how late the callback is. A missing or
+    backwards clock keeps wall_now.
     """
-    if not TTS_STATE_FILE.exists():
+    if (
+        isinstance(adc_time, bool)
+        or isinstance(stream_now, bool)
+        or not isinstance(adc_time, (int, float))
+        or not isinstance(stream_now, (int, float))
+        or frames <= 0
+        or sample_rate <= 0
+    ):
+        return wall_now
+    late = float(stream_now) - (float(adc_time) + frames / sample_rate)
+    if late <= 0:
+        return wall_now
+    return wall_now - late
+
+
+def mic_block_samples(item: object) -> object:
+    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], float):
+        return item[0]
+    return item
+
+
+def mic_block_captured_at(item: object) -> float | None:
+    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], float):
+        return item[1]
+    return None
+
+
+_capture_lock = threading.Lock()
+_mic_dropped = 0
+_mic_invalid = 0
+
+
+def frame_status_invalid(status: object) -> bool:
+    """True when PortAudio reports an input overflow, underflow, or a status string."""
+    if status is None or status == "":
         return False
-    data = json.loads(TTS_STATE_FILE.read_text(encoding="utf-8"))
+    if isinstance(status, bool):
+        return status
+    if getattr(status, "input_overflow", False) or getattr(status, "input_underflow", False):
+        return True
+    if isinstance(status, str):
+        return True
+    return bool(status)
+
+
+def offer_mic_frame(frames: queue.Queue, block: object, status: object = None) -> tuple[int, int]:
+    """Queue one callback block. Returns (dropped, invalid), each a count for this call.
+
+    A full queue drops the oldest block so the newest audio is kept. The block
+    itself is never logged.
+    """
+    invalid = 1 if frame_status_invalid(status) else 0
+    try:
+        frames.put_nowait(block)
+        return 0, invalid
+    except queue.Full:
+        pass
+    try:
+        frames.get_nowait()
+    except queue.Empty:
+        return 1, invalid
+    try:
+        frames.put_nowait(block)
+    except queue.Full:
+        return 2, invalid
+    return 1, invalid
+
+
+def record_mic_offer(dropped: int, invalid: int) -> None:
+    global _mic_dropped, _mic_invalid
+    if dropped == 0 and invalid == 0:
+        return
+    with _capture_lock:
+        _mic_dropped += dropped
+        _mic_invalid += invalid
+
+
+def slot_reference(slot: dict) -> dict | None:
+    """The WAV afplay is playing, as published on the playback slot.
+
+    This is the render description. It is not echo cancellation.
+    """
+    if not isinstance(slot, dict):
+        return None
+    ref = slot.get("reference")
+    if not isinstance(ref, dict):
+        return None
+    rate = ref.get("sample_rate")
+    channels = ref.get("channels")
+    frames = ref.get("frames")
+    wav = ref.get("wav")
+    if isinstance(rate, bool) or not isinstance(rate, int) or rate < 8000:
+        return None
+    if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
+        return None
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames <= 0:
+        return None
+    if not isinstance(wav, str) or not wav.endswith(".wav"):
+        return None
+    return {"sample_rate": rate, "channels": channels, "frames": frames, "wav": wav}
+
+
+def resample_to_mic_rate(pcm: np.ndarray, src_rate: int, dst_rate: int = 16000) -> np.ndarray:
+    """Linear map of mono PCM onto the microphone rate. Same-rate input is copied.
+
+    This is not a band-limited resampler. It exists so a 22050 Hz VoiceBox file
+    can be compared with a 16 kHz microphone block.
+    """
+    samples = np.ascontiguousarray(pcm, dtype=np.int16)
+    if src_rate == dst_rate:
+        return samples
+    if src_rate < 8000 or dst_rate < 8000 or len(samples) == 0:
+        return np.zeros(0, dtype=np.int16)
+    out_len = int(len(samples) * dst_rate / src_rate)
+    if out_len <= 0:
+        return np.zeros(0, dtype=np.int16)
+    pos = np.arange(out_len, dtype=np.float64) * (src_rate / dst_rate)
+    i0 = np.minimum(np.floor(pos).astype(np.int64), len(samples) - 1)
+    i1 = np.minimum(i0 + 1, len(samples) - 1)
+    frac = (pos - i0).astype(np.float32)
+    mixed = samples[i0].astype(np.float32) * (1.0 - frac) + samples[i1].astype(np.float32) * frac
+    return np.clip(np.rint(mixed), -32768, 32767).astype(np.int16)
+
+
+def playback_rate_of(slot: dict) -> float:
+    """afplay -r for this clip. Missing or out of range means 1x.
+
+    The voice command accepts 0.7 to 2.0. The default in the extension is 1.18.
+    """
+    if not isinstance(slot, dict):
+        return 1.0
+    raw = slot.get("playback_rate")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 1.0
+    rate = float(raw)
+    if rate < 0.7 or rate > 2.0:
+        return 1.0
+    return rate
+
+
+def render_cursor(started_at: float, now: float, sample_rate: int, playback_rate: float = 1.0) -> int:
+    """How many file samples afplay has consumed since the clip started."""
+    if sample_rate <= 0 or playback_rate <= 0 or now <= started_at:
+        return 0
+    return int((now - started_at) * sample_rate * playback_rate)
+
+
+def parse_wav_pcm(data: bytes) -> dict | None:
+    """16-bit PCM payload of a WAV file. None when the file is not that format."""
+    if len(data) < 44 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    offset = 12
+    fmt = None
+    pcm = None
+    while offset + 8 <= len(data):
+        ident = data[offset : offset + 4]
+        size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        body = offset + 8
+        if size < 0 or body + size > len(data):
+            return None
+        if ident == b"fmt " and size >= 16:
+            fmt = struct.unpack_from("<HHIIHH", data, body)
+        elif ident == b"data":
+            pcm = data[body : body + size]
+        offset = body + size + (size % 2)
+    if fmt is None or pcm is None:
+        return None
+    format_id, channels, rate, _byte_rate, block, bits = fmt
+    if format_id != 1 or bits != 16 or channels < 1 or rate < 8000:
+        return None
+    if block != channels * 2 or len(pcm) < block or len(pcm) % block != 0:
+        return None
+    return {"sample_rate": rate, "channels": channels, "frames": len(pcm) // block, "pcm": pcm}
+
+
+def connect_render_reference(slot: dict, wav_bytes: bytes, now: float) -> dict | None:
+    """Accept the WAV only when its PCM header matches the slot that names it.
+
+    The returned pcm bytes are the samples afplay was given. They are not a
+    cancelled microphone signal.
+    """
+    announced = slot_reference(slot)
+    parsed = parse_wav_pcm(wav_bytes) if wav_bytes else None
+    if announced is None or parsed is None:
+        return None
+    if (
+        parsed["sample_rate"] != announced["sample_rate"]
+        or parsed["channels"] != announced["channels"]
+        or parsed["frames"] != announced["frames"]
+    ):
+        return None
+    started = slot.get("started_at")
+    rate = playback_rate_of(slot)
+    cursor = 0
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        cursor = render_cursor(float(started), now, parsed["sample_rate"], rate)
+    if cursor > parsed["frames"]:
+        cursor = parsed["frames"]
+    return {
+        "connected": True,
+        "sample_rate": parsed["sample_rate"],
+        "channels": parsed["channels"],
+        "frames": parsed["frames"],
+        "cursor": cursor,
+        "aligned": parsed["sample_rate"] == 16000 and parsed["channels"] == 1,
+        "pcm_bytes": len(parsed["pcm"]),
+        "pcm": parsed["pcm"],
+        "started_at": float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
+        "playback_rate": rate,
+    }
+
+
+def render_overlap(start: int, mic_len: int, render_len: int) -> tuple[int, int] | None:
+    """Mic slice that lands inside the render when sample 0 would be at start."""
+    mic_lo = max(0, -start)
+    mic_hi = min(mic_len, render_len - start)
+    if mic_hi <= mic_lo:
+        return None
+    return mic_lo, mic_hi
+
+
+def best_render_delay(
+    mic: np.ndarray,
+    render: np.ndarray,
+    position: int,
+    max_delay: int,
+    min_corr: float,
+    step: int = 1,
+) -> int | None:
+    """Lag where the microphone block best matches the playback, or None.
+
+    A weak match is left alone. This is a single delay, not a room model.
+    """
+    if step < 1 or max_delay < 0 or len(mic) == 0 or len(render) == 0:
+        return None
+    mic_f = mic.astype(np.float32)
+    mic_energy = float(np.dot(mic_f, mic_f))
+    if mic_energy < 1.0:
+        return None
+
+    def score_at(lag: int) -> float:
+        start = position - lag
+        span = render_overlap(start, len(mic), len(render))
+        if span is None:
+            return -1.0
+        mic_lo, mic_hi = span
+        full = mic_lo == 0 and mic_hi == len(mic)
+        if not full and mic_hi - mic_lo < 160:
+            return -1.0
+        piece = mic_f[mic_lo:mic_hi]
+        ref = render[start + mic_lo : start + mic_hi].astype(np.float32)
+        piece_energy = float(np.dot(piece, piece))
+        ref_energy = float(np.dot(ref, ref))
+        if piece_energy < 1.0 or ref_energy < 1.0:
+            return -1.0
+        return float(np.dot(piece, ref) / np.sqrt(piece_energy * ref_energy))
+
+    best_lag = None
+    best_score = min_corr
+    for lag in range(0, max_delay + 1, step):
+        score = score_at(lag)
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    if best_lag is None or step == 1:
+        return best_lag
+    for lag in range(max(0, best_lag - step), min(max_delay, best_lag + step) + 1):
+        score = score_at(lag)
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    return best_lag
+
+
+def subtract_aligned_render(mic: np.ndarray, render: np.ndarray, position: int, delay: int) -> np.ndarray | None:
+    """Remove a scaled copy of the playback from the mic block. None if it does not fit."""
+    start = position - delay
+    if start < 0 or start + len(mic) > len(render):
+        return None
+    mic_i = mic.astype(np.float32)
+    ref = render[start : start + len(mic)].astype(np.float32)
+    ref_energy = float(np.dot(ref, ref))
+    if ref_energy < 1.0:
+        return None
+    gain = float(np.dot(mic_i, ref) / ref_energy)
+    if gain <= 0.0 or gain > 4.0:
+        return None
+    cleaned = np.clip(np.rint(mic_i - gain * ref), -32768, 32767)
+    return cleaned.astype(np.int16)
+
+
+def subtract_render_filter(
+    mic: np.ndarray,
+    render: np.ndarray,
+    position: int,
+    delay: int,
+    taps: int = 48,
+) -> np.ndarray | None:
+    """Remove a short filtered copy of the playback around one delay.
+
+    The correlation peak is not always the first arrival, so the taps extend
+    a few samples before it and a few after it. Each tap is at most 4, and the
+    taps together are at most 4. A fit outside that range is rejected. This is
+    not a room model.
+    """
+    if taps < 1:
+        return None
+    mic_i = mic.astype(np.float64)
+    first = -(taps // 2) + 1
+    start0 = position - delay
+    span = render_overlap(start0, len(mic), len(render))
+    if span is None:
+        return None
+    mic_lo, mic_hi = span
+    if (mic_lo != 0 or mic_hi != len(mic)) and mic_hi - mic_lo < 160:
+        return None
+    cols = []
+    for offset in range(first, first + taps):
+        start = position - delay - offset
+        if start + mic_lo < 0 or start + mic_hi > len(render):
+            if offset == 0:
+                return None
+            continue
+        cols.append(render[start + mic_lo : start + mic_hi].astype(np.float64))
+    if not cols:
+        return None
+    piece = mic_i[mic_lo:mic_hi]
+    coef, *_ = np.linalg.lstsq(np.column_stack(cols), piece, rcond=None)
+    if float(np.max(coef)) <= 0.0 or float(np.max(np.abs(coef))) > 4.0 or float(np.sum(np.abs(coef))) > 4.0:
+        return None
+    cleaned = np.array(mic_i, copy=True)
+    cleaned[mic_lo:mic_hi] = piece - np.column_stack(cols) @ coef
+    return np.clip(np.rint(cleaned), -32768, 32767).astype(np.int16)
+
+
+def subtract_playback_at(
+    frame: np.ndarray,
+    render: np.ndarray,
+    started_at: float,
+    captured_at: float,
+    max_delay: int = 2400,
+    min_corr: float = 0.75,
+    playback_rate: float = 1.0,
+    paused_seconds: float = 0.0,
+) -> tuple[np.ndarray, int | None]:
+    """Place the block at the render index of its capture time, not a later read.
+
+    playback_rate is afplay -r. One wall-clock second consumes that many seconds of the file.
+    paused_seconds is time afplay spent stopped, which does not advance the file.
+    """
+    end_position = render_cursor(started_at, captured_at - paused_seconds, 16000, playback_rate)
+    return remove_render_from_block(frame, render, end_position, max_delay, min_corr)
+
+
+def remove_render_from_block(
+    mic: np.ndarray,
+    render: np.ndarray,
+    end_position: int,
+    max_delay: int,
+    min_corr: float,
+) -> tuple[np.ndarray, int | None]:
+    """Subtract playback from a block that ends at end_position.
+
+    The clock is the render index just after the block. Delay zero lines the
+    first mic sample up with end_position - len(mic). The returned delay is
+    that acoustic lag. It does not include the length of the block.
+    """
+    origin = end_position - len(mic)
+    delay = best_render_delay(mic, render, origin, max_delay, min_corr, step=1)
+    if delay is None:
+        return mic, None
+    cleaned = subtract_render_filter(mic, render, origin, delay)
+    if cleaned is None:
+        cleaned = subtract_aligned_render(mic, render, origin, delay)
+    if cleaned is None:
+        return mic, None
+    return cleaned, delay
+
+
+def apply_render_subtraction(frame: np.ndarray, captured_at: float | None = None) -> np.ndarray:
+    """Remove a delayed copy of our playback from one mic block.
+
+    captured_at is the wall time the callback finished the block. The time the
+    block is later read from the queue is not used. A weak correlation leaves
+    the block unchanged. This is not a room model.
+    """
+    parsed = _render_parsed
+    samples = _render_samples
+    if not parsed or samples is None or not parsed.get("aligned"):
+        return frame
+    started = parsed.get("started_at")
+    if not isinstance(started, float):
+        return frame
+    when = time.time() if captured_at is None else captured_at
+    rate = parsed.get("playback_rate")
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        rate = 1.0
+    cleaned, delay = subtract_playback_at(
+        frame, samples, started, when, playback_rate=float(rate), paused_seconds=paused_playback_seconds(when)
+    )
+    if delay is None:
+        return frame
+    log_once(f"render-delay-{delay}", f"render copy removed at delay {delay}")
+    return cleaned
+
+
+def render_status_fields(connected: dict | None) -> dict:
+    if not connected:
+        return {"render_connected": False}
+    return {
+        "render_connected": True,
+        "render_rate": connected["sample_rate"],
+        "render_channels": connected["channels"],
+        "render_frames": connected["frames"],
+        "render_cursor": connected["cursor"],
+        "render_aligned": connected["aligned"],
+    }
+
+
+_render_pcm = b""
+_render_samples: np.ndarray | None = None
+_render_fields = {"render_connected": False}
+_render_file_key: tuple | None = None
+_render_hold_until = 0.0
+_render_paused_at: float | None = None
+_render_paused_seconds = 0.0
+
+
+def _slot_rank(slot: dict) -> tuple[float, int, int]:
+    started = slot.get("started_at")
+    try:
+        started_f = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
+    except (TypeError, ValueError):
+        started_f = 0.0
+    turn = slot.get("turn")
+    clip = slot.get("clip")
+    turn_i = turn if isinstance(turn, int) and not isinstance(turn, bool) else -1
+    clip_i = clip if isinstance(clip, int) and not isinstance(clip, bool) else -1
+    return (started_f, turn_i, clip_i)
+
+
+def choose_render_slot(slots, now: float, pid_alive_fn) -> dict | None:
+    """Newest slot that is speaking and names a WAV. Directory order is not used."""
+    chosen = None
+    best: tuple[float, int, int] | None = None
+    for slot in slots:
+        if not isinstance(slot, dict) or slot_reference(slot) is None:
+            continue
+        if not slot_is_speaking(slot, now, pid_alive_fn, 0.0):
+            continue
+        rank = _slot_rank(slot)
+        if best is None or rank > best:
+            best = rank
+            chosen = slot
+    return chosen
+
+
+def refresh_render_reference(now: float | None = None) -> dict:
+    """Load the newest speaking slot's WAV when the file matches that slot.
+
+    After the slot ends, the PCM already in memory is kept for the reverb tail.
+    The WAV file is deleted when afplay exits, so this does not read it again.
+    """
+    global _render_pcm, _render_samples, _render_fields, _render_file_key, _render_parsed, _render_hold_until, _render_paused_at, _render_paused_seconds
+    moment = time.time() if now is None else now
+    slots = _read_playback_slots() or []
+    chosen = choose_render_slot(slots, moment, pid_alive)
+    if chosen is None:
+        if (
+            _render_samples is not None
+            and _render_parsed
+            and _render_parsed.get("aligned")
+            and moment < _render_hold_until
+        ):
+            _render_fields = render_status_fields(_render_parsed)
+            return _render_fields
+        _render_hold_until = 0.0
+        _render_paused_at = None
+        _render_paused_seconds = 0.0
+        _render_pcm = b""
+        _render_samples = None
+        _render_file_key = None
+        _render_parsed = None
+        _render_fields = render_status_fields(None)
+        return _render_fields
+    ref = slot_reference(chosen)
+    assert ref is not None
+    key = (ref["wav"], ref["frames"], ref["sample_rate"], ref["channels"])
+    if key != _render_file_key:
+        _render_paused_at = None
+        _render_paused_seconds = 0.0
+        try:
+            blob = Path(ref["wav"]).read_bytes()
+        except OSError:
+            blob = b""
+        connected = connect_render_reference(chosen, blob, moment)
+        _render_file_key = key
+        if connected is None:
+            _render_pcm = b""
+            _render_samples = None
+            _render_parsed = None
+            _render_fields = render_status_fields(None)
+            return _render_fields
+        _render_pcm = connected["pcm"]
+        raw = np.frombuffer(connected["pcm"], dtype="<i2").copy()
+        _render_parsed = {key: value for key, value in connected.items() if key != "pcm"}
+        if connected["channels"] == 1:
+            _render_samples = resample_to_mic_rate(raw, int(connected["sample_rate"]))
+            _render_parsed["aligned"] = _render_samples.size > 0
+        else:
+            _render_samples = raw
+    elif _render_parsed is None:
+        _render_fields = render_status_fields(None)
+        return _render_fields
+    else:
+        started = chosen.get("started_at")
+        cursor = 0
+        if isinstance(started, (int, float)) and not isinstance(started, bool):
+            # Wall time includes SIGSTOP. The file does not move during that interval.
+            playing_at = moment - paused_playback_seconds(moment)
+            cursor = render_cursor(
+                float(started), playing_at, int(_render_parsed["sample_rate"]), playback_rate_of(chosen)
+            )
+        _render_parsed = {**_render_parsed, "playback_rate": playback_rate_of(chosen)}
+        if cursor > int(_render_parsed["frames"]):
+            cursor = int(_render_parsed["frames"])
+        _render_parsed = {**_render_parsed, "cursor": cursor}
+    if _render_parsed and _render_parsed.get("aligned") and _render_samples is not None and len(_render_samples):
+        _render_hold_until = moment + REVERB_TAIL_GUARD_SECONDS
+    _render_fields = render_status_fields(_render_parsed)
+    return _render_fields
+
+
+def capture_totals() -> tuple[int, int]:
+    with _capture_lock:
+        return _mic_dropped, _mic_invalid
+
+
+PLAYBACK_LEASE_SECONDS = 60.0
+
+
+def _valid_pid(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def slot_is_speaking(slot: dict, now: float, pid_alive_fn, tail: float) -> bool:
+    """One session slot. A dead afplay is silence. A clean end keeps the reverb tail."""
+    if not isinstance(slot, dict):
+        return False
+    ended_raw = slot.get("ended_at")
+    try:
+        ended = float(ended_raw) if ended_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        ended = 0.0
+    if slot.get("playing") is not True:
+        return ended > 0 and (now - ended) < tail
+    afplay = _valid_pid(slot.get("afplay_pid"))
+    writer = _valid_pid(slot.get("writer_pid"))
+    if afplay is not None:
+        if not pid_alive_fn(afplay):
+            return False
+        if writer is not None and not pid_alive_fn(writer):
+            try:
+                started = float(slot.get("started_at") or 0)
+            except (TypeError, ValueError):
+                started = 0.0
+            return now < started + PLAYBACK_LEASE_SECONDS
+        return True
+    if writer is None or not pid_alive_fn(writer):
+        return False
+    try:
+        lease = float(slot.get("lease_until") or 0)
+    except (TypeError, ValueError):
+        lease = 0.0
+    return now < lease
+
+
+def playback_is_speaking(data: dict, now: float, pid_alive_fn, tail: float) -> bool:
+    """Legacy files have no sessions object and do not check pids."""
+    if not isinstance(data, dict):
+        return False
+    sessions = data.get("sessions")
+    if isinstance(sessions, dict):
+        return any(
+            isinstance(slot, dict) and slot_is_speaking(slot, now, pid_alive_fn, tail)
+            for slot in sessions.values()
+        )
     if data.get("playing") is True and not data.get("ended_at"):
         return True
-    ended_at = float(data.get("ended_at", 0) or 0)
-    return ended_at > 0 and (time.time() - ended_at) < REVERB_TAIL_GUARD_SECONDS
+    try:
+        ended = float(data.get("ended_at", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return ended > 0 and (now - ended) < tail
+
+
+def playback_sources_speaking(slots, legacy, now: float, pid_alive_fn, tail: float) -> bool:
+    """slots is None only when the tts-playing directory is absent."""
+    if slots is not None:
+        return any(
+            isinstance(slot, dict) and slot_is_speaking(slot, now, pid_alive_fn, tail) for slot in slots
+        )
+    if not isinstance(legacy, dict):
+        return False
+    return playback_is_speaking(legacy, now, pid_alive_fn, tail)
+
+
+def _read_playback_slots() -> list[dict] | None:
+    slot_dir = STATE_DIR / "tts-playing"
+    if not slot_dir.is_dir():
+        return None
+    found: list[dict] = []
+    for path in slot_dir.glob("*.json"):
+        if not path.stem.isdigit():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            found.append(data)
+    return found
+
+
+def _tts_file_says_speaking() -> bool:
+    """True while a session slot is active or inside the reverb tail.
+
+    The tts-playing directory is the authority when it exists. The flat
+    tts-playing.json file is only the projection the old reader understood.
+    A new write must flip this immediately, so it is not cached.
+    """
+    now = time.time()
+    slots = _read_playback_slots()
+    if slots is not None:
+        return playback_sources_speaking(slots, None, now, pid_alive, REVERB_TAIL_GUARD_SECONDS)
+    if not TTS_STATE_FILE.exists():
+        return False
+    try:
+        data = json.loads(TTS_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return playback_is_speaking(data, now, pid_alive, REVERB_TAIL_GUARD_SECONDS)
 
 
 def is_voicebox_speaking() -> bool:
@@ -245,6 +897,22 @@ def is_voicebox_speaking() -> bool:
         return _tts_file_says_speaking()
     except (OSError, ValueError, TypeError):
         return False
+
+
+LOG_ROTATE_BYTES = 1_048_576
+
+
+def rotate_log(path: Path, limit_bytes: int) -> bool:
+    """Keep one backup once a log passes the limit. A missing file is left alone."""
+    try:
+        if path.stat().st_size <= limit_bytes:
+            return False
+        backup = path.with_name(path.name + ".1")
+        backup.unlink(missing_ok=True)
+        path.rename(backup)
+    except OSError:
+        return False
+    return True
 
 
 def log(msg: str) -> None:
@@ -297,6 +965,45 @@ def play_cue(path: str, wait: bool = False) -> None:
         log(f"play_cue failed: {exc}")
 
 
+def publish_capture_totals() -> None:
+    """Record drop counts and the render link without erasing the other fields."""
+    dropped, invalid = capture_totals()
+    render = refresh_render_reference()
+    if not STATUS_FILE.exists():
+        return
+    try:
+        data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    changed = data.get("mic_dropped") != dropped or data.get("mic_invalid") != invalid
+    for key, value in render.items():
+        if data.get(key) != value:
+            changed = True
+    if not changed:
+        return
+    note = None
+    if data.get("mic_dropped") != dropped or data.get("mic_invalid") != invalid:
+        note = f"mic capture dropped={dropped} invalid={invalid}"
+    if data.get("render_connected") != render.get("render_connected"):
+        if render.get("render_connected"):
+            note = (
+                f"render reference connected rate={render['render_rate']} "
+                f"frames={render['render_frames']} aligned={render['render_aligned']}"
+            )
+        else:
+            note = "render reference unavailable"
+    data["mic_dropped"] = dropped
+    data["mic_invalid"] = invalid
+    data.update(render)
+    tmp = STATUS_FILE.with_suffix(".capture.tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(STATUS_FILE)
+    if note:
+        log(note)
+
+
 def write_status(state: str, extra: dict | None = None) -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -307,6 +1014,10 @@ def write_status(state: str, extra: dict | None = None) -> None:
         }
         if extra:
             payload.update(extra)
+        dropped, invalid = capture_totals()
+        payload["mic_dropped"] = dropped
+        payload["mic_invalid"] = invalid
+        payload.update(_render_fields)
         tmp = STATUS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(STATUS_FILE)
@@ -627,21 +1338,51 @@ def bridge_base(dest: dict) -> str:
     return f"http://127.0.0.1:{int(port)}"
 
 
-def live_bridge_bases() -> list[str]:
+def bridge_status_targets(sessions: list[dict], legacy_owner_pid: int | None) -> list[str]:
     bases: list[str] = []
-    for session in omp_session_records():
+    for session in sessions:
         port = session.get("port")
-        if isinstance(port, int) and port > 0:
+        if isinstance(port, int) and not isinstance(port, bool) and port > 0:
             bases.append(f"http://127.0.0.1:{port}")
-    if legacy_bridge_owner_pid() is not None:
-        bases.append(OMP_BRIDGE_URL)
+    if legacy_owner_pid is not None:
+        bases.append("http://127.0.0.1:17494")
     deduped: list[str] = []
     for base in bases:
         if base not in deduped:
             deduped.append(base)
-    if not deduped:
-        deduped.append(OMP_BRIDGE_URL)
     return deduped
+
+
+def live_bridge_bases() -> list[str]:
+    return bridge_status_targets(omp_session_records(), legacy_bridge_owner_pid())
+
+
+def status_probe_order(delivery: dict, targets: list[str]) -> list[str]:
+    ordered = list(targets)
+    if delivery.get("mode") != "bridge":
+        return ordered
+    port = delivery.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or port <= 0:
+        return ordered
+    preferred = f"http://127.0.0.1:{port}"
+    return [preferred, *[base for base in ordered if base != preferred]]
+
+
+LEGACY_BRIDGE_URL = "http://127.0.0.1:17494"
+NO_BRIDGE_NOTE = "No session bridge responded"
+LEGACY_BIND_NOTE = "Restart the OMP session (/restart) to bind :17494"
+
+
+def probe_bridge_status(delivery: dict, targets: list[str]) -> dict:
+    ordered = status_probe_order(delivery, targets)
+    for base in ordered:
+        response = bridge_request("/status", method="GET", base=base)
+        if isinstance(response, dict) and response.get("ok") is True:
+            return {**response, "url": base}
+    note = NO_BRIDGE_NOTE
+    if LEGACY_BRIDGE_URL in ordered:
+        note = f"{NO_BRIDGE_NOTE}. {LEGACY_BIND_NOTE}"
+    return {"ok": False, "note": note, "targets": ordered}
 
 
 def latest_history_row() -> tuple[int, str]:
@@ -782,6 +1523,34 @@ STRATA_STATE = Path.home() / ".local/state/strata/omp-autostart.json"
 # threading.Event, not a bare bool: _watch_strata writes it from a background
 # thread while the mic loop reads it. All access goes through the event.
 _handy_on_light = False
+_voicebox_want: bool | None = None
+_voicebox_ok = False
+_voicebox_retry_at = 0.0
+VOICEBOX_HEALTH_RETRY_SECONDS = 5.0
+
+
+def sync_speech_tier(now: float) -> None:
+    """Keep Handy on the Strata tier. Ask VoiceBox again 5 s after a refusal.
+
+    A down VoiceBox used to invert the Handy flag, so the next mic frame tried
+    again. That was a health check and a log line about twelve times a second.
+    """
+    global _voicebox_want, _voicebox_ok, _voicebox_retry_at
+    strata_running = _strata_loaded.is_set()
+    if strata_running != _handy_on_light:
+        apply_handy_model(strata_running)
+    if strata_running != _voicebox_want:
+        _voicebox_want = strata_running
+        _voicebox_ok = False
+        _voicebox_retry_at = 0.0
+        _logged_once.discard("voicebox-health")
+    if _voicebox_ok or now < _voicebox_retry_at:
+        return
+    if apply_voicebox_model(strata_running):
+        _voicebox_ok = True
+        _logged_once.discard("voicebox-health")
+        return
+    _voicebox_retry_at = now + VOICEBOX_HEALTH_RETRY_SECONDS
 
 
 def strata_loaded() -> bool:
@@ -843,7 +1612,7 @@ def apply_voicebox_model(strata_running: bool) -> bool:
         with urllib.request.urlopen("http://127.0.0.1:17493/health", timeout=2) as res:
             loaded = str(json.loads(res.read().decode()).get("model_size") or "")
     except (OSError, ValueError, json.JSONDecodeError):
-        log("VoiceBox health unread; speech tier not changed")
+        log_once("voicebox-health", "VoiceBox health unread; speech tier not changed")
         return False
     if loaded == size:
         marker.write_text(size + "\n", encoding="utf-8")
@@ -1077,15 +1846,42 @@ def _omp_vb_pids() -> list[str]:
     ]
 
 
+def paused_playback_seconds(now: float) -> float:
+    """Wall time afplay has been stopped, including a pause that is still open."""
+    extra = 0.0
+    if _render_paused_at is not None:
+        extra = max(0.0, now - _render_paused_at)
+    return _render_paused_seconds + extra
+
+
+def note_render_paused(now: float) -> None:
+    global _render_paused_at
+    if _render_paused_at is None:
+        _render_paused_at = now
+
+
+def note_render_resumed(now: float) -> None:
+    global _render_paused_at, _render_paused_seconds
+    if _render_paused_at is None:
+        return
+    _render_paused_seconds += max(0.0, now - _render_paused_at)
+    _render_paused_at = None
+
+
 def pause_tts_clips() -> None:
     """Hold our clips so the mic hears the person instead of the speakers."""
-    for pid in _omp_vb_pids():
+    pids = list(_omp_vb_pids())
+    if not pids:
+        return
+    for pid in pids:
         subprocess.run(["kill", "-STOP", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    note_render_paused(time.time())
 
 
 def resume_tts_clips() -> None:
     for pid in _omp_vb_pids():
         subprocess.run(["kill", "-CONT", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    note_render_resumed(time.time())
 
 
 def kill_tts_clips() -> None:
@@ -1537,6 +2333,7 @@ class MicState:
     partial_base: str = ""
     on_headphones: bool = False
     whisper_pending: dict | None = None
+    idle_verify_next: tuple | None = None
     # Rolling speaker-bleed floor while VoiceBox plays (~2.0s). A person talking over the
     # laptop speakers sits well above that floor; a wake-word hit on the TTS audio does not.
     tts_rms_floor: deque[float] = field(default_factory=lambda: deque(maxlen=25))
@@ -1565,9 +2362,43 @@ class MicState:
         try:
             jobs.put_nowait({"audio": audio_f32, "prompt": prompt, "slot": slot})
         except queue.Full:
+            if kind == "tts_barge":
+                self.tts_barge_next = (audio_f32, prompt)
             return False
         self.whisper_pending = {"kind": kind, "slot": slot}
         return True
+
+    def release_barge_clip(self, jobs: queue.Queue) -> bool:
+        """Queue a held interruption once Whisper is free. A full queue keeps it."""
+        if self.tts_barge_next is None or self.whisper_pending is not None:
+            return False
+        audio, prompt = self.tts_barge_next
+        self.tts_barge_next = None
+        if self.kick_whisper(jobs, "tts_barge", audio, prompt):
+            return True
+        if self.tts_barge_next is None:
+            self.tts_barge_next = (audio, prompt)
+        return False
+
+    def hold_idle_utterance(self, audio: np.ndarray, prompt: str) -> str:
+        """Keep one idle clip while Whisper is busy. A newer clip replaces the older one."""
+        replaced = self.idle_verify_next is not None
+        self.idle_verify_next = (audio, prompt)
+        return "replaced" if replaced else "held"
+
+    def release_idle_utterance(self, jobs: queue.Queue) -> bool:
+        """Queue the held idle clip once the in-flight job is gone. Dictation drops it."""
+        if self.state != "IDLE":
+            self.idle_verify_next = None
+            return False
+        if self.idle_verify_next is None or self.whisper_pending is not None:
+            return False
+        audio, prompt = self.idle_verify_next
+        self.idle_verify_next = None
+        if self.kick_whisper(jobs, "idle_verify", audio, prompt):
+            return True
+        self.idle_verify_next = (audio, prompt)
+        return False
 
     def show_closing_partial(self, jobs: queue.Queue) -> None:
         """Write the latest words before the flush line.
@@ -1650,6 +2481,7 @@ class MicState:
         self.pending_fast_flush = False
         self.idle_in_speech = False
         self.idle_silence_frames = 0
+        self.idle_verify_next = None
         # 1. Trigger Barge-in on VoiceBox if it's speaking (and abort any in-flight OMP generation/tool run)
         self.barge_mute = True
         silence_speech(True)
@@ -1803,7 +2635,9 @@ class MicState:
                 audio, prompt = nxt
                 if self.kick_whisper(jobs, "tts_barge", audio, prompt):
                     return True
-            if self.tts_barge_held:
+                if self.tts_barge_next is None:
+                    self.tts_barge_next = (audio, prompt)
+            if self.tts_barge_held and self.tts_barge_next is None:
                 resume_tts_clips()
                 self.tts_barge_held = False
                 self.note_barge_release()
@@ -1840,10 +2674,8 @@ class MicState:
     def handle_idle_frame(self, frame, now, rms, vad_score, is_speech, dev_name, oww, vad, wake_word, wake_threshold, jobs) -> bool:
         """One IDLE mic frame. True means skip the rest of this iteration."""
         global _handy_on_light
-        if _strata_loaded.is_set() != _handy_on_light:
-            apply_handy_model(_strata_loaded.is_set())
-            if not apply_voicebox_model(_strata_loaded.is_set()):
-                _handy_on_light = not _strata_loaded.is_set()
+        self.release_idle_utterance(jobs)
+        sync_speech_tier(now)
         if (now - self.last_manual_check) >= 1.0:
             self.last_manual_check = now
             manual_id, manual_txt = latest_history_row()
@@ -1980,11 +2812,14 @@ class MicState:
                     if 2 <= n_frames <= 16 and peak >= clip_floor:
                         audio_f32 = clip_for_whisper(clip.astype(np.float32) / 32768.0, 6.0)
                         if not self.kick_whisper(jobs, "tts_barge", audio_f32, "Hey Jarvis. stop."):
-                            log("whisper busy; skipped TTS barge clip")
-                            if self.tts_barge_held:
-                                resume_tts_clips()
-                                self.tts_barge_held = False
-                                self.note_barge_release()
+                            if self.tts_barge_next is not None:
+                                log("whisper busy; held TTS barge clip")
+                            else:
+                                log("whisper busy; skipped TTS barge clip")
+                                if self.tts_barge_held:
+                                    resume_tts_clips()
+                                    self.tts_barge_held = False
+                                    self.note_barge_release()
                     elif self.tts_barge_held:
                         resume_tts_clips()
                         self.tts_barge_held = False
@@ -2052,12 +2887,10 @@ class MicState:
                     self.idle_silence_frames = 0
                     if 5 <= n_frames <= 42 and float(np.max(np.abs(audio_i16))) >= RMS_IDLE_UTTERANCE:
                         audio_f32 = clip_for_whisper(audio_i16.astype(np.float32) / 32768.0, 6.0)
-                        if not self.kick_whisper(jobs, 
-                            "idle_verify",
-                            audio_f32,
-                            "Hey Jarvis, Jarvis, send prompt, prompt this, submit prompt, scratch that, undo that, clear draft.",
-                        ):
-                            log("whisper busy; skipped idle utterance")
+                        prompt = "Hey Jarvis, Jarvis, send prompt, prompt this, submit prompt, scratch that, undo that, clear draft."
+                        if not self.kick_whisper(jobs, "idle_verify", audio_f32, prompt):
+                            held = self.hold_idle_utterance(audio_f32, prompt)
+                            log(f"whisper busy; {held} idle utterance")
 
         return False
 
@@ -2310,8 +3143,7 @@ def run_daemon(
     threading.Thread(target=watch_submitted_messages, daemon=True).start()
     threading.Thread(target=_whisper_worker, daemon=True).start()
     apply_handy_model(_strata_loaded.is_set())
-    if not apply_voicebox_model(_strata_loaded.is_set()):
-        _handy_on_light = not _strata_loaded.is_set()
+    sync_speech_tier(time.monotonic())
     write_status(mic.state, {"wake_word": wake_word, "pause_seconds": pause_seconds})
     log(
         f"OMP Voice Controller ready in IDLE. Say 'Hey Jarvis' (or 'Jarvis') to start dictating; "
@@ -2349,19 +3181,19 @@ def run_daemon(
         try:
             mic_frames: queue.Queue = queue.Queue(maxsize=32)
 
-            def on_mic(indata, _frames, _time_info, _status) -> None:
+            def on_mic(indata, frames, time_info, _status) -> None:
                 block = indata.copy()
-                try:
-                    mic_frames.put_nowait(block)
-                except queue.Full:
-                    try:
-                        mic_frames.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        mic_frames.put_nowait(block)
-                    except queue.Full:
-                        pass
+                captured = block_end_wall_time(
+                    time.time(),
+                    getattr(time_info, "inputBufferAdcTime", None),
+                    getattr(time_info, "currentTime", None),
+                    int(frames),
+                    sample_rate,
+                )
+                dropped, invalid = offer_mic_frame(
+                    mic_frames, stamp_mic_block(block, captured), _status
+                )
+                record_mic_offer(dropped, invalid)
 
             with sd.InputStream(
                 samplerate=sample_rate,
@@ -2370,6 +3202,7 @@ def run_daemon(
                 blocksize=chunk_samples,
                 callback=on_mic,
             ):
+                last_capture_publish = 0.0
                 while running:
                     kind, pcm_block, last_dev_check = next_mic_frame(
                         mic_frames,
@@ -2377,6 +3210,10 @@ def run_daemon(
                         coreaudio_default_input_device_id,
                         last_dev_check,
                     )
+                    now_mono = time.monotonic()
+                    if now_mono - last_capture_publish >= 1.0:
+                        last_capture_publish = now_mono
+                        publish_capture_totals()
                     if kind == "rebind":
                         new_ca_dev = coreaudio_default_input_device_id()
                         log(
@@ -2391,7 +3228,11 @@ def run_daemon(
                         break
                     if kind != "frame" or pcm_block is None:
                         continue
-                    frame = pcm_block[:, 0]
+                    refresh_render_reference()
+                    frame = apply_render_subtraction(
+                        mic_block_samples(pcm_block)[:, 0],
+                        mic_block_captured_at(pcm_block),
+                    )
                     now = time.monotonic()
 
                     if now < mic.cooldown_until:
@@ -2406,6 +3247,7 @@ def run_daemon(
                         heard_kind, heard = polled
                         if mic.apply_whisper(heard_kind, heard, oww, vad, whisper_jobs):
                             continue
+                    mic.release_barge_clip(whisper_jobs)
                     if mic.barge_mute and (now - mic.last_tts_mute) >= 0.25:
                         mic.last_tts_mute = now
                         kill_tts_clips()
@@ -2434,11 +3276,16 @@ def run_daemon(
 
 
 def cmd_status() -> int:
-    bridge = bridge_request("/status", method="GET")
     try:
         delivery = resolve_delivery()
     except Exception as exc:
         delivery = {"mode": "unknown", "error": str(exc)}
+    try:
+        targets = live_bridge_bases()
+    except Exception as exc:
+        log_once("status-targets", f"live_bridge_bases failed: {exc}")
+        targets = []
+    bridge = probe_bridge_status(delivery, targets)
     ctrl = json.loads(STATUS_FILE.read_text(encoding="utf-8")) if STATUS_FILE.exists() else {"state": "STOPPED"}
     pid = ctrl.get("pid")
     alive = False
@@ -2453,7 +3300,7 @@ def cmd_status() -> int:
             {
                 "controller": {**ctrl, "alive": alive},
                 "delivery": delivery,
-                "omp_bridge": bridge or {"ok": False, "note": "Restart the OMP session (/restart) to bind :17494"},
+                "omp_bridge": bridge,
             },
             indent=2,
         )
@@ -2512,6 +3359,7 @@ def cmd_start_bg(args: argparse.Namespace) -> int:
         "--idle-timeout",
         str(args.idle_timeout),
     ]
+    rotate_log(LOG_FILE, LOG_ROTATE_BYTES)
     log_fh = open(LOG_FILE, "a", encoding="utf-8")
     child_env = os.environ.copy()
     child_env["OMP_VOICE_PID_LOCK_FD"] = str(lock.fileno())

@@ -432,6 +432,60 @@ IMPROVEMENT LOOP IDLE
 
 J1 is pass. The 01:33:13 field write contains `pause`, and #734 is one draft that contains `pause`. The log ends at that send. No later line shows a new user-facing miss. G10 stays blocked. No new section.
 
+That idle line is historical. It is not a claim that the product is reliable. The 2026-11-13 reliability pass found a real false down and fixed it. Do not rerun A–J. VA-PLAY-001, VA-TTS-001, and VA-AUD-002 are done in unit tests. The open code gap is VA-AUD-001. Speaker echo was not run.
+
+### VA-OMP-001, 12:43
+
+`omp-voice-controller status` asked `http://127.0.0.1:17494/status`, got connection refused, and printed `omp_bridge.ok: false` with a note to restart OMP and bind :17494. The session file for pid 80894 already had an ephemeral port, and `GET /status` on that port was ok. `cmd_status` always used `OMP_BRIDGE_URL`. After the fix, status at 12:43:48 reported `omp_bridge.ok: true`, `pid` 80894, and `url` `http://127.0.0.1:57042`, which matched `sessions/80894.json` at that moment. No connection-refused line. The port is not stable: the same pid had been on 56876 earlier in the same hour, so the next run must read the registry again. Unit tests: `~/.local/share/omp-voice/venv/bin/python -m pytest tests/ -q` → 67 passed. No speech. OMP was not restarted by this run. G10 stays blocked as a spoken delivery test. VA-OMP-001 is pass. Do not rerun it.
+
+### VA-PLAY-001, unit only
+
+No speech. `tts-playing.json` was one object, so one session's end cleared every session, and a dead `afplay` could stay `playing: true`. Slots are now `tts-playing/<pid>.json`. An older clip cannot end a newer one. The directory wins over the flat file when the directory exists. `pytest tests/ -q` → 69 passed. `node --experimental-strip-types --test tests/playback-state.test.ts tests/match_command.test.ts` → 44 passed. The running controller and the running OMP session were not restarted, so they still have the old playback code. VA-PLAY-001 is pass at unit level. Do not rerun it. Do not treat it as a speaker pass.
+
+### VA-TTS-001, unit only
+
+No speech. `enqueue` used to skip a sentence when `spokenText` contained it, and a prefix miss cleared the spoken chunks so the reply played again. A chunk is now spoken unless it equals a chunk already queued or a join of consecutive chunks. A new assistant message id clears that list. The same id does not. `node --experimental-strip-types --test tests/speech-queue.test.ts tests/match_command.test.ts` → 36 passed. The running OMP session was not restarted. VA-TTS-001 is pass at unit level. Do not rerun it. Do not treat it as a speaker pass.
+
+### VA-AUD-002, unit only
+
+No speech and no microphone. A full capture queue used to drop the oldest block without a count. `offer_mic_frame` keeps the newest block and returns the drop. Overflow counts as `mic_invalid`. `pytest tests/ -q` → 73 passed. The running controller was not restarted, so its status file does not have these keys yet. VA-AUD-002 is pass at unit level. Do not rerun it. Do not treat it as a hardware pass.
+
+### VA-AUD-001, reference only
+
+No speech. A mic block that is a delayed, scaled copy of the 16 kHz playback is subtracted when the correlation is at least 0.75. Noise below 0.85 is left alone. This is one delay, not a room model. `pytest tests/test_playback_state.py tests/test_mic_capture.py -q` → 9 passed. The running controller was not restarted. Do not mark speaker echo suppressed.
+
+### VA-TTS-003, player exit
+
+No audio. `play` used to mark a chunk spoken whenever afplay closed, including a failed start. Exit 0 is heard. Exit 1 is not. `SIGKILL` is heard. A spawn error is not. A miss uses the same unspoken-chunk release as VA-TTS-002. The three Node test files → 55 passed. The running extension was not reloaded. Do not rerun the spoken rows.
+
+### VA-LOG-003, log rotation
+
+No speech. `controller.log` was 3.1 MiB and `speech.log` was 1.5 MiB. A file over the limit now becomes one `.1` backup, and the next rotation replaces that backup. The controller does this before it opens the log. The speech logger does it before an append. The live files were not renamed. `pytest tests/ -q` → 97 passed. The three Node test files → 54 passed. The running processes were not restarted. Do not rerun the spoken rows.
+
+### VA-TTS-002, unspoken chunk
+
+No audio. A chunk was added to the spoken list before VoiceBox returned, and a refused request left it there. That chunk is now removed. If it is the end of the queue, the queue rewinds. If a later chunk is already queued, that later chunk stays spoken. `node --experimental-strip-types --test tests/match_command.test.ts tests/playback-state.test.ts tests/speech-queue.test.ts` → 53 passed. The running extension was not reloaded. Do not rerun the spoken rows.
+
+### VA-LOG-002, speech log
+
+No speech was played. `speech.log` stored the sentence on a failed VoiceBox request. The record now has `event`, `chars`, and the reason. The sentence is stored only when `OMP_VOICE_LOG_TEXT=1`. `controller.log` is unchanged. `node --experimental-strip-types --test tests/match_command.test.ts tests/playback-state.test.ts tests/speech-queue.test.ts` → 52 passed. The running extension was not reloaded. Do not rerun the spoken rows.
+
+### VA-BARGE-001, busy barge clip
+
+No speech and no microphone. The controller log says `whisper busy; skipped TTS barge clip`, including 2026-11-13 00:15:09 and a run on 2026-11-11 from 22:35 through 22:40. A full queue dropped the clip and resumed playback. The clip is now held, a newer one replaces it, and it is queued after the worker takes the previous job. `pytest tests/test_idle_whisper.py -q` passed. `pytest tests/ -q` → 96 passed. The running controller was not restarted. Do not rerun the spoken rows.
+
+### VA-IDLE-001, busy Whisper
+
+No speech and no microphone. The controller log has `whisper busy; skipped idle utterance` at 12:43:37, 12:52:42, 13:09:13, 13:09:15, and 13:09:23. Those clips were discarded. One idle clip is now held, a newer one replaces it, and the next idle frame queues it after the in-flight job is taken. Dictation drops it. `pytest tests/test_idle_whisper.py -q` passed. `pytest tests/ -q` → 95 passed. The running controller was not restarted. Do not rerun the spoken rows.
+
+### VA-LOG-001, VoiceBox health
+
+No speech. From 12:32:16 to 12:32:22 the controller log repeated `VoiceBox health unread` on idle frames. A failed health check had inverted the Handy flag, so the next frame tried again. The check now waits 5 s, logs the refusal once per outage, and leaves the Handy flag on the Strata tier. `pytest tests/test_speech_tier.py -q` passed. `pytest tests/ -q` → 93 passed. VoiceBox was not started. The running controllers were not restarted. Do not rerun the spoken rows.
+
+### VA-AUD-001, published cursor
+
+No speech and no microphone. Subtraction already ignored stopped time. `refresh_render_reference` still moved `render_cursor` with the wall clock: 8000 samples at 0.50 s, then 12000 after 0.25 s stopped. The published field now stays at 8000 until playback resumes, and is 12000 after another 0.25 s of playback. `pytest tests/test_playback_state.py tests/test_mic_capture.py -q` → 24 passed. `pytest tests/ -q` → 91 passed. The running controller was not restarted. Speaker echo was not run. Do not mark it suppressed.
+
 ## Loop prompt
 
 Give an agent this prompt, one iteration at a time.

@@ -28,7 +28,7 @@ This is a local listener and an OMP extension. It does not ship its own speech e
 flowchart LR
   mic[Mic] --> ctrl[omp-voice-controller]
   ctrl --> handy[Handy]
-  handy --> bridge["OMP extension :17494"]
+  handy --> bridge["OMP extension ephemeral port"]
   bridge --> omp[OMP session]
   omp --> bridge
   bridge --> vb["VoiceBox :17493"]
@@ -54,7 +54,7 @@ brew tap can1357/tap
 brew install omp
 ```
 
-Open the OMP session you want to talk to. The voice extension listens on `127.0.0.1:17494` when that session starts. If more than one session is open, the newest one takes the port.
+Open the OMP session you want to talk to. The voice extension binds an ephemeral `127.0.0.1` port and writes `~/.local/state/omp-voice/sessions/<pid>.json`. The controller reads that file. Port `17494` is only for a legacy build that is actually listening there. A focused text control in another app is a paste, not a bridge send.
 
 ### 2. Handy
 

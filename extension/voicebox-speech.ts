@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { commitBegin, commitEnd, wavReference } from "./playback-state.ts";
 
 const API = "http://127.0.0.1:17493";
 const BRIDGE_HOST = "127.0.0.1";
@@ -60,6 +61,9 @@ export class VoiceSession {
   // reply must not be spoken after Handy closes. A different reply clears it.
   droppedPlain: string | null = null;
   clipSeq = 0;
+  replyKey = "";
+  activeTurn = 0;
+  activeClip = 0;
   activeAfplay: ChildProcess | null = null;
   activeAbort: AbortController | null = null;
   isSpeaking = false;
@@ -78,6 +82,9 @@ export class VoiceSession {
     this.lastPlain = "";
     this.droppedPlain = null;
     this.clipSeq = 0;
+    this.replyKey = "";
+    this.activeTurn = 0;
+    this.activeClip = 0;
     this.activeAfplay = null;
     this.activeAbort = null;
     this.isSpeaking = false;
@@ -95,13 +102,6 @@ function logOnce(key: string, err: unknown): void {
   if (session.loggedOnce.has(key)) return;
   session.loggedOnce.add(key);
   logSpeech("error", key, { error: String(err) });
-}
-
-function writeJsonAtomic(filePath: string, value: unknown): void {
-  const tmp = `${filePath}.${process.pid}.tmp`;
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(value));
-  fs.renameSync(tmp, filePath);
 }
 
 function readBody(req: http.IncomingMessage, onEnd: (body: string) => void): void {
@@ -269,6 +269,94 @@ export function continuesDroppedReply(dropped: string | null, plain: string): bo
   return plain.startsWith(dropped) || dropped.startsWith(plain);
 }
 
+export function messageKey(message: unknown): string {
+  if (!message || typeof message !== "object" || !("id" in message)) return "";
+  const id = message.id;
+  return typeof id === "string" ? id : "";
+}
+
+export function isNewReply(previousKey: string, nextKey: string): boolean {
+  return previousKey.length > 0 && nextKey.length > 0 && previousKey !== nextKey;
+}
+
+/** Exact chunk, or several consecutive chunks joined in order. Not a substring. */
+export function isSpokenChunk(chunks: readonly string[], sentence: string): boolean {
+  const target = sentence.trim();
+  if (!target) return true;
+  const parts = chunks.map((chunk) => chunk.trim()).filter(Boolean);
+  if (parts.some((part) => part === target)) return true;
+  const joined = parts.join(" ");
+  if (!joined) return false;
+  if (joined === target || joined.startsWith(`${target} `)) return true;
+  for (let start = 0; start < parts.length; start++) {
+    let acc = "";
+    for (let index = start; index < parts.length; index++) {
+      acc = acc ? `${acc} ${parts[index]}` : parts[index]!;
+      if (acc === target) return true;
+      if (acc.length > target.length) break;
+    }
+  }
+  return false;
+}
+
+export function queuedAfterRewrite(queued: string, spokenText: string, plain: string): string {
+  if (!queued || plain.startsWith(queued)) return queued;
+  const covered = spokenText.trim();
+  const head = covered.slice(0, 48);
+  const at = head ? plain.indexOf(head) : -1;
+  if (at < 0) return "";
+  let index = 0;
+  while (index < covered.length && at + index < plain.length && plain[at + index] === covered[index]) index++;
+  return plain.slice(0, at + index);
+}
+
+export function dropUnspokenChunk(inflight: readonly string[], chunk: string): string[] {
+  const trimmed = chunk.trim();
+  if (!trimmed) return [...inflight];
+  return inflight.filter((item) => item.trim() !== trimmed);
+}
+
+export function rewindQueuedPastChunk(queued: string, chunk: string): string {
+  const trimmed = chunk.trim();
+  const end = queued.trimEnd();
+  if (!trimmed || end === trimmed) return trimmed && end === trimmed ? "" : queued;
+  const suffix = ` ${trimmed}`;
+  if (end.endsWith(suffix)) return end.slice(0, -suffix.length);
+  return queued;
+}
+
+export function playbackHeard(code: number | null, signal: string | null, spawnError: boolean): boolean {
+  if (spawnError) return false;
+  if (signal) return true;
+  return code === 0;
+}
+
+export function noteUnspoken(
+  inflight: readonly string[],
+  committed: readonly string[],
+  queued: string,
+  chunk: string,
+): { inflight: string[]; spokenText: string; queued: string; forget: boolean } {
+  const next = dropUnspokenChunk(inflight, chunk);
+  const trimmed = chunk.trim();
+  const forget = trimmed.length > 0 && !committed.some((item) => item.trim() === trimmed);
+  return {
+    inflight: next,
+    spokenText: [...committed, ...next].join(" "),
+    queued: rewindQueuedPastChunk(queued, chunk),
+    forget,
+  };
+}
+
+function releaseUnspoken(chunk: string): void {
+  const next = noteUnspoken(session.inflight, session.committed, session.queued, chunk);
+  session.inflight.length = 0;
+  session.inflight.push(...next.inflight);
+  if (next.forget) session.spoken.delete(chunk);
+  session.spokenText = next.spokenText;
+  session.queued = next.queued;
+}
+
 function rollbackInflight(): void {
   for (const sentence of session.inflight) session.spoken.delete(sentence);
   session.inflight.length = 0;
@@ -283,8 +371,23 @@ function commitSpoken(sentence: string): void {
   session.spokenText = [...session.committed, ...session.inflight].join(" ");
 }
 
+function voiceStateDir(): string {
+  return path.join(os.homedir(), ".local", "state", "omp-voice");
+}
+
 export function stopPlayback(): boolean {
   const wasSpeaking = session.isSpeaking || session.activeAfplay !== null || session.activeAbort !== null;
+  const turn = session.activeTurn;
+  const clip = session.activeClip;
+  if (clip > 0) {
+    try {
+      commitEnd(voiceStateDir(), String(process.pid), turn, clip, Date.now() / 1000);
+    } catch (err) {
+      logOnce("tts-playing-write", err);
+    }
+  }
+  session.activeTurn = 0;
+  session.activeClip = 0;
   session.speechEpoch++;
   // A new turn or a barge-in aborts clips that have not finished. Forgetting
   // them here is what left the next reply silent when it repeated that text.
@@ -309,13 +412,6 @@ export function stopPlayback(): boolean {
     session.activeAfplay = null;
   }
   session.isSpeaking = false;
-  const statePath = path.join(os.homedir(), ".local", "state", "omp-voice", "tts-playing.json");
-  try {
-    fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    writeJsonAtomic(statePath, { playing: false, ended_at: Date.now() / 1000 });
-  } catch (err) {
-    logOnce("tts-playing-write", err);
-  }
   return wasSpeaking;
 }
 
@@ -450,20 +546,53 @@ async function profileId(): Promise<string | undefined> {
   return undefined;
 }
 
+const SPEECH_LOG_LIMIT = 1_048_576;
+
+export function rotateLogFile(file: string, limitBytes: number): boolean {
+  let size = 0;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    return false;
+  }
+  if (size <= limitBytes) return false;
+  const backup = `${file}.1`;
+  try {
+    fs.rmSync(backup, { force: true });
+    fs.renameSync(file, backup);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+export function speechLogRecord(
+  event: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+  includeText = process.env.OMP_VOICE_LOG_TEXT === "1",
+): Record<string, unknown> {
+  const record: Record<string, unknown> = { t: new Date().toISOString(), event, chars: text.length, ...extra };
+  if (includeText) record.text = text;
+  return record;
+}
+
 function logSpeech(event: string, text: string, extra: Record<string, unknown> = {}): void {
   try {
     const dir = path.join(os.homedir(), ".local", "state", "omp-voice");
     fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, "speech.log"),
-      `${JSON.stringify({ t: new Date().toISOString(), event, chars: text.length, text, ...extra })}\n`,
-    );
+    const file = path.join(dir, "speech.log");
+    rotateLogFile(file, SPEECH_LOG_LIMIT);
+    fs.appendFileSync(file, `${JSON.stringify(speechLogRecord(event, text, extra))}\n`);
   } catch {
     // ignore
   }
 }
 
-async function generate(text: string, epoch: number): Promise<{ wav: string; sentence: string } | undefined> {
+async function generate(
+  text: string,
+  epoch: number,
+): Promise<{ wav: string; sentence: string; clip: number; reference: ReturnType<typeof wavReference> } | undefined> {
   if (epoch !== session.speechEpoch) {
     logSpeech("dropped", text, { reason: "epoch" });
     return undefined;
@@ -502,10 +631,17 @@ async function generate(text: string, epoch: number): Promise<{ wav: string; sen
       logSpeech("failed", text, { reason: epoch !== session.speechEpoch ? "epoch" : "short-audio", bytes: arrayBuf.byteLength });
       return undefined;
     }
-    const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${++session.clipSeq}.wav`);
-    fs.writeFileSync(wavPath, Buffer.from(arrayBuf));
-    logSpeech("generated", text, { bytes: arrayBuf.byteLength, wav: path.basename(wavPath) });
-    return { wav: wavPath, sentence: text };
+    const clipNo = ++session.clipSeq;
+    const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${clipNo}.wav`);
+    const wavBytes = Buffer.from(arrayBuf);
+    const reference = wavReference(wavBytes, wavPath);
+    fs.writeFileSync(wavPath, wavBytes);
+    logSpeech("generated", text, {
+      bytes: wavBytes.byteLength,
+      wav: path.basename(wavPath),
+      reference: reference ? { sample_rate: reference.sample_rate, channels: reference.channels, frames: reference.frames } : null,
+    });
+    return { wav: wavPath, sentence: text, clip: clipNo, reference };
   } catch (err) {
     logSpeech("failed", text, { reason: String(err) });
     return undefined;
@@ -515,7 +651,10 @@ async function generate(text: string, epoch: number): Promise<{ wav: string; sen
   }
 }
 
-async function play(clip: { wav: string; sentence: string }, epoch: number): Promise<void> {
+async function play(
+  clip: { wav: string; sentence: string; clip: number; reference?: { sample_rate: number; channels: number; frames: number; wav: string } | null },
+  epoch: number,
+): Promise<void> {
   if (epoch !== session.speechEpoch) {
     try {
       fs.unlinkSync(clip.wav);
@@ -554,15 +693,30 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
     return;
   }
   session.activeAfplay = child;
-  const statePath = path.join(os.homedir(), ".local", "state", "omp-voice", "tts-playing.json");
+  session.activeTurn = epoch;
+  session.activeClip = clip.clip;
   try {
-    fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    writeJsonAtomic(statePath, { playing: true, pid: child.pid, started_at: Date.now() / 1000 });
+    commitBegin(
+      voiceStateDir(),
+      String(process.pid),
+      epoch,
+      clip.clip,
+      process.pid,
+      child.pid,
+      Date.now() / 1000,
+      clip.reference,
+      session.playbackRate,
+    );
   } catch (err) {
     logOnce("tts-playing-write", err);
   }
   let settled = false;
-  const finish = () => {
+  let spawnError = false;
+  let exitCode: number | null = null;
+  let exitSignal: string | null = null;
+  const finish = (code?: number | null, signal?: NodeJS.Signals | null) => {
+    if (typeof code === "number") exitCode = code;
+    if (signal) exitSignal = signal;
     if (settled) return;
     settled = true;
     resolve();
@@ -573,21 +727,31 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
     } catch {
       // ignore
     }
-    finish();
+    finish(null, "SIGKILL");
   }, 45000);
-  child.on("close", finish);
-  child.on("exit", finish);
-  child.on("error", finish);
+  child.on("exit", (code, signal) => finish(code, signal));
+  child.on("close", (code, signal) => finish(code, signal));
+  child.on("error", () => {
+    spawnError = true;
+    finish();
+  });
   await promise;
-  if (epoch === session.speechEpoch) commitSpoken(clip.sentence);
+  if (epoch === session.speechEpoch) {
+    if (playbackHeard(exitCode, exitSignal, spawnError)) commitSpoken(clip.sentence);
+    else releaseUnspoken(clip.sentence);
+  }
   clearTimeout(watchdog);
   if (session.activeAfplay === child) {
     session.activeAfplay = null;
     session.isSpeaking = false;
     try {
-      writeJsonAtomic(statePath, { playing: false, ended_at: Date.now() / 1000 });
+      commitEnd(voiceStateDir(), String(process.pid), epoch, clip.clip, Date.now() / 1000);
     } catch (err) {
       logOnce("tts-playing-write", err);
+    }
+    if (session.activeTurn === epoch && session.activeClip === clip.clip) {
+      session.activeTurn = 0;
+      session.activeClip = 0;
     }
   }
   try {
@@ -598,7 +762,8 @@ async function play(clip: { wav: string; sentence: string }, epoch: number): Pro
 }
 
 function enqueue(sentence: string): void {
-  if (session.spoken.has(sentence) || session.spokenText.includes(sentence)) return;
+  const chunks = [...session.committed, ...session.inflight];
+  if (isSpokenChunk(chunks, sentence)) return;
   session.spoken.add(sentence);
   session.inflight.push(sentence);
   session.spokenText = [...session.committed, ...session.inflight].join(" ");
@@ -608,6 +773,7 @@ function enqueue(sentence: string): void {
   session.playTail = session.playTail.then(async () => {
     const clip = await ready;
     if (clip) await play(clip, epoch);
+    else if (epoch === session.speechEpoch) releaseUnspoken(sentence);
   });
 }
 
@@ -634,26 +800,27 @@ function push(message: unknown, flush: boolean): void {
   }
   const plain = forSpeech(raw);
   if (!plain) return;
+  const key = messageKey(message);
+  if (isNewReply(session.replyKey, key)) {
+    // A different assistant message. Stop the old clip and forget its chunks so
+    // a repeated sentence can be spoken. The same message id is a stream or a
+    // tool round, and those chunks stay put.
+    stopPlayback();
+    session.spoken.clear();
+    session.committed.length = 0;
+    session.inflight.length = 0;
+    session.spokenText = "";
+    session.queued = "";
+    session.droppedPlain = null;
+  }
+  if (key) session.replyKey = key;
   if (continuesDroppedReply(session.droppedPlain, plain)) return;
   session.lastPlain = plain;
   if (session.queued && !plain.startsWith(session.queued)) {
     // forSpeech rewrites command words as the message grows, so the normalized
-    // text no longer starts with what we already queued. Replaying from the
-    // start is what looped the last reply. Keep going after the covered part.
-    const covered = session.spokenText.trim();
-    const head = covered.slice(0, 48);
-    const at = head ? plain.indexOf(head) : -1;
-    if (at >= 0) {
-      let i = 0;
-      while (i < covered.length && at + i < plain.length && plain[at + i] === covered[i]) i++;
-      session.queued = plain.slice(0, at + i);
-    } else {
-      session.queued = "";
-      session.spoken.clear();
-      session.committed.length = 0;
-      session.inflight.length = 0;
-      session.spokenText = "";
-    }
+    // text no longer starts with what we already queued. Keep the spoken chunks.
+    // Clearing them here replayed the reply.
+    session.queued = queuedAfterRewrite(session.queued, session.spokenText, plain);
   }
   const base = session.queued.length;
   const fresh = plain.slice(base);
