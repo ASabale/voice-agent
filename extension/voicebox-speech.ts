@@ -17,6 +17,8 @@ import * as path from "node:path";
 import { commitBegin, commitEnd, wavReference } from "./playback-state.ts";
 
 const API = "http://127.0.0.1:17493";
+export const VOICEBOX_REFUSAL_SECONDS = 5;
+let voiceboxRetryAt = 0;
 const BRIDGE_HOST = "127.0.0.1";
 const HTTP_BODY_CAP = 65536;
 let boundBridgePort = 0;
@@ -264,9 +266,20 @@ export function parseVoiceTranscript(
   };
 }
 
+function spokenWords(text: string): string {
+  return text
+    .trim()
+    .replace(/[.!?;:]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function continuesDroppedReply(dropped: string | null, plain: string): boolean {
   if (dropped === null || dropped.length === 0) return false;
-  return plain.startsWith(dropped) || dropped.startsWith(plain);
+  const prior = spokenWords(dropped);
+  const next = spokenWords(plain);
+  if (!prior || !next) return false;
+  return next === prior || next.startsWith(`${prior} `) || prior.startsWith(`${next} `);
 }
 
 export function messageKey(message: unknown): string {
@@ -277,6 +290,28 @@ export function messageKey(message: unknown): string {
 
 export function isNewReply(previousKey: string, nextKey: string): boolean {
   return previousKey.length > 0 && nextKey.length > 0 && previousKey !== nextKey;
+}
+
+export function beginReplyStopsPlayback(
+  previousKey: string,
+  nextKey: string,
+  previousPlain: string,
+  nextPlain: string,
+): boolean {
+  return isNewReply(previousKey, nextKey) && !continuesDroppedReply(previousPlain, nextPlain);
+}
+
+export function speechAfterSpoken(already: readonly string[], sentence: string): string {
+  const incomingWords = spokenWords(sentence);
+  if (!incomingWords) return "";
+  const parts = already.map((part) => spokenWords(part)).filter(Boolean);
+  if (parts.length === 0) return sentence.trim();
+  for (let start = 0; start < parts.length; start++) {
+    const covered = parts.slice(start).join(" ");
+    if (incomingWords === covered || covered.startsWith(`${incomingWords} `)) return "";
+    if (incomingWords.startsWith(`${covered} `)) return incomingWords.slice(covered.length).trim();
+  }
+  return sentence.trim();
 }
 
 /** Exact chunk, or several consecutive chunks joined in order. Not a substring. */
@@ -413,6 +448,16 @@ export function stopPlayback(): boolean {
   }
   session.isSpeaking = false;
   return wasSpeaking;
+}
+
+export function currentSpeechEpoch(): number {
+  return session.speechEpoch;
+}
+
+export function onTurnStart(): void {
+  // A tool round and a streamed reply both start a turn. Stopping here aborts
+  // the clip, drops the queue, and the same sentences play again. The mic then
+  // hears that replay. A user interrupt already calls bargeIn.
 }
 
 export function bargeIn(): boolean {
@@ -566,6 +611,17 @@ export function rotateLogFile(file: string, limitBytes: number): boolean {
   return true;
 }
 
+export function refusalHold(now: number, retryAt: number): boolean {
+  return now < retryAt;
+}
+
+export function isConnectionRefusal(err: unknown): boolean {
+  const parts = [String(err)];
+  if (err && typeof err === "object" && "cause" in err) parts.push(String((err as { cause?: unknown }).cause));
+  const text = parts.join(" ");
+  return text.includes("ECONNREFUSED") || text.includes("Unable to connect");
+}
+
 export function speechLogRecord(
   event: string,
   text: string,
@@ -595,6 +651,11 @@ async function generate(
 ): Promise<{ wav: string; sentence: string; clip: number; reference: ReturnType<typeof wavReference> } | undefined> {
   if (epoch !== session.speechEpoch) {
     logSpeech("dropped", text, { reason: "epoch" });
+    return undefined;
+  }
+  const now = Date.now() / 1000;
+  if (refusalHold(now, voiceboxRetryAt)) {
+    logOnce("voicebox-refused", "VoiceBox refused; speech request held");
     return undefined;
   }
   const controller = new AbortController();
@@ -641,8 +702,11 @@ async function generate(
       wav: path.basename(wavPath),
       reference: reference ? { sample_rate: reference.sample_rate, channels: reference.channels, frames: reference.frames } : null,
     });
+    voiceboxRetryAt = 0;
+    session.loggedOnce.delete("voicebox-refused");
     return { wav: wavPath, sentence: text, clip: clipNo, reference };
   } catch (err) {
+    if (isConnectionRefusal(err)) voiceboxRetryAt = now + VOICEBOX_REFUSAL_SECONDS;
     logSpeech("failed", text, { reason: String(err) });
     return undefined;
   } finally {
@@ -763,17 +827,18 @@ async function play(
 
 function enqueue(sentence: string): void {
   const chunks = [...session.committed, ...session.inflight];
-  if (isSpokenChunk(chunks, sentence)) return;
-  session.spoken.add(sentence);
-  session.inflight.push(sentence);
+  const speak = speechAfterSpoken(chunks, sentence);
+  if (!speak || isSpokenChunk(chunks, speak) || isSpokenChunk(chunks, sentence)) return;
+  session.spoken.add(speak);
+  session.inflight.push(speak);
   session.spokenText = [...session.committed, ...session.inflight].join(" ");
   const epoch = session.speechEpoch;
-  const ready = session.genTail.then(() => generate(sentence, epoch));
+  const ready = session.genTail.then(() => generate(speak, epoch));
   session.genTail = ready.then(() => undefined);
   session.playTail = session.playTail.then(async () => {
     const clip = await ready;
     if (clip) await play(clip, epoch);
-    else if (epoch === session.speechEpoch) releaseUnspoken(sentence);
+    else if (epoch === session.speechEpoch) releaseUnspoken(speak);
   });
 }
 
@@ -801,10 +866,11 @@ function push(message: unknown, flush: boolean): void {
   const plain = forSpeech(raw);
   if (!plain) return;
   const key = messageKey(message);
-  if (isNewReply(session.replyKey, key)) {
-    // A different assistant message. Stop the old clip and forget its chunks so
-    // a repeated sentence can be spoken. The same message id is a stream or a
-    // tool round, and those chunks stay put.
+  if (beginReplyStopsPlayback(session.replyKey, key, session.lastPlain, plain)) {
+    // A different reply. Stop the old clip and forget its chunks so a repeated
+    // sentence can be spoken. The same message id, or a new id whose words
+    // extend the reply already playing, leaves that clip alone. A period in
+    // "I will leave." must not make "I will leave the player." look new.
     stopPlayback();
     session.spoken.clear();
     session.committed.length = 0;
@@ -864,11 +930,10 @@ function push(message: unknown, flush: boolean): void {
   }
 
   if (group) {
-    // Emit the final group immediately if:
-    // - flush is true (end of message), OR
-    // - it's the very first sentence of the reply (so audio starts with zero delay), OR
-    // - the group is already >= 110 chars (so it won't need to wait for another sentence).
-    if (flush || session.spoken.size === 0 || group.length >= 110) {
+    // Wait for the next sentence or the end of the message. Speaking the first
+    // short sentence immediately is what said "I will leave" and then said
+    // "I will leave the player" when that sentence grew.
+    if (flush || group.length >= 110) {
       enqueue(group);
       session.queued = plain.slice(0, base + groupEndOffset);
     }
@@ -1095,10 +1160,7 @@ export default function voiceboxSpeech(pi: {
 
   pi.on("turn_start", (_event, ctx) => {
     if (ctx) latestCtx = ctx;
-    // Cut audio for a new user message. Do not mark the reply dropped and do not
-    // forget spoken sentences: tool and sub-agent rounds also start a turn, and
-    // the parent text is delivered again on each one.
-    stopPlayback();
+    onTurnStart();
   });
 
   // If any assistant speech occurs while Handy is recording in DICTATING, silence it immediately!

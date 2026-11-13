@@ -4,13 +4,20 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import {
+  beginReplyStopsPlayback,
+  currentSpeechEpoch,
   isNewReply,
   isSpokenChunk,
+  onTurnStart,
+  stopPlayback,
   messageKey,
   noteUnspoken,
   playbackHeard,
+  isConnectionRefusal,
   queuedAfterRewrite,
+  refusalHold,
   rotateLogFile,
+  speechAfterSpoken,
   speechLogRecord,
 } from "../extension/voicebox-speech.ts";
 
@@ -52,12 +59,72 @@ test("an aligned rewrite keeps the covered prefix", () => {
   assert.equal(plain.startsWith(queued), true);
 });
 
+test("a turn start does not abort the playing clip", () => {
+  const epoch = currentSpeechEpoch();
+  onTurnStart();
+  assert.equal(currentSpeechEpoch(), epoch);
+  stopPlayback();
+  assert.equal(currentSpeechEpoch(), epoch + 1);
+  onTurnStart();
+  assert.equal(currentSpeechEpoch(), epoch + 1);
+});
+
+test("a longer sentence does not speak the words already queued", () => {
+  assert.equal(speechAfterSpoken(["I will leave."], "I will leave the player."), "the player");
+  assert.equal(speechAfterSpoken(["I will leave the player."], "I will leave the player."), "");
+  assert.equal(speechAfterSpoken(["I will leave."], "A different line."), "A different line.");
+  assert.equal(speechAfterSpoken([], "I will leave."), "I will leave.");
+  assert.equal(
+    speechAfterSpoken(["The reply was cut.", "I will leave."], "I will leave the player."),
+    "the player",
+  );
+});
+
+test("a continued reply with a new message id does not stop playback", () => {
+  assert.equal(
+    beginReplyStopsPlayback("msg-1", "msg-2", "The file is ready.", "The file is ready. Open it next."),
+    false,
+  );
+  assert.equal(
+    beginReplyStopsPlayback("msg-1", "msg-2", "The file is ready. Open it next.", "The file is ready."),
+    false,
+  );
+  assert.equal(
+    beginReplyStopsPlayback("msg-1", "msg-2", "The file is ready.", "A different answer."),
+    true,
+  );
+  assert.equal(beginReplyStopsPlayback("msg-1", "msg-1", "The file is ready.", "A different answer."), false);
+  assert.equal(beginReplyStopsPlayback("msg-1", "msg-2", "", "The file is ready."), true);
+  assert.equal(
+    beginReplyStopsPlayback("msg-1", "msg-2", "I will leave.", "I will leave the player."),
+    false,
+  );
+  assert.equal(
+    beginReplyStopsPlayback("msg-1", "msg-2", "I will leave the player.", "I will leave."),
+    false,
+  );
+  assert.equal(
+    beginReplyStopsPlayback("msg-1", "msg-2", "I will leave the player.", "A different answer."),
+    true,
+  );
+});
+
 test("a new assistant message id starts a fresh reply", () => {
   assert.equal(isNewReply("msg-1", "msg-2"), true);
   assert.equal(isNewReply("msg-1", "msg-1"), false);
   assert.equal(isNewReply("", "msg-1"), false);
   assert.equal(messageKey({ id: "msg-2", role: "assistant" }), "msg-2");
   assert.equal(messageKey({ role: "assistant" }), "");
+});
+
+test("a refused VoiceBox holds the next request until the retry time", () => {
+  assert.equal(refusalHold(10, 15), true);
+  assert.equal(refusalHold(15, 15), false);
+  assert.equal(isConnectionRefusal(new TypeError("ECONNREFUSED")), true);
+  const wrapped = new TypeError("fetch failed");
+  (wrapped as { cause?: unknown }).cause = new Error("connect ECONNREFUSED 127.0.0.1:17493");
+  assert.equal(isConnectionRefusal(wrapped), true);
+  assert.equal(isConnectionRefusal(new Error("http 500")), false);
 });
 
 test("a player error is not heard and a kill signal is", () => {

@@ -22,6 +22,21 @@ OTHER = {"pid": 21526, "tty": "ttys001", "started_at": 200, "port": None}
 TEXT = {"role": "AXTextArea", "tty": "/dev/ttys002"}
 
 
+def test_a_missing_registry_port_uses_the_one_loopback_listener(monkeypatch) -> None:
+    assert controller.loopback_listen_port("n127.0.0.1:56876\n") == 56876
+    assert controller.loopback_listen_port("n127.0.0.1:1\nn127.0.0.1:2\n") is None
+    assert controller.loopback_listen_port("n*:80\n") is None
+    monkeypatch.setattr(controller, "load_session_registry", lambda: {})
+    monkeypatch.setattr(controller, "omp_ui_pids", lambda: [80894])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(controller, "pid_tty", lambda _pid: "/dev/ttys002")
+    monkeypatch.setattr(controller, "pid_started_at", lambda _pid: 10)
+    monkeypatch.setattr(controller, "pid_bridge_port", lambda _pid: 56876)
+    records = controller.omp_session_records()
+    dest = controller.choose_delivery(TEXT, records, None)
+    assert dest == {"mode": "bridge", "pid": 80894, "port": 56876, "focused_text": True}
+
+
 def test_focused_omp_tab_without_its_own_port_is_a_paste() -> None:
     dest = controller.choose_delivery(TEXT, [THIS, OTHER], legacy_owner_pid=21526)
     assert dest["mode"] == "paste", dest

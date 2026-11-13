@@ -145,6 +145,28 @@ Status values: `open`, `done`, `blocked`. A `done` row is one verified scenario,
 - **Test method:** `node --experimental-strip-types --test tests/speech-queue.test.ts`. No afplay and no VoiceBox.
 - **Status:** done 2026-11-13 in unit tests. The running extension keeps the old completion until that session reloads. Do not restart it for this row.
 
+## VA-OMP-003 — A missing registry file still has a listen port
+
+- **Priority:** P0. Found live at 14:16 on 2026-11-13.
+- **Problem:** Pid 80894 was the focused Terminal session, but `sessions/` had no file for it. Delivery was `paste` with `port=None`, so live partials were skipped. The process was listening on `127.0.0.1:56876`, and `GET /status` there returned `ok: true` and `pid: 80894`.
+- **Evidence:** Controller log `Delivery paste pid=80894 port=None focused_text=True` and `Partial field skipped (paste, focused=True)`. The status read above. A session object that still has no port stays a paste.
+- **Approach:** When the registry port is missing, `lsof -F n` must show one `127.0.0.1` listen port, and that port's `/status` must name the same pid. Two ports, or a status pid that does not match, stays a paste.
+- **Dependencies:** VA-OMP-001. Do not restart the controller to load it. Do not POST `/transcript`.
+- **Acceptance:** A focused omp tab whose only loopback listener answers `/status` for that pid is a bridge. Without that port, it is still a paste.
+- **Test method:** `pytest tests/test_delivery.py -q`. The test does not call lsof or the live bridge.
+- **Status:** done 2026-11-13 in unit tests. The running controller still pastes until it restarts. Do not restart it for this row.
+
+## VA-TTS-004 — A refused VoiceBox is not called again for 5 s
+
+- **Priority:** P1. Measured at 19:22 on 2026-11-13.
+- **Problem:** `generate` calls VoiceBox for every sentence. While port 17493 is closed, each sentence opens a connection and writes a `failed` line. Fourteen of those lines landed in the 19:22 minute.
+- **Evidence:** `speech.log` records at `2026-11-13T19:22`, including four between 19:22:06 and 19:22:07, each with `ECONNREFUSED`.
+- **Approach:** `isConnectionRefusal` covers that error and its `cause`. The next `generate` returns before `fetch` until 5 seconds after the refusal. A held call logs once. A clip that is produced clears the hold. An HTTP error does not start it.
+- **Dependencies:** VA-TTS-002. Do not restart OMP to load it. Do not start VoiceBox.
+- **Acceptance:** A time before the retry instant is held. The retry instant is not. `ECONNREFUSED`, including a cause, is a refusal. `http 500` is not.
+- **Test method:** `node --experimental-strip-types --test tests/speech-queue.test.ts`. No socket.
+- **Status:** done 2026-11-13 in unit tests. The running extension still connects for every sentence until that session reloads. Do not restart it for this row.
+
 ## Later
 
 Command semantics, a spoken-output contract, and splitting the controller stay behind the open P0 row. `controller.log` still quotes transcripts because the spoken checkpoint reads those lines. Do not refactor the controller while VA-AUD-001 is open.

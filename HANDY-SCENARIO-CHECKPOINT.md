@@ -69,6 +69,10 @@ Do not rerun these unless a later code change invalidates them. Speaker at outpu
 
 ## Retrospective
 
+### VA-INT-001, 2026-11-13 19:24 UTC
+
+Integration check only. No code change. No speech was dictated. Handy pid 62365 is running and was not invoked. VoiceBox GUI pid 29277 is running. `voicebox-server` is absent after a 10:12 SIGSEGV in `mlx::core::eval_impl` and was not relaunched. Port 17493 is closed. OMP pid 80894 answered `GET /status` on 56876 with `agentBusy: true` and `draftLength: 0`. Controller pid 64238 is IDLE and its log stops at 14:16. At 14:27:37 a wake scored 0.98, speech rms was 896, and Handy chunk #771 was `Cancel that.` The outcome was `cancelled`. Delivery was still paste with no port. VoiceBox was not reached. The spoken pipeline stays BLOCKED. Do not mark this pass.
+
 ### F2, after 22:47:54
 
 Ten seconds of silence. No clip. Log did not grow past line 12206 (`Ignored 'Thank you.' over TTS` at 22:47:54). No `Wake triggered`. Status stayed IDLE, pid 3695, `last_action` `sent`, `updated_at` unchanged from the F1 close. F2 is pass.
@@ -453,6 +457,14 @@ No speech and no microphone. A full capture queue used to drop the oldest block 
 ### VA-AUD-001, reference only
 
 No speech. A mic block that is a delayed, scaled copy of the 16 kHz playback is subtracted when the correlation is at least 0.75. Noise below 0.85 is left alone. This is one delay, not a room model. `pytest tests/test_playback_state.py tests/test_mic_capture.py -q` → 9 passed. The running controller was not restarted. Do not mark speaker echo suppressed.
+
+### VA-OMP-003, missing registry port
+
+No new speech. At 14:16 a focused Terminal dictation logged `Delivery paste pid=80894 port=None` and `Partial field skipped (paste, focused=True)`. `sessions/` has no file for that pid. `GET /status` on `127.0.0.1:56876` returned ok for pid 80894. A missing registry port now uses that one loopback listener when status names the same pid. Two ports stay a paste. `pytest tests/ -q` → 98 passed. The running controller was not restarted. Do not POST `/transcript`. Do not rerun the spoken rows.
+
+### VA-TTS-004, VoiceBox hold
+
+No speech. `speech.log` had 14 `failed` records in the 19:22 minute, four of them between 19:22:06 and 19:22:07, each `ECONNREFUSED`. A refusal now holds the next `generate` for 5 seconds, before `fetch`. An HTTP 500 does not. The three Node test files → 56 passed. The running extension was not reloaded. Do not start VoiceBox for this row. Do not rerun the spoken rows.
 
 ### VA-TTS-003, player exit
 
