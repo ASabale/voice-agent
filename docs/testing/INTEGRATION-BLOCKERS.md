@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-14 04:15 UTC — the canceller now reports its own residual
+
+**Status:** PASS for VA-OBS-001 at LEVEL 1. `cancel_playback_echo` accumulates raw and cleaned energy per block (silent references skipped) and `publish_capture_totals` writes `aec_echo_db` and `aec_blocks` into `status.json`. Measured -33.1 dB over the 8 s four-path room feed, 101 blocks. A latent bug surfaced on the way: int16 energies overflowed in `np.dot`, so the widening to int64 is now asserted by the test. Full controller suite: 215 passed. Pid 64238 was not restarted, so the live status file still lacks these fields until the new code runs. Not a room measurement, not VA-INT-001. See `docs/testing/scenarios/VA-OBS-001-aec-residual.md`.
+
 ## 2026-11-14 03:52 UTC — four arrivals at once are cancelled in the synthetic room
 
 **Status:** PASS for VA-AEC-004 at LEVEL 1. A mic signal built from the played clip at 15/30/60/90 ms with gains 0.45/0.18/0.07/0.03, fed through `cancel_playback_echo` in production 1280-sample blocks, loses 37.7 dB of echo tail. Near-end speech layered on top keeps 0.54 of its energy. After a 20 s run the tail is still 38.7 dB down. Full controller suite: 213 passed. Pid 64238 was not restarted and still owns the microphone, so the live path keeps the old filter and this is not a room measurement. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-004-multi-path-room.md`.

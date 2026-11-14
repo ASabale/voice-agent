@@ -458,6 +458,38 @@ def test_near_end_survives_the_multi_path_response(
     assert _rms(cleaned[-_RATE:]) > 0.4 * _rms(near[-_RATE:])
 
 
+def test_the_residual_metric_reports_the_cancelled_echo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    speech = _tile(_wav("sentence-stop-say.wav"), 8.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [_mono_slot(tmp_path, speech)])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    controller.refresh_render_reference(100.0)
+    controller.aec_window_fields()  # reset the window
+    _feed_blocks(_room_response(speech))
+    fields = controller.aec_window_fields()
+    print(f"window residual: {fields}")
+    assert fields["aec_blocks"] > 0
+    assert fields["aec_echo_db"] <= -15.0
+    # The window resets: a read with no new blocks reports nothing.
+    assert controller.aec_window_fields() == {}
+
+
+def test_the_residual_metric_skips_silent_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        controller, "_read_playback_slots", lambda: [_mono_slot(tmp_path, np.zeros(16000, dtype=np.int16))]
+    )
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    controller.refresh_render_reference(100.0)
+    controller.aec_window_fields()
+    rng = np.random.default_rng(7)
+    mic = (rng.integers(-4000, 4000, size=12800) // 1).astype(np.int16)
+    _feed_blocks(mic)
+    assert controller.aec_window_fields() == {}
+
+
 def test_the_canceller_still_works_after_twenty_seconds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

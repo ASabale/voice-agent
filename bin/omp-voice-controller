@@ -46,6 +46,7 @@ import ctypes
 import datetime
 import fcntl
 import json
+import math
 import re
 import select
 import signal
@@ -738,6 +739,39 @@ def process_echo_block(processor, mic: np.ndarray, reverse: np.ndarray) -> np.nd
     return out
 
 
+_aec_mic_energy = 0.0
+_aec_clean_energy = 0.0
+_aec_blocks = 0
+
+
+def _aec_observe(mic: np.ndarray, cleaned: np.ndarray, reverse: np.ndarray) -> None:
+    """Accumulate echo energy for the residual metric. Silent references are skipped."""
+    global _aec_mic_energy, _aec_clean_energy, _aec_blocks
+    if not reverse.any():
+        return
+    # int16 squared overflows in 16-bit; widen before summing.
+    _aec_mic_energy += float(np.dot(mic.astype(np.int64), mic.astype(np.int64)))
+    _aec_clean_energy += float(np.dot(cleaned.astype(np.int64), cleaned.astype(np.int64)))
+    _aec_blocks += 1
+
+
+def aec_window_fields() -> dict:
+    """Rolling residual echo in dB for the blocks since the last read, then reset.
+
+    Negative means the echo got smaller. A canceller that only adapts still
+    reports the honest tail, not the best block.
+    """
+    global _aec_mic_energy, _aec_clean_energy, _aec_blocks
+    fields = {}
+    if _aec_blocks and _aec_mic_energy > 0:
+        ratio = math.sqrt(_aec_clean_energy / _aec_mic_energy)
+        fields["aec_echo_db"] = round(20 * math.log10(ratio), 1) if ratio > 0 else -120.0
+        fields["aec_blocks"] = _aec_blocks
+    _aec_mic_energy = _aec_clean_energy = 0.0
+    _aec_blocks = 0
+    return fields
+
+
 def playback_echo_canceller(file_key):
     """One canceller per clip. A new file starts from an empty filter."""
     global _echo_ap, _echo_key, _echo_unavailable
@@ -786,7 +820,9 @@ def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) ->
         float(rate),
         paused_playback_seconds(when),
     )
-    return process_echo_block(processor, mic, reverse)
+    cleaned = process_echo_block(processor, mic, reverse)
+    _aec_observe(mic, cleaned, reverse)
+    return cleaned
 
 
 def render_status_fields(connected: dict | None) -> dict:
@@ -1131,6 +1167,10 @@ def publish_capture_totals() -> None:
     for key, value in render.items():
         if data.get(key) != value:
             changed = True
+    aec = aec_window_fields()
+    for key, value in aec.items():
+        if data.get(key) != value:
+            changed = True
     if not changed:
         return
     note = None
@@ -1147,6 +1187,7 @@ def publish_capture_totals() -> None:
     data["mic_dropped"] = dropped
     data["mic_invalid"] = invalid
     data.update(render)
+    data.update(aec)
     tmp = STATUS_FILE.with_suffix(".capture.tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(STATUS_FILE)
