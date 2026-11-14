@@ -52,6 +52,8 @@ A synthetic 24 kHz stereo clip (left full speech, right half amplitude) downmixe
 
 The delay hint is 0. Speech delays of 20 ms, 40 ms, and 120 ms still cleared about 40 dB with that hint. A new clip builds a new canceller. Eight 160-sample frames are processed reverse-then-capture and joined in order.
 
+Four simultaneous arrivals (15/30/60/90 ms at gains 0.45/0.18/0.07/0.03) fed through the production `cancel_playback_echo` block path were cancelled by 37.7 dB, and the canceller was still at 38.7 dB after 20 seconds of continuous echo. Near-end speech on top of that echo kept 0.54 of its energy. That is `VA-AEC-004`. The tap gains are invented; the real room's arrivals are not yet measured.
+
 The extension default `afplay -r` is 1.18. Half a second of wall clock then ends at file sample 9440 on the 16 kHz grid, and the 1280-sample reference is samples 8160 through 9439. A 0.25 s pause inside that half second ends at sample 4720, so the reference is samples 3440 through 4719. `cancel_playback_echo` sends that slice. A rate of 1.0 is not assumed.
 
 ## Not claimed

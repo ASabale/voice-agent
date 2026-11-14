@@ -392,3 +392,80 @@ def test_captured_frame_filters_before_vad(monkeypatch: pytest.MonkeyPatch) -> N
     assert seen["at"] == 125
     assert seen["vad"] == 7
     assert seen["idle"] == 7
+
+
+# Four arrivals: 15, 30, 60 and 90 ms. The short fit removes one delay. AEC3
+# must keep all of them in its filter. This is a synthetic room, not the room.
+_ROOM_TAPS = ((240, 0.45), (480, 0.18), (960, 0.07), (1440, 0.03))
+
+
+def _room_response(reference: np.ndarray) -> np.ndarray:
+    length = len(reference) + max(delay for delay, _ in _ROOM_TAPS)
+    mic = np.zeros(length, dtype=np.int32)
+    for delay, gain in _ROOM_TAPS:
+        mic[delay : delay + len(reference)] += np.rint(gain * reference).astype(np.int32)
+    return np.clip(mic, -32768, 32767).astype(np.int16)
+
+
+def _mono_slot(tmp_path: Path, pcm: np.ndarray) -> dict:
+    wav = tmp_path / "room-clip.wav"
+    with wave.open(str(wav), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(pcm.tobytes())
+    return {
+        "reference": {"wav": str(wav), "sample_rate": 16000, "channels": 1, "frames": len(pcm)},
+        "started_at": 100.0,
+        "playing": True,
+        "afplay_pid": 4242,
+    }
+
+
+def _feed_blocks(mic: np.ndarray) -> np.ndarray:
+    cleaned: list[np.ndarray] = []
+    for i in range(len(mic) // 1280):
+        cleaned.append(
+            controller.cancel_playback_echo(mic[i * 1280 : (i + 1) * 1280], 100.0 + (i + 1) * 0.08)
+        )
+    return np.concatenate(cleaned)
+
+
+def test_a_multi_path_room_response_is_cancelled_by_aec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    speech = _tile(_wav("sentence-stop-say.wav"), 8.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [_mono_slot(tmp_path, speech)])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    controller.refresh_render_reference(100.0)
+    mic = _room_response(speech)
+    cleaned = _feed_blocks(mic)
+    print(f"multi-path ERLE: {_erle(mic, cleaned):.1f} dB")
+    assert _erle(mic, cleaned) >= 10.0
+
+
+def test_near_end_survives_the_multi_path_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    speech = _tile(_wav("sentence-stop-say.wav"), 8.0)
+    near = _tile(_wav("good-morning-say.wav"), 8.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [_mono_slot(tmp_path, speech)])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    controller.refresh_render_reference(100.0)
+    mic = np.clip(_room_response(speech) + np.pad((0.7 * near).astype(np.int32), (0, max(d for d, _ in _ROOM_TAPS))), -32768, 32767).astype(np.int16)
+    cleaned = _feed_blocks(mic)
+    print(f"near-end kept: {_rms(cleaned[-_RATE:]) / _rms(near[-_RATE:]):.2f}")
+    assert _rms(cleaned[-_RATE:]) > 0.4 * _rms(near[-_RATE:])
+
+
+def test_the_canceller_still_works_after_twenty_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    speech = _tile(_wav("sentence-stop-say.wav"), 20.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [_mono_slot(tmp_path, speech)])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    controller.refresh_render_reference(100.0)
+    mic = _room_response(speech)
+    cleaned = _feed_blocks(mic)
+    print(f"20 s tail ERLE: {_erle(mic, cleaned):.1f} dB")
+    assert _erle(mic, cleaned) >= 10.0

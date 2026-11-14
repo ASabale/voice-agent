@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-14 03:52 UTC — four arrivals at once are cancelled in the synthetic room
+
+**Status:** PASS for VA-AEC-004 at LEVEL 1. A mic signal built from the played clip at 15/30/60/90 ms with gains 0.45/0.18/0.07/0.03, fed through `cancel_playback_echo` in production 1280-sample blocks, loses 37.7 dB of echo tail. Near-end speech layered on top keeps 0.54 of its energy. After a 20 s run the tail is still 38.7 dB down. Full controller suite: 213 passed. Pid 64238 was not restarted and still owns the microphone, so the live path keeps the old filter and this is not a room measurement. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-004-multi-path-room.md`.
+
 ## 2026-11-14 00:04 UTC — the status cursor now matches the canceller's grid
 
 **Status:** PASS for VA-AEC-003 at LEVEL 1. `render_cursor` counted file samples while both cancellation paths indexed the resampled 16 kHz reference; a 24 kHz clip published 1.5x the true position. The cursor now counts grid samples, clamps to `render_processed_frames`, and still freezes across SIGSTOP. Full controller suite: 210 passed. Pid 64238 was not restarted and still runs the old path, so `status.json` from the live process keeps the old units until it reloads. Not a speaker test and not VA-INT-001.
