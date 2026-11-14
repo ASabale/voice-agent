@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-13 20:45 UTC — the canceller survives a broken render reference and reconnects
+
+**Status:** PASS for VA-AEC-008. `scripts/run_render_recovery_probe.py` feeds echo through the production frame loop while the playback clip fails mid-playback: a truncated file logs "render reference unavailable", `render_connected` goes false, echo passes through uncancelled with the mic IDLE and no exception, and a replacement clip reconnects at −29.6 dB so the wake/dictation/flush turn still completes. Two facts worth keeping: deleting a loaded clip does not disconnect the canceller (PCM stays cached until the slot key changes), and raw echo with the reference gone can trip the barge-hold gate (rms 683, hot=3) without acting — the physical test must check what a real uncanceled echo does to barge logic. Pid 64238 untouched. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-008-reference-failure-recovery.md`.
+
 ## 2026-11-13 20:34 UTC — repeated conversations hold in one instance at LEVEL 4
 
 **Status:** PASS for VA-AEC-007. `scripts/run_repeat_turn_probe.py` runs two full echo -> wake -> dictate -> flush turns through one `MicState` in ~73 s: zero wakes from 70 echo blocks, both sentences transcribed verbatim, and the mic returned to IDLE through the real 15 s DICTATING idle timeout, so the second conversation needs no restart. Two facts the probe surfaced: after a "held" dispatch the controller stays DICTATING ("Continuing DICTATING for next chunk"), so echo playing before the idle timeout would be appended to the next chunk — the physical test must check this; and a wake fed within the 0.6 s reverb-tail guard is swallowed by the closing slot. Wake-to-flush latency (7.2 s, 8.4 s incl. the 5 s pause) is the first latency baseline. Pid 64238 untouched. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-007-repeat-conversations.md`.
