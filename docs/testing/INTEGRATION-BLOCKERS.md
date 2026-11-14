@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-13 20:34 UTC — repeated conversations hold in one instance at LEVEL 4
+
+**Status:** PASS for VA-AEC-007. `scripts/run_repeat_turn_probe.py` runs two full echo -> wake -> dictate -> flush turns through one `MicState` in ~73 s: zero wakes from 70 echo blocks, both sentences transcribed verbatim, and the mic returned to IDLE through the real 15 s DICTATING idle timeout, so the second conversation needs no restart. Two facts the probe surfaced: after a "held" dispatch the controller stays DICTATING ("Continuing DICTATING for next chunk"), so echo playing before the idle timeout would be appended to the next chunk — the physical test must check this; and a wake fed within the 0.6 s reverb-tail guard is swallowed by the closing slot. Wake-to-flush latency (7.2 s, 8.4 s incl. the 5 s pause) is the first latency baseline. Pid 64238 untouched. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-007-repeat-conversations.md`.
+
 ## 2026-11-13 20:20 UTC — barge-in works against cancelled echo at LEVEL 4
 
 **Status:** PASS for VA-AEC-006. `scripts/run_double_talk_probe.py` mixes a synthesized "Stop. Stop. Stop." with the four-tap echo of a 6.7 s assistant clip: the echo-only window measured -27.4 dB with no wake or barge, the mixed frames held at rms 6257 over a floor of 8, Whisper heard "stop.", `stop_playback` killed the stand-in clip pid, and the render reference went unavailable. Two probe-specific traps surfaced: a single `say "Stop."` clip produces only 2 hot frames (the gate needs 3), and an unreaped zombie stand-in still passes `pid_alive`, so the probe reaps it every block. Pid 64238 untouched; the real speaker-to-mic path remains untested. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-006-double-talk-stop.md`.
