@@ -14,10 +14,77 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { commitBegin, commitEnd, wavReference } from "./playback-state.ts";
+import { commitBegin, commitEnd, wavReference, type WavReference } from "./playback-state.ts";
 
-const API = "http://127.0.0.1:17493";
+// Overridable so tests can point generate() at a mock VoiceBox without
+// touching the real one on 17493.
+// Resolved per call so each test scenario can point at its own mock port; a
+// single fixed origin would let Node's keep-alive pool leak a dead socket from
+// one mock into the next test's fresh server.
+function apiBase(): string {
+  return process.env.OMP_VOICEBOX_API ?? "http://127.0.0.1:17493";
+}
 export const VOICEBOX_REFUSAL_SECONDS = 5;
+// The memory guardian writes ~/.local/state/strata/pressure.json every poll.
+// Speaking is the cheapest thing to shed on a 64 GiB machine, so the voice path
+// backs off before the engine is ever killed.
+const DEFAULT_PRESSURE_FILE = path.join(os.homedir(), ".local", "state", "strata", "pressure.json");
+export const MEMORY_DEFER_HEADROOM_GIB = Number(process.env.OMP_VOICE_DEFER_HEADROOM_GIB ?? "3");
+export const MEMORY_WAIT_MS = 8000;
+// The guardian rewrites the file every poll (<= 2 s while it runs). A file
+// older than this means the guardian is gone: its kill logic is gone with it,
+// so its last "shed voice" instruction must not defer speech forever.
+export const PRESSURE_STALE_MS = 30000;
+
+export interface MemoryPressure {
+  shedVoice: boolean;
+  headroomGiB: number;
+}
+
+export function readMemoryPressure(): MemoryPressure | undefined {
+  const file = process.env.OMP_VOICE_PRESSURE_FILE || DEFAULT_PRESSURE_FILE;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    const at = Date.parse(String(raw.at ?? ""));
+    if (Number.isFinite(at) && Date.now() - at > PRESSURE_STALE_MS) {
+      return undefined;
+    }
+    const headroom = Number(raw.headroomGiB);
+    return {
+      shedVoice: Boolean(raw.shedVoice),
+      headroomGiB: Number.isFinite(headroom) ? headroom : Number.MAX_SAFE_INTEGER,
+    };
+  } catch {
+    // No guardian state: the voice path runs normally.
+    return undefined;
+  }
+}
+
+export function isMemoryTight(pressure: MemoryPressure | undefined): boolean {
+  if (!pressure) return false;
+  return pressure.shedVoice || pressure.headroomGiB < MEMORY_DEFER_HEADROOM_GIB;
+}
+
+/** Wait up to MEMORY_WAIT_MS for headroom to come back, then say whether to speak. */
+export async function waitForHeadroom(
+  waitMs = MEMORY_WAIT_MS,
+  read: () => MemoryPressure | undefined = readMemoryPressure,
+  nap = (ms: number) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, ms);
+    return promise;
+  },
+): Promise<{ ok: boolean; headroomGiB: number; waitedMs: number }> {
+  let waited = 0;
+  let pressure = read();
+  while (isMemoryTight(pressure) && waited < waitMs) {
+    await nap(1000);
+    waited += 1000;
+    pressure = read();
+  }
+  return { ok: !isMemoryTight(pressure), headroomGiB: pressure?.headroomGiB ?? 0, waitedMs: waited };
+}
+
 let voiceboxRetryAt = 0;
 const BRIDGE_HOST = "127.0.0.1";
 const HTTP_BODY_CAP = 65536;
@@ -46,9 +113,44 @@ function profileName(): string {
   }
 }
 
+// A sentence held because the guardian said "shed voice" or because VoiceBox
+// itself is unreachable or unhealthy. It is retried every DEFER_RETRY_MS while
+// the reply is still current, and dropped when a new reply takes over or after
+// DEFER_EXPIRY_MS of continuous unavailability.
+export interface DeferredSpeech {
+  text: string;
+  epoch: number;
+  at: number;
+}
+
+export type SpeechClip = {
+  wav: string;
+  sentence: string;
+  clip: number;
+  reference: WavReference | null;
+};
+export type GenResult = { clip: SpeechClip } | { deferred: true } | undefined;
+export type ClipGenerator = (text: string, epoch: number) => Promise<GenResult>;
+export type ClipPlayer = (clip: SpeechClip, epoch: number) => Promise<void>;
+
+export const DEFER_RETRY_MS = 5000;
+export const DEFER_EXPIRY_MS = 120000;
+
+// Watchdog for a hung VoiceBox: headers arrive but the audio body never ends.
+// Configurable so tests can exercise the path without waiting 90 s.
+export function ttsTimeoutMs(): number {
+  const raw = Number(process.env.OMP_VOICE_TTS_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 90000;
+}
+
 export class VoiceSession {
   playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
   queued = "";
+  readonly deferred: DeferredSpeech[] = [];
+  // Sentences held during an outage that expired unspoken this session. They
+  // are on screen but never spoken; the status surface reports them so silence
+  // during an outage is explainable instead of mysterious.
+  expiredSpeech = 0;
   readonly spoken = new Set<string>();
   // Sentences whose audio finished. Aborted clips stay out of this list so a later
   // reply can speak them. `inflight` is the queue that stopPlayback rolls back.
@@ -74,6 +176,8 @@ export class VoiceSession {
   reset(): void {
     this.playbackRate = Number(process.env.OMP_VOICE_RATE ?? "1.18") || 1.18;
     this.queued = "";
+    this.deferred.length = 0;
+    this.expiredSpeech = 0;
     this.spoken.clear();
     this.committed.length = 0;
     this.inflight.length = 0;
@@ -97,6 +201,7 @@ export class VoiceSession {
 const session = new VoiceSession();
 
 export function resetSpeechSession(): void {
+  voiceboxRetryAt = 0;
   session.reset();
 }
 
@@ -577,7 +682,7 @@ async function profileId(): Promise<string | undefined> {
   const name = profileName();
   if (!name) return undefined;
   if (cachedProfileId && cachedProfileName === name) return cachedProfileId;
-  const res = await fetch(`${API}/profiles`);
+  const res = await fetch(`${apiBase()}/profiles`);
   const rows: unknown = await res.json().catch(() => null);
   if (!Array.isArray(rows)) return undefined;
   for (const row of rows) {
@@ -615,11 +720,28 @@ export function refusalHold(now: number, retryAt: number): boolean {
   return now < retryAt;
 }
 
+// Transport-level failures all mean "VoiceBox is not reachable right now":
+// ECONNREFUSED when nothing is listening, ECONNRESET when a keep-alive
+// connection dies mid-request, ETIMEDOUT/ENOTFOUND for the rest. All of them
+// must hold the sentence instead of losing it. Node 26's fetch wraps a peer
+// that accepts the connection and then closes the socket before responding
+// (the VoiceBox GUI dying mid-generation) as TypeError("fetch failed") with
+// cause SocketError("other side closed", code UND_ERR_SOCKET) — none of the
+// classic errno strings appear, so that shape is matched explicitly.
 export function isConnectionRefusal(err: unknown): boolean {
   const parts = [String(err)];
   if (err && typeof err === "object" && "cause" in err) parts.push(String((err as { cause?: unknown }).cause));
   const text = parts.join(" ");
-  return text.includes("ECONNREFUSED") || text.includes("Unable to connect");
+  return (
+    text.includes("ECONNREFUSED") ||
+    text.includes("ECONNRESET") ||
+    text.includes("ETIMEDOUT") ||
+    text.includes("ENOTFOUND") ||
+    text.includes("Unable to connect") ||
+    text.includes("other side closed") ||
+    text.includes("UND_ERR_SOCKET") ||
+    text.includes("socket hang up")
+  );
 }
 
 export function speechLogRecord(
@@ -648,7 +770,7 @@ function logSpeech(event: string, text: string, extra: Record<string, unknown> =
 async function generate(
   text: string,
   epoch: number,
-): Promise<{ wav: string; sentence: string; clip: number; reference: ReturnType<typeof wavReference> } | undefined> {
+): Promise<GenResult> {
   if (epoch !== session.speechEpoch) {
     logSpeech("dropped", text, { reason: "epoch" });
     return undefined;
@@ -656,11 +778,29 @@ async function generate(
   const now = Date.now() / 1000;
   if (refusalHold(now, voiceboxRetryAt)) {
     logOnce("voicebox-refused", "VoiceBox refused; speech request held");
+    logSpeech("deferred", text, { reason: "voicebox-refused" });
+    return { deferred: true };
+  }
+  const headroom = await waitForHeadroom();
+  if (!headroom.ok) {
+    // The reply text is still on screen; only the utterance is skipped so the
+    // TTS weights do not push the machine over the guardian's kill line. The
+    // retry timer speaks it when the guardian reports headroom again.
+    logSpeech("deferred", text, { headroomGiB: headroom.headroomGiB, waitedMs: headroom.waitedMs });
+    return { deferred: true };
+  }
+  if (epoch !== session.speechEpoch) {
+    logSpeech("dropped", text, { reason: "epoch" });
     return undefined;
   }
   const controller = new AbortController();
   session.activeAbort = controller;
-  const timer = setTimeout(() => controller.abort(), 90000);
+  let watchdogFired = false;
+  const timeoutMs = ttsTimeoutMs();
+  const timer = setTimeout(() => {
+    watchdogFired = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     const id = await profileId();
     if (!id || epoch !== session.speechEpoch) {
@@ -669,7 +809,7 @@ async function generate(
     }
     logSpeech("requested", text);
     // Use /generate/stream directly to eliminate 200ms polling latency + SQLite history churn
-    const res = await fetch(`${API}/generate/stream`, {
+    const res = await fetch(`${apiBase()}/generate/stream`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -684,18 +824,38 @@ async function generate(
       signal: controller.signal,
     });
     if (!res.ok) {
-      logSpeech("failed", text, { reason: "http", status: res.status });
-      return undefined;
+      // A live but unhealthy VoiceBox (e.g. 500 with the TTS model unloaded)
+      // is the same speech-loss problem as a dead one: hold the sentence and
+      // let the retry timer try again, bounded by DEFER_EXPIRY_MS.
+      logSpeech("deferred", text, { reason: "http", status: res.status });
+      return { deferred: true };
     }
     const arrayBuf = await res.arrayBuffer();
-    if (epoch !== session.speechEpoch || arrayBuf.byteLength < 100) {
-      logSpeech("failed", text, { reason: epoch !== session.speechEpoch ? "epoch" : "short-audio", bytes: arrayBuf.byteLength });
+    if (epoch !== session.speechEpoch) {
+      logSpeech("dropped", text, { reason: "epoch" });
       return undefined;
+    }
+    if (arrayBuf.byteLength < 100) {
+      // A live but unhealthy VoiceBox can answer 200 with a truncated payload
+      // (model unloaded mid-stream). That is the same speech-loss problem as a
+      // 500: hold the sentence, retry on the timer (which already paces every
+      // 5 s), and expire after DEFER_EXPIRY_MS. The connection-refusal hold
+      // window is not armed here because the service is reachable.
+      logSpeech("deferred", text, { reason: "short-audio", bytes: arrayBuf.byteLength });
+      return { deferred: true };
     }
     const clipNo = ++session.clipSeq;
     const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${clipNo}.wav`);
     const wavBytes = Buffer.from(arrayBuf);
     const reference = wavReference(wavBytes, wavPath);
+    if (!reference || reference.frames < Math.floor(reference.sample_rate * 0.1)) {
+      // A 200 whose body is not playable PCM (error JSON, truncated header,
+      // or a valid header with effectively no audio) is the same speech-loss
+      // class as a 500: afplay would fail or play silence and the sentence
+      // would be counted as delivered. Hold it for the retry chain instead.
+      logSpeech("deferred", text, { reason: "invalid-audio", bytes: wavBytes.byteLength });
+      return { deferred: true };
+    }
     fs.writeFileSync(wavPath, wavBytes);
     logSpeech("generated", text, {
       bytes: wavBytes.byteLength,
@@ -704,9 +864,25 @@ async function generate(
     });
     voiceboxRetryAt = 0;
     session.loggedOnce.delete("voicebox-refused");
-    return { wav: wavPath, sentence: text, clip: clipNo, reference };
+    return { clip: { wav: wavPath, sentence: text, clip: clipNo, reference } };
   } catch (err) {
-    if (isConnectionRefusal(err)) voiceboxRetryAt = now + VOICEBOX_REFUSAL_SECONDS;
+    if (isConnectionRefusal(err)) {
+      voiceboxRetryAt = now + VOICEBOX_REFUSAL_SECONDS;
+      logSpeech("deferred", text, { reason: "connection-refused" });
+      return { deferred: true };
+    }
+    if (err instanceof Error && err.name === "AbortError") {
+      // Two sources of abort: the watchdog (VoiceBox hung mid-stream) and a
+      // real stop/barge-in. A watchdog abort on the current reply is a
+      // transient failure like a 500: hold the sentence for the retry chain.
+      // An abort because the reply was replaced is an intentional drop.
+      if (watchdogFired && epoch === session.speechEpoch) {
+        logSpeech("deferred", text, { reason: "generation-timeout", timeoutMs });
+        return { deferred: true };
+      }
+      logSpeech("dropped", text, { reason: watchdogFired ? "epoch" : "abort" });
+      return undefined;
+    }
     logSpeech("failed", text, { reason: String(err) });
     return undefined;
   } finally {
@@ -825,21 +1001,156 @@ async function play(
   }
 }
 
-function enqueue(sentence: string): void {
-  const chunks = [...session.committed, ...session.inflight];
-  const speak = speechAfterSpoken(chunks, sentence);
-  if (!speak || isSpokenChunk(chunks, speak) || isSpokenChunk(chunks, sentence)) return;
+function speakChunk(
+  speak: string,
+  epoch: number,
+  gen: ClipGenerator,
+  player: ClipPlayer,
+  at: number = Date.now(),
+): Promise<boolean> {
   session.spoken.add(speak);
   session.inflight.push(speak);
   session.spokenText = [...session.committed, ...session.inflight].join(" ");
-  const epoch = session.speechEpoch;
-  const ready = session.genTail.then(() => generate(speak, epoch));
+  const ready = session.genTail.then(() => gen(speak, epoch));
   session.genTail = ready.then(() => undefined);
-  session.playTail = session.playTail.then(async () => {
-    const clip = await ready;
-    if (clip) await play(clip, epoch);
-    else if (epoch === session.speechEpoch) releaseUnspoken(speak);
+  const done = session.playTail.then(async () => {
+    const result = await ready;
+    if (result?.clip) {
+      await player(result.clip, epoch);
+      return false;
+    }
+    if (epoch === session.speechEpoch) {
+      // Never counted as spoken: the barge-in rollback and dedupe logic must be
+      // able to say this sentence later.
+      releaseUnspoken(speak);
+      if (result?.deferred) {
+        // `at` is the first time this sentence was held, not the time of the
+        // latest failed attempt: re-deferring must not reset the expiry clock,
+        // or a permanently unreachable VoiceBox retries a sentence forever.
+        session.deferred.push({ text: speak, epoch, at });
+        startDeferredRetry();
+        return true;
+      }
+    }
+    return false;
   });
+  session.playTail = done.then(() => undefined);
+  return done;
+}
+
+export function enqueue(sentence: string, gen: ClipGenerator = generate, player: ClipPlayer = play): void {
+  const chunks = [...session.committed, ...session.inflight];
+  const speak = speechAfterSpoken(chunks, sentence);
+  if (!speak || isSpokenChunk(chunks, speak) || isSpokenChunk(chunks, sentence)) return;
+  if (session.deferred.length > 0) {
+    // An earlier sentence of this reply is still held. Holding this one behind
+    // it keeps the reply in its original order when the service recovers.
+    if (!session.deferred.some((item) => item.text === speak && item.epoch === session.speechEpoch)) {
+      session.deferred.push({ text: speak, epoch: session.speechEpoch, at: Date.now() });
+      startDeferredRetry();
+    }
+    return;
+  }
+  speakChunk(speak, session.speechEpoch, gen, player);
+}
+
+/**
+ * Re-speak sentences the guardian deferred, oldest first. Sentences are dropped
+ * when the reply they belong to is gone (epoch changed) or pressure has lasted
+ * longer than DEFER_EXPIRY_MS. The pass stops at the first sentence that is
+ * still held: nothing behind it may play out of order. Returns how many
+ * sentences were handed back to the TTS pipeline.
+ */
+export async function retryDeferredSpeech(
+  gen: ClipGenerator = generate,
+  player: ClipPlayer = play,
+  now: number = Date.now(),
+): Promise<number> {
+  if (session.deferred.length === 0) return 0;
+  const pending = session.deferred.slice();
+  session.deferred.length = 0;
+  let retried = 0;
+  for (let i = 0; i < pending.length; i++) {
+    const item = pending[i];
+    if (item.epoch !== session.speechEpoch) {
+      logSpeech("dropped", item.text, { reason: "defer-stale" });
+      continue;
+    }
+    if (now - item.at > DEFER_EXPIRY_MS) {
+      session.expiredSpeech++;
+      logSpeech("dropped", item.text, { reason: "defer-expired" });
+      continue;
+    }
+    const chunks = [...session.committed, ...session.inflight];
+    const speak = speechAfterSpoken(chunks, item.text);
+    if (!speak || isSpokenChunk(chunks, speak)) continue;
+    const deferredAgain = await speakChunk(speak, item.epoch, gen, player, item.at);
+    retried++;
+    if (deferredAgain) {
+      // Keep the remainder queued behind the held sentence so the reply
+      // replays on the next retry tick in its original order.
+      session.deferred.push(...pending.slice(i + 1));
+      break;
+    }
+  }
+  return retried;
+}
+
+/**
+ * Speech state for the status surfaces. Silence during an outage or a guardian
+ * voice-shed must be explainable: `deferred` counts sentences currently held,
+ * `deferredOldestAgeMs` how long the oldest has waited, and `expiredSpeech`
+ * counts sentences that expired unspoken in this session — text on screen that
+ * was never spoken.
+ */
+export function currentSpeechStatus(): {
+  speaking: boolean;
+  deferred: number;
+  deferredOldestAgeMs: number;
+  expiredSpeech: number;
+} {
+  const oldest = session.deferred.reduce(
+    (min, item) => Math.min(min, item.at),
+    Number.POSITIVE_INFINITY,
+  );
+  return {
+    speaking: session.isSpeaking || session.activeAfplay !== null,
+    deferred: session.deferred.length,
+    deferredOldestAgeMs: Number.isFinite(oldest) ? Date.now() - oldest : 0,
+    expiredSpeech: session.expiredSpeech,
+  };
+}
+
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+// One-shot reschedule: each deferral arms the next attempt. If a retry defers
+// again, speakChunk arms it once more; if it succeeds the chain ends by itself,
+// so no timer outlives the deferrals.
+function startDeferredRetry(): void {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void retryDeferredSpeech();
+  }, DEFER_RETRY_MS);
+}
+
+export function stopDeferredRetry(): void {
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+}
+
+export function currentDeferred(): DeferredSpeech[] {
+  return [...session.deferred];
+}
+
+export function speechSettled(): Promise<void> {
+  return session.playTail;
+}
+
+export function currentSpokenText(): string {
+  return session.spokenText;
 }
 
 const VOICE_SYSTEM_INSTRUCTION = `
@@ -987,7 +1298,7 @@ export default function voiceboxSpeech(pi: {
     }
   };
 
-  void fetch(`${API}/settings/generation`, {
+  void fetch(`${apiBase()}/settings/generation`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ autoplay_on_generate: false }),
@@ -1038,7 +1349,7 @@ export default function voiceboxSpeech(pi: {
             ok: true,
             version: 2,
             pid: process.pid,
-            speaking: session.isSpeaking || session.activeAfplay !== null,
+            ...currentSpeechStatus(),
             agentBusy: !idle,
             draft,
             draftLength: draft.length,
@@ -1290,8 +1601,13 @@ export default function voiceboxSpeech(pi: {
           return;
         }
         const draft = ctx.ui?.getEditorText?.() ?? "";
+        const st = currentSpeechStatus();
+        const heldNote = st.deferred > 0
+          ? `, held=${st.deferred} (${Math.round(st.deferredOldestAgeMs / 1000)}s oldest)`
+          : "";
+        const expiredNote = st.expiredSpeech > 0 ? `, expired=${st.expiredSpeech}` : "";
         ctx.ui?.notify?.(
-          `OMP Voice Bridge listening on http://${BRIDGE_HOST}:${boundBridgePort} (speaking=${session.isSpeaking}, rate=${session.playbackRate}x, humanize=${humanizeMode}, draft=${draft.length} chars)`,
+          `OMP Voice Bridge listening on http://${BRIDGE_HOST}:${boundBridgePort} (speaking=${st.speaking}${heldNote}${expiredNote}, rate=${session.playbackRate}x, humanize=${humanizeMode}, draft=${draft.length} chars)`,
           "info",
         );
       },

@@ -29,7 +29,10 @@ replaced:
   unlink = failure and was wrong; the crash modeled here is the real one — a
   new reference that fails to parse.
 - A failed parse leaves the reference disconnected until a new clip key
-  arrives. That matches VoiceBox behavior: every utterance writes a new file.
+  arrives. That matches VoiceBox behavior: every utterance writes a new
+  file. Superseded for the transient-read case by VA-AEC-011: the key is
+  no longer pinned on a failed read, so the same clip key reconnects once
+  the file is readable again.
 - Raw echo through a disconnected reference can trip the barge-hold gate
   (hot frames, rms above floor × 2.4). Only Whisper-confirmed commands act,
   so it held harmlessly here. On real hardware this is the case the physical

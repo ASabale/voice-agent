@@ -50,6 +50,7 @@ import math
 import re
 import select
 import signal
+import stat
 import sqlite3
 import struct
 import subprocess
@@ -61,6 +62,24 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
+
+# Playback slot decision rules live in bin/playback_state.py so the vectors
+# in tests/playback_vectors.json test the complete contract without the
+# audio, process, and file machinery around them.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from playback_state import (  # noqa: E402
+    PLAYBACK_LEASE_SECONDS,
+    _slot_rank,
+    _valid_pid,
+    choose_render_slot,
+    playback_is_speaking,
+    playback_rate_of,
+    playback_sources_speaking,
+    project_aggregate,
+    render_cursor,
+    slot_is_speaking,
+    slot_reference,
+)
 
 HANDY_BIN = "/Applications/Handy.app/Contents/MacOS/handy"
 HANDY_DIR = Path.home() / "Library" / "Application Support" / "com.pais.handy"
@@ -321,31 +340,6 @@ def record_mic_offer(dropped: int, invalid: int) -> None:
         _mic_invalid += invalid
 
 
-def slot_reference(slot: dict) -> dict | None:
-    """The WAV afplay is playing, as published on the playback slot.
-
-    This is the render description. It is not echo cancellation.
-    """
-    if not isinstance(slot, dict):
-        return None
-    ref = slot.get("reference")
-    if not isinstance(ref, dict):
-        return None
-    rate = ref.get("sample_rate")
-    channels = ref.get("channels")
-    frames = ref.get("frames")
-    wav = ref.get("wav")
-    if isinstance(rate, bool) or not isinstance(rate, int) or rate < 8000:
-        return None
-    if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
-        return None
-    if isinstance(frames, bool) or not isinstance(frames, int) or frames <= 0:
-        return None
-    if not isinstance(wav, str) or not wav.endswith(".wav"):
-        return None
-    return {"sample_rate": rate, "channels": channels, "frames": frames, "wav": wav}
-
-
 MIC_RENDER_RATE = 16000
 
 
@@ -384,29 +378,6 @@ def downmix_to_mono(pcm: np.ndarray, channels: int) -> np.ndarray:
         return np.zeros(0, dtype=np.int16)
     mixed = pcm[: frames * channels].reshape(frames, channels).mean(axis=1)
     return np.clip(np.rint(mixed), -32768, 32767).astype(np.int16)
-
-
-def playback_rate_of(slot: dict) -> float:
-    """afplay -r for this clip. Missing or out of range means 1x.
-
-    The voice command accepts 0.7 to 2.0. The default in the extension is 1.18.
-    """
-    if not isinstance(slot, dict):
-        return 1.0
-    raw = slot.get("playback_rate")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return 1.0
-    rate = float(raw)
-    if rate < 0.7 or rate > 2.0:
-        return 1.0
-    return rate
-
-
-def render_cursor(started_at: float, now: float, sample_rate: int, playback_rate: float = 1.0) -> int:
-    """How many file samples afplay has consumed since the clip started."""
-    if sample_rate <= 0 or playback_rate <= 0 or now <= started_at:
-        return 0
-    return int((now - started_at) * sample_rate * playback_rate)
 
 
 def parse_wav_pcm(data: bytes) -> dict | None:
@@ -792,6 +763,70 @@ def playback_echo_canceller(file_key):
     return processor
 
 
+# The guard slides the render block by up to 300 ms, the longest measured
+# flight lag between the render cursor and the microphone echo (VA-AEC-009).
+AEC_GUARD_LAG_SAMPLES = 4800
+
+
+def _guard_reference(
+    render: np.ndarray,
+    started_at: float,
+    captured_at: float,
+    n: int,
+    playback_rate: float,
+) -> np.ndarray:
+    """Render samples around the mic block, widened by the flight-lag window."""
+    rate = float(playback_rate) or 1.0
+    lead = AEC_GUARD_LAG_SAMPLES / (MIC_RENDER_RATE * rate)
+    return render_block_at(
+        render,
+        started_at,
+        captured_at + lead,
+        n + 2 * AEC_GUARD_LAG_SAMPLES,
+        rate,
+        paused_playback_seconds(captured_at),
+    )
+
+
+def echo_over_cancels(mic: np.ndarray, cleaned: np.ndarray, reference: np.ndarray) -> bool:
+    """True when the energy the filter removed cannot be echo.
+
+    A fit that keeps most of a block cannot hide an interruption. When the
+    filter crushes the block to less than a quarter of its energy, the removed
+    part is echo only if the microphone block actually resembles some lagged
+    window of the render reference. A filter that has latched onto the
+    reference's statistics alone removes the person instead of the echo, and
+    the raw frame is the honest one.
+    """
+    mic_f = mic.astype(np.float64)
+    mic_energy = float(mic_f @ mic_f)
+    clean_f = cleaned.astype(np.float64)
+    if mic_energy == 0.0 or float(clean_f @ clean_f) >= 0.25 * mic_energy:
+        return False
+    ref = reference.astype(np.float64)
+    if not ref.any():
+        return True
+    n = len(mic_f)
+    if n == 0 or len(ref) < n:
+        return True
+    # Linear cross-correlation at every sample lag: c[j] is the dot product of
+    # the mic block with ref[j : j + n]. Sample resolution matters because a
+    # noise-like echo only matches the reference at its exact offset.
+    size = 1 << (len(ref) + n - 1).bit_length()
+    corr = np.fft.irfft(np.fft.rfft(ref, size) * np.conj(np.fft.rfft(mic_f, size)), size)
+    prefix = np.cumsum(ref * ref)
+    spans = len(ref) - n + 1
+    energies = prefix[n - 1 : n - 1 + spans] - np.concatenate(([0.0], prefix[: spans - 1]))
+    live = energies > 0.0
+    if not live.any():
+        return True
+    # Measured separation on this machine: a real echo path matches a lagged
+    # render window at 0.62-1.0, unrelated speech at 0.46 or below. A fit that
+    # crushes a block with no such match is removing the person, not the echo.
+    best = float(np.max(np.abs(corr[:spans][live]) / np.sqrt(mic_energy * energies[live])))
+    return best < 0.55
+
+
 def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) -> np.ndarray:
     """Remove our playback before VAD. The short fit runs only if this module is missing.
 
@@ -821,6 +856,12 @@ def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) ->
         paused_playback_seconds(when),
     )
     cleaned = process_echo_block(processor, mic, reverse)
+    if echo_over_cancels(mic, cleaned, _guard_reference(samples, started, when, len(mic), float(rate))):
+        # A fit that crushed the block removed energy the render reference
+        # cannot explain: that is the person, not the echo. Keep the raw
+        # block so the barge gate can still hear the interruption.
+        _aec_observe(mic, mic, reverse)
+        return mic
     _aec_observe(mic, cleaned, reverse)
     return cleaned
 
@@ -846,35 +887,6 @@ _render_file_key: tuple | None = None
 _render_hold_until = 0.0
 _render_paused_at: float | None = None
 _render_paused_seconds = 0.0
-
-
-def _slot_rank(slot: dict) -> tuple[float, int, int]:
-    started = slot.get("started_at")
-    try:
-        started_f = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
-    except (TypeError, ValueError):
-        started_f = 0.0
-    turn = slot.get("turn")
-    clip = slot.get("clip")
-    turn_i = turn if isinstance(turn, int) and not isinstance(turn, bool) else -1
-    clip_i = clip if isinstance(clip, int) and not isinstance(clip, bool) else -1
-    return (started_f, turn_i, clip_i)
-
-
-def choose_render_slot(slots, now: float, pid_alive_fn) -> dict | None:
-    """Newest slot that is speaking and names a WAV. Directory order is not used."""
-    chosen = None
-    best: tuple[float, int, int] | None = None
-    for slot in slots:
-        if not isinstance(slot, dict) or slot_reference(slot) is None:
-            continue
-        if not slot_is_speaking(slot, now, pid_alive_fn, 0.0):
-            continue
-        rank = _slot_rank(slot)
-        if best is None or rank > best:
-            best = rank
-            chosen = slot
-    return chosen
 
 
 def refresh_render_reference(now: float | None = None) -> dict:
@@ -916,13 +928,16 @@ def refresh_render_reference(now: float | None = None) -> dict:
         except OSError:
             blob = b""
         connected = connect_render_reference(chosen, blob, moment)
-        _render_file_key = key
         if connected is None:
+            # Do not pin the key on a failed read: the file can become
+            # readable on the next frame, and a pinned failed key would
+            # leave AEC dead for the whole clip.
             _render_pcm = b""
             _render_samples = None
             _render_parsed = None
             _render_fields = render_status_fields(None)
             return _render_fields
+        _render_file_key = key
         _render_pcm = connected["pcm"]
         raw = np.frombuffer(connected["pcm"], dtype="<i2").copy()
         _render_parsed = {key: value for key, value in connected.items() if key != "pcm"}
@@ -964,94 +979,48 @@ def capture_totals() -> tuple[int, int]:
         return _mic_dropped, _mic_invalid
 
 
-PLAYBACK_LEASE_SECONDS = 60.0
-
-
-def _valid_pid(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
-
-
-def slot_is_speaking(slot: dict, now: float, pid_alive_fn, tail: float) -> bool:
-    """One session slot. A dead afplay is silence. A clean end keeps the reverb tail."""
-    if not isinstance(slot, dict):
-        return False
-    ended_raw = slot.get("ended_at")
-    try:
-        ended = float(ended_raw) if ended_raw not in (None, "") else 0.0
-    except (TypeError, ValueError):
-        ended = 0.0
-    if slot.get("playing") is not True:
-        return ended > 0 and (now - ended) < tail
-    afplay = _valid_pid(slot.get("afplay_pid"))
-    writer = _valid_pid(slot.get("writer_pid"))
-    if afplay is not None:
-        if not pid_alive_fn(afplay):
-            return False
-        if writer is not None and not pid_alive_fn(writer):
-            try:
-                started = float(slot.get("started_at") or 0)
-            except (TypeError, ValueError):
-                started = 0.0
-            return now < started + PLAYBACK_LEASE_SECONDS
-        return True
-    if writer is None or not pid_alive_fn(writer):
-        return False
-    try:
-        lease = float(slot.get("lease_until") or 0)
-    except (TypeError, ValueError):
-        lease = 0.0
-    return now < lease
-
-
-def playback_is_speaking(data: dict, now: float, pid_alive_fn, tail: float) -> bool:
-    """Legacy files have no sessions object and do not check pids."""
-    if not isinstance(data, dict):
-        return False
-    sessions = data.get("sessions")
-    if isinstance(sessions, dict):
-        return any(
-            isinstance(slot, dict) and slot_is_speaking(slot, now, pid_alive_fn, tail)
-            for slot in sessions.values()
-        )
-    if data.get("playing") is True and not data.get("ended_at"):
-        return True
-    try:
-        ended = float(data.get("ended_at", 0) or 0)
-    except (TypeError, ValueError):
-        return False
-    return ended > 0 and (now - ended) < tail
-
-
-def playback_sources_speaking(slots, legacy, now: float, pid_alive_fn, tail: float) -> bool:
-    """slots is None only when the tts-playing directory is absent."""
-    if slots is not None:
-        return any(
-            isinstance(slot, dict) and slot_is_speaking(slot, now, pid_alive_fn, tail) for slot in slots
-        )
-    if not isinstance(legacy, dict):
-        return False
-    return playback_is_speaking(legacy, now, pid_alive_fn, tail)
-
-
 def _read_playback_slots() -> list[dict] | None:
     slot_dir = playback_slot_dir()
     if not slot_dir.is_dir():
         return None
     owner = playback_owner_pid()
+    now = time.time()
     found: list[dict] = []
+    pruned = False
     for path in slot_dir.glob("*.json"):
         if not path.stem.isdigit():
             continue
         if owner and path.stem != owner:
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf8"))
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict):
-            found.append(data)
+        if not isinstance(data, dict):
+            continue
+        # A slot whose session process is gone can never become active
+        # again. Keep it while it still counts as audible (the reverb
+        # tail), then unlink it so dead sessions do not accumulate in
+        # the state directory forever.
+        if not pid_alive(int(path.stem)) and not slot_is_speaking(
+            data, now, pid_alive, REVERB_TAIL_GUARD_SECONDS
+        ):
+            try:
+                path.unlink()
+                pruned = True
+            except OSError:
+                pass
+            continue
+        found.append(data)
+    # The flat projection is only written by live sessions. When a session
+    # dies mid-clip, tts-playing.json would freeze at playing:true and the
+    # memory guardian would keep believing voice is playing forever. Any
+    # prune is a chance to re-derive the projection from the surviving slots.
+    if pruned:
+        try:
+            TTS_STATE_FILE.write_text(json.dumps(project_aggregate(found, pid_alive, now)), encoding="utf-8")
+        except OSError:
+            pass
     return found
 
 
@@ -1101,9 +1070,42 @@ def rotate_log(path: Path, limit_bytes: int) -> bool:
     return True
 
 
+def _rotate_stdout_log() -> bool:
+    """Rotate controller.log while it is this process's stdout.
+
+    Rotating only at start lets a long-running daemon grow past the limit
+    (29.6 MB was observed after one day of PID 64238). When fd 1 is the log
+    file itself, move it to .1 and re-point fd 1 at a fresh file. No-op when
+    stdout is a terminal, a pipe, or a different file.
+    """
+    try:
+        st = os.fstat(1)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= LOG_ROTATE_BYTES:
+        return False
+    try:
+        probe = os.open(str(LOG_FILE), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        if not os.path.sameopenfile(1, probe):
+            return False
+    finally:
+        os.close(probe)
+    sys.stdout.flush()
+    if not rotate_log(LOG_FILE, LOG_ROTATE_BYTES):
+        return False
+    new_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    os.dup2(new_fd, 1)
+    os.close(new_fd)
+    return True
+
+
 def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
+    _rotate_stdout_log()
     print(line, flush=True)
 
 
@@ -2780,11 +2782,27 @@ def barge_note(mic: "MicState", stage: str, **fields) -> None:
         return
 
 
-def stop_playback(reason: str) -> None:
-    # Kill the clip and the turn. Stopping only afplay leaves the agent
-    # streaming, and the next sentence starts the loop again.
+def stop_playback(reason: str) -> float | None:
+    """Kill the clip and the turn, then confirm the clip processes are gone.
+
+    Returns the monotonic time the last VoiceBox clip process was confirmed
+    dead, or None if no clip process was alive or one survived the kill.
+    Stopping only afplay leaves the agent streaming, and the next sentence
+    starts the loop again.
+    """
+    # Kill the speakers before the bridge round-trip. Otherwise Handy records the reply.
+    # Abort only the session that would receive the dictation. Other sessions lose
+    # their audio but keep a turn that the user is not talking to.
     log(reason)
+    clips = [int(pid) for pid in _omp_vb_pids()]
     silence_speech(True)
+    deadline = time.monotonic() + 2.0
+    while clips and time.monotonic() < deadline:
+        clips = [pid for pid in clips if pid_alive(pid)]
+        if not clips:
+            return time.monotonic()
+        time.sleep(0.02)
+    return time.monotonic() if not clips else None
 
 
 @dataclass
@@ -2793,6 +2811,19 @@ class MicState:
 
     state: str = "IDLE"
     last_history_id: int = 0
+    # Per-turn latencies, seconds on time.monotonic(). Published to
+    # status.json as "turn":
+    #   turn_seq          counts wake->DICTATING transitions; identifies the turn
+    #   wake_to_flush_s   entering DICTATING .. the pause that flushes the chunk
+    #   asr_s             the Handy --transcribe-file (or history-row wait) call
+    #   dispatch_s        dispatch_transcript (paste/submit) for that flush
+    #   stop_latency_s    TTS barge hold opened .. clip afplay confirmed dead
+    turn_seq: int = 0
+    wake_mono: float = 0.0
+    flush_mono: float = 0.0
+    asr_s: float | None = None
+    dispatch_s: float | None = None
+    stop_latency_s: float = 0.0
     speech_seen_in_chunk: bool = False
     chunk_started_at: float = 0.0
     last_handy_ui_check: float = 0.0
@@ -2836,11 +2867,32 @@ class MicState:
     tts_pre_roll: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=8))
     tts_barge_waiting: bool = False
     barge_trace: list = field(default_factory=list)
-    barge_onset_wall: float = 0.0
+    barge_onset_mono: float = 0.0
     idle_pre_roll: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=6))  # 480ms pre-roll
     idle_speech_frames: list[np.ndarray] = field(default_factory=list)
     dict_tail_frames: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=38))
     dict_speech_frames: list[np.ndarray] = field(default_factory=list)
+
+    def turn_metrics(self) -> dict:
+        """Latencies for the most recent turn, monotonic seconds. Metadata only, no transcript text.
+
+        wake_to_flush_s is None until a flush has completed for the turn that
+        started at the wake; asr_s/dispatch_s are None until that flush runs;
+        stop_latency_s is None until a barge stop confirms the clip process is
+        gone. Every published value is finite and nonnegative.
+        """
+        wake_to_flush = (
+            round(self.flush_mono - self.wake_mono, 2)
+            if self.wake_mono and self.flush_mono and self.flush_mono >= self.wake_mono
+            else None
+        )
+        return {
+            "turn_seq": self.turn_seq,
+            "wake_to_flush_s": wake_to_flush,
+            "asr_s": round(self.asr_s, 3) if self.asr_s is not None else None,
+            "dispatch_s": round(self.dispatch_s, 3) if self.dispatch_s is not None else None,
+            "stop_latency_s": round(self.stop_latency_s, 3) if self.stop_latency_s > 0 else None,
+        }
 
     def kick_whisper(self, jobs: queue.Queue, kind: str, audio_f32: np.ndarray, prompt: str) -> bool:
         """Queue one clip. Return False if a clip is already in flight (do not block the mic loop)."""
@@ -2998,7 +3050,12 @@ class MicState:
         self.last_speech_at = self.chunk_started_at
         self.score_wake_blocked_until = 0.0
         self.cooldown_until = self.chunk_started_at + ENTER_DICTATION_COOLDOWN_SECONDS
-        write_status(self.state, {"chunk_started_at": time.time(), "trigger": reason})
+        self.turn_seq += 1
+        self.wake_mono = time.monotonic()
+        self.flush_mono = 0.0
+        self.asr_s = None
+        self.dispatch_s = None
+        write_status(self.state, {"chunk_started_at": time.time(), "trigger": reason, "turn": self.turn_metrics()})
 
     def note_barge_release(self) -> None:
         """A hold that was not a stop. Do not treat the resume attack as a new voice."""
@@ -3049,7 +3106,7 @@ class MicState:
         self.partial_base = ""
         self.speech_seen_in_chunk = False
         self.cooldown_until = time.monotonic() + cooldown
-        write_status(self.state, {"last_action": action})
+        write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
 
     def _partial_bridge(self) -> str | None:
         try:
@@ -3120,9 +3177,16 @@ class MicState:
                 self.tts_barge_held = False
                 self.tts_barge_waiting = False
                 self.tts_barge_next = None
-                latency = round(time.time() - self.barge_onset_wall, 3) if self.barge_onset_wall else None
+                # Boundary: barge hold opened -> clip process confirmed dead.
+                died_at = stop_playback(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy")
+                latency = (
+                    round(died_at - self.barge_onset_mono, 3)
+                    if died_at is not None and self.barge_onset_mono
+                    else None
+                )
+                if latency is not None:
+                    self.stop_latency_s = latency
                 barge_note(self, "stop_playback", latency_s=latency, text=heard)
-                stop_playback(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy")
                 self.tts_loud_run = 0
                 self.tts_rms_floor.clear()
                 self.tts_active = False
@@ -3251,6 +3315,7 @@ class MicState:
             )
             oww.reset()
             floor = sorted(self.tts_rms_floor)[len(self.tts_rms_floor) // 2] if self.tts_rms_floor else 0.0
+            gate = max(320.0, floor * 2.4)
             if self.on_headphones:
                 hot = vad_score >= 0.25 and rms >= 180.0
                 user_voice = hot
@@ -3264,30 +3329,41 @@ class MicState:
                 # person, so they must not become the next floor.
                 hot = (
                     vad_score >= 0.55
-                    and rms >= max(320.0, floor * 2.4)
+                    and rms >= gate
                     and time.monotonic() >= self.tts_barge_cool_until
                 )
                 self.tts_loud_run = self.tts_loud_run + 1 if hot else 0
                 user_voice = self.tts_loud_run >= 3
                 clip_limit = 10
                 clip_floor = 80.0
+            # A spoken word starts with frames loud enough for the gate but
+            # with a VAD score still below the threshold, so the gate opens
+            # only at the third hot frame. Keep the whole current burst above
+            # the gate so the clip holds the onset, not just the tail. Bleed
+            # sits below the gate and never enters the burst.
+            if rms >= gate and time.monotonic() >= self.tts_barge_cool_until:
+                self.tts_pre_roll.append(frame.copy())
+            else:
+                self.tts_pre_roll.clear()
             just_held = False
             if self.tts_barge_waiting:
                 return True
-            if not self.tts_barge_held:
-                self.tts_pre_roll.append(frame.copy())
             if user_voice and not self.tts_stop_frames and not self.tts_barge_held:
                 # Do not SIGSTOP the clip here. The words are not known yet, and
                 # pausing speaker bleed stops the reply and starts it again.
                 # A confirmed stop calls stop_playback. Anything else leaves it playing.
+                # The clip is the burst above the gate: bleed never qualifies, and
+                # a quiet frame clears the burst, so the clip cannot be seeded with
+                # the playback instead of the interruption.
                 self.tts_barge_held = True
                 self.tts_barge_voice = False
                 self.tts_barge_quiet = 0
                 self.tts_barge_skip = 2
                 self.tts_barge_loud = 0
                 just_held = True
-                self.tts_stop_frames = [chunk.copy() for chunk in self.tts_pre_roll]
-                self.barge_onset_wall = time.time()
+                self.tts_stop_frames = list(self.tts_pre_roll) or [frame.copy()]
+                self.tts_pre_roll.clear()
+                self.barge_onset_mono = time.monotonic()
                 log(
                     f"TTS barge hold rms={rms:.0f} vad={vad_score:.2f} floor={floor:.0f} "
                     f"hot={self.tts_loud_run} frames={len(self.tts_stop_frames)}"
@@ -3383,7 +3459,7 @@ class MicState:
                         barge_note(self, "resume", reason="clip rejected")
             if self.tts_floor_holdoff > 0:
                 self.tts_floor_holdoff -= 1
-            elif not self.tts_barge_held and not hot:
+            elif not self.tts_barge_held and not hot and rms < gate:
                 self.tts_rms_floor.append(rms)
             return True
         if self.tts_barge_held:
@@ -3398,6 +3474,7 @@ class MicState:
         self.tts_rms_floor.clear()
         self.tts_stop_frames.clear()
         self.tts_stop_silence = 0
+        self.tts_pre_roll.clear()
 
         # Path 1: Fast neural keyword spotter (with 3x gain normalization if mic signal is quiet)
         boosted = np.clip(frame.astype(np.float32) * 3.0, -32768, 32767).astype(np.int16) if rms < 1200 else frame
@@ -3502,7 +3579,7 @@ class MicState:
                 self.chunk_started_at = time.monotonic()
                 self.last_speech_at = self.chunk_started_at
                 self.cooldown_until = self.chunk_started_at + 0.25
-                write_status(self.state, {"last_action": action})
+                write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
             return True
 
         # Headphones sit close to the mouth, so a quiet or slow phrase is
@@ -3546,7 +3623,9 @@ class MicState:
                 if should_flush:
                     self.show_closing_partial(jobs)
                     log(f"Pause of {silence_dur:.1f}s detected -> flushing chunk via Handy")
+                    self.flush_mono = time.monotonic()
                     prev_id = self.last_history_id
+                    asr_started = time.monotonic()
                     if handy_file_mode():
                         transcript = transcribe_handy_file(list(self.dict_speech_frames))
                         row = (prev_id, transcript) if transcript else None
@@ -3556,13 +3635,16 @@ class MicState:
                         row = None
                     else:
                         row = wait_for_new_history_row(prev_id, timeout_sec=2.2)
+                    self.asr_s = time.monotonic() - asr_started
                     if row is not None:
                         self.last_history_id, transcript = row
                         log(f"Handy transcribed chunk #{self.last_history_id}: {transcript!r}")
                         # Wait 260ms so Handy's native Cmd+V paste (229ms) finishes before OMP deduplicates & updates editor
                         time.sleep(0.26)
                         self.retract_partial()
+                        dispatch_started = time.monotonic()
                         outcome = dispatch_transcript(transcript)
+                        self.dispatch_s = time.monotonic() - dispatch_started
                         action = outcome.get("action", "appended")
                         log(f"Transcript outcome: {action}")
                         if outcome.get("draft"):
@@ -3574,10 +3656,18 @@ class MicState:
                         if fallback_txt:
                             log(f"Handy row missing (stopped externally); kept local transcript: {fallback_txt!r}")
                             self.retract_partial()
+                            dispatch_started = time.monotonic()
                             dispatch_transcript(fallback_txt)
+                            self.dispatch_s = time.monotonic() - dispatch_started
                         else:
                             log("Handy row missing (stopped externally); nothing to keep")
                         action = "handy_stopped"
+                    log(
+                        f"Turn {self.turn_seq} metrics: wake->flush {self.flush_mono - self.wake_mono:.2f}s "
+                        f"asr {self.asr_s:.2f}s dispatch "
+                        f"{f'{self.dispatch_s:.2f}s' if self.dispatch_s is not None else 'none'} "
+                        f"frames {len(self.dict_speech_frames)}"
+                    )
 
                     self.dict_speech_frames.clear()
                     self.partial_sent_frames = 0
@@ -3600,7 +3690,7 @@ class MicState:
                         self.chunk_started_at = time.monotonic()
                         self.last_speech_at = self.chunk_started_at
                         self.cooldown_until = self.chunk_started_at + 0.25
-                        write_status(self.state, {"last_action": action})
+                        write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
                         log(f"Draft {action} -> continuing DICTATING for replacement chunk...")
                     elif action in ("cancelled", "handy_stopped"):
                         self.transition_to_idle(
@@ -3622,7 +3712,7 @@ class MicState:
                         self.chunk_started_at = time.monotonic()
                         self.last_speech_at = self.chunk_started_at
                         self.cooldown_until = self.chunk_started_at + 0.25
-                        write_status(self.state, {"last_action": action})
+                        write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
                         log("Continuing DICTATING for next chunk...")
             else:
                 if (now - self.chunk_started_at) >= idle_timeout_seconds:
@@ -3786,12 +3876,40 @@ def handle_captured_frame(
         )
 
 
+def ensure_wake_models() -> None:
+    """The openWakeWord pip wheel bundles only the .tflite models.
+
+    `download_models()` skips a model when its .tflite already exists, so on
+    a fresh install it never fetches the .onnx files this controller loads —
+    exactly the NoSuchFile failure CI hit on 2026-11-14. Fetch each ONNX the
+    controller needs by name instead.
+    """
+    import openwakeword
+    from openwakeword.utils import download_file
+
+    models_dir = Path(openwakeword.__file__).parent / "resources" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    urls: dict[str, str] = {}
+    for group in (openwakeword.FEATURE_MODELS, openwakeword.VAD_MODELS, openwakeword.MODELS):
+        for entry in group.values():
+            urls[entry["download_url"].split("/")[-1]] = entry["download_url"]
+    for name in ("melspectrogram.onnx", "embedding_model.onnx", "silero_vad.onnx", "hey_jarvis_v0.1.onnx"):
+        if (models_dir / name).exists():
+            continue
+        url = urls.get(name) or urls.get(name.replace(".onnx", ".tflite"))
+        if url is None:
+            raise RuntimeError(f"openWakeWord does not list a model named {name}")
+        log(f"Downloading openWakeWord model {name} (first run)...")
+        download_file(url.replace(".tflite", ".onnx"), str(models_dir))
+
+
 def load_fixture_listeners():
     """Wake, VAD, and the Whisper worker. Does not open a microphone or Handy."""
     from faster_whisper import WhisperModel
     from openwakeword.model import Model
     from openwakeword.vad import VAD
 
+    ensure_wake_models()
     oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
     vad = VAD()
     whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
@@ -3849,6 +3967,7 @@ def run_daemon(
     )
 
     log(f"Loading openWakeWord '{wake_word}' + Silero VAD + faster-whisper tiny.en wake verifier...")
+    ensure_wake_models()
     oww = Model(wakeword_models=[wake_word], inference_framework="onnx")
     vad = VAD()
     whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")

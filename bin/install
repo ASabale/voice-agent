@@ -8,6 +8,12 @@ STATE="$HOME/.local/state/omp-voice"
 
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install -r "$ROOT/requirements.txt"
+# WebRTC AEC ships only an Apple Silicon / CPython 3.12 wheel. On Intel or
+# other Python versions this fails; the controller falls back to render
+# subtraction when the import is unavailable, so do not abort the install.
+if ! "$VENV/bin/pip" install -r "$ROOT/requirements-aec.txt"; then
+  echo "aec-audio-processing unavailable on this machine; echo cancellation will use the render-subtraction fallback"
+fi
 mkdir -p "$HOME/.local/bin" "$STATE" "$HOME/.local/share/omp-voice" "$HOME/.omp/agent/extensions" "$HOME/.omp/agent/managed-skills"
 if [ -n "${1:-}" ]; then
   printf '%s\n' "$1" > "$STATE/profile"

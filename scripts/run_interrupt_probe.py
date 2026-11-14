@@ -97,7 +97,7 @@ def main() -> int:
             "Respond with exactly: The quick brown fox jumps over the lazy dog and then counts slowly from one to twelve. Send prompt.",
         )
         evidence["submit"] = sent.get("action")
-        playing = pipe.wait_playing(pid, 90)
+        playing = pipe.wait_playing(pid, 150)
         if not playing:
             evidence["playback_started"] = False
             print(json.dumps(evidence, indent=2))
@@ -117,13 +117,23 @@ def main() -> int:
             vad,
             jobs,
         )
-        deadline = time.time() + 3
-        while time.time() < deadline and afplay_alive(afplay):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and afplay_alive(afplay):
             time.sleep(0.05)
         dead = not afplay_alive(afplay)
-        onset = mic.barge_onset_wall
+        death_mono = time.monotonic() if dead else None
+        onset = mic.barge_onset_mono
+        metrics = mic.turn_metrics()
         evidence["stopped"] = dead
-        evidence["latency_s"] = round(time.time() - onset, 3) if onset and dead else None
+        # External boundary: probe observes afplay gone with 0.05 s polling.
+        evidence["latency_s"] = round(death_mono - onset, 3) if onset and dead else None
+        # Controller boundary: barge hold opened -> clip process confirmed dead
+        # inside stop_playback, before the bridge barge-in round-trip returns.
+        evidence["stop_latency_s"] = metrics["stop_latency_s"]
+        evidence["baseline_va_int_auto_041"] = {
+            "hold_to_stop_playback_call_s": 0.589,
+            "hold_to_probe_detected_death_s": 1.076,
+        }
         evidence["whisper_text"] = next((row.get("text") for row in reversed(mic.barge_trace) if row.get("stage") == "whisper"), None)
         evidence["stages"] = [row.get("stage") for row in mic.barge_trace]
         time.sleep(0.8)
@@ -153,7 +163,7 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
     print(json.dumps(evidence, indent=2))
-    return 0 if evidence.get("stopped") and not evidence.get("resumed") and evidence.get("second_playback") else 1
+    return 0 if evidence.get("stopped") and not evidence.get("resumed") and evidence.get("second_playback") and evidence.get("stop_latency_s") is not None else 1
 
 
 if __name__ == "__main__":

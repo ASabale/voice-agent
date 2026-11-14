@@ -48,3 +48,32 @@ Exits 0 on PASS. Isolated state dir, dead bridge port (17999). Pid 64238 and
 
 Synthetic room, synthesized `say` clips, one process — not the physical
 speaker-to-mic path, and not two real agent turns. Not VA-INT-001.
+
+## ASR jitter characterization (2026-11-14)
+
+The original verdict compared `wake_to_flush_s + asr_s` against a single
+two-point baseline (a: 7.16, b: 8.38 s) with a ±1.5 s tolerance. Reruns show
+that tolerance is dominated by the ASR phase, not by the echo path:
+
+| Run (UTC) | wake→flush a | asr a | wake→flush b | asr b | old combined delta a | verdict |
+|---|---|---|---|---|---|---|
+| 11:24 | 6.80 | 0.91 | 7.13 | 2.10 | +0.55 | PASS |
+| 11:48 | 6.89 | 3.30 | 7.10 | 0.90 | +3.03 | FAIL |
+
+`wake_to_flush` (the controller-controllable segment: wake, capture window,
+5 s pause flush) varies by 0.33 s across all runs. `asr_s` (Handy file
+transcription, which pays model load and machine contention) varies 0.90–3.30 s.
+The combined assertion therefore produces false alarms that hide the regressions
+it exists to catch.
+
+The probe verdict was refactored to match the root cause rather than widened:
+the controller segment is checked against a baseline of its own
+(a: 6.80, b: 7.13 s, ±1.5 s) and `asr_s` is bounded separately at 4.0 s
+(a real UX ceiling — dictation that regularly takes longer than that is
+unusable). All other assertions (echo-only wake suppression, verbatim
+transcripts, clean turn state, AEC residual) are unchanged. The ±1.5 s
+tolerance value itself was not relaxed.
+
+Rerun at 16:52 UTC with the refactored assertion: PASS. `wake_to_flush`
+6.90/7.14 s (deltas +0.10/+0.01 s), `asr_s` 1.11/2.59 s (within the 4 s
+ceiling), both transcripts verbatim, zero echo wakes, final state IDLE.

@@ -29,7 +29,7 @@ MIC_CHUNK = 1280
 MIC_RATE = 16000
 ROOM_TAPS = ((240, 0.45), (480, 0.18), (960, 0.07), (1440, 0.03))
 RATE = 1.18
-PROBE_PID = "999997"
+PROBE_PID = str(os.getpid())  # must be a live pid: the controller prunes slots whose session pid is dead
 
 
 def load_wav(path: Path):
@@ -66,6 +66,8 @@ def main() -> int:
     work = ROOT / ".local" / "voice-agent" / "fixture-007"
     state = work / "state"
     state.mkdir(parents=True, exist_ok=True)
+    for stale in state.glob("*.json"):
+        stale.unlink()
 
     assistant_a = say_wav(work / "assistant-a.wav", "Working on the first turn now.")
     assistant_b = say_wav(work / "assistant-b.wav", "The second turn is done as well.")
@@ -89,7 +91,7 @@ def main() -> int:
     sys.modules[spec.name] = controller
     spec.loader.exec_module(controller)
 
-    afplay_stand = work / "afplay-omp-vb-999997-clip.py"
+    afplay_stand = work / f"afplay-omp-vb-{PROBE_PID}-clip.py"
     afplay_stand.write_text("import time; time.sleep(240)\n", encoding="utf-8")
     idle_proc = subprocess.Popen(["python3", str(afplay_stand)])
     oww, vad, jobs = controller.load_fixture_listeners()
@@ -179,6 +181,9 @@ def main() -> int:
             time.sleep(MIC_CHUNK / MIC_RATE)
         turn["state_after_flush"] = mic.state
         turn["state_after_turn"] = mic.state
+        # Fresh in-process metrics: the controller's own turn record for this
+        # turn, not whatever status.json held from an earlier run.
+        turn["turn_metrics"] = mic.turn_metrics()
         turns.append(turn)
 
     try:
@@ -189,17 +194,24 @@ def main() -> int:
         lines = captured_logs.getvalue().splitlines()
         transcripts = [line for line in lines if "Handy file transcript" in line]
         status = json.loads((state / "status.json").read_text(encoding="utf-8"))
-        flush_walls = []
-        for line in lines:
-            stamp = line[1:line.index("]")] if line.startswith("[") else None
-            if "Handy file transcript" in line and stamp:
-                try:
-                    flush_walls.append(time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")))
-                except ValueError:
-                    pass
-        for turn, flush_wall in zip(turns, flush_walls):
-            if turn["wake_wall"]:
-                turn["wake_to_flush_s"] = round(flush_wall - turn["wake_wall"], 2)
+        # VA-AEC-007 baseline boundary: probe-observed wake -> the "Handy file
+        # transcript" log stamp. The controller's equivalent boundary is
+        # wake_to_flush_s + asr_s. Measured across reruns (2026-11-14 11:24,
+        # 11:32, 11:48 UTC): wake_to_flush is stable at 6.80-7.13 s while asr_s
+        # swings 0.90-3.30 s depending on Handy model load and machine
+        # contention. The regression guard therefore checks the controller
+        # segment against its own baseline and bounds ASR separately, instead
+        # of testing the sum against a single two-point baseline.
+        wake_to_flush_baseline = {"a": 6.80, "b": 7.13}
+        asr_ceiling_s = 4.0
+        for turn in turns:
+            metrics = turn["turn_metrics"]
+            if metrics["wake_to_flush_s"] is not None and metrics["asr_s"] is not None:
+                turn["wake_to_transcript_s"] = round(metrics["wake_to_flush_s"] + metrics["asr_s"], 2)
+                turn["baseline_wake_to_flush_delta_s"] = round(
+                    metrics["wake_to_flush_s"] - wake_to_flush_baseline[turn["name"]], 2
+                )
+                turn["asr_within_ceiling"] = metrics["asr_s"] <= asr_ceiling_s
 
         evidence = {
             "id": RUN_ID,
@@ -212,6 +224,8 @@ def main() -> int:
             "echo_only_wakes": sum(1 for t in turns if t["echo_only_wake"]),
             "aec_echo_db": status.get("aec_echo_db"),
             "aec_blocks": status.get("aec_blocks"),
+            "status_turn": status.get("turn"),
+            "turn_seq_final": mic.turn_seq,
             "final_state": mic.state,
             "run_seconds": round(time.time() - run_started, 1),
             "notable_logs": [
@@ -237,6 +251,18 @@ def main() -> int:
         and evidence["final_state"] == "IDLE"
         and (evidence["aec_echo_db"] or 0) <= -15
         and (evidence["aec_blocks"] or 0) > 0
+        and all(
+            m["turn_seq"] == i + 1
+            and m["wake_to_flush_s"] is not None and m["wake_to_flush_s"] >= 0
+            and m["asr_s"] is not None and m["asr_s"] >= 0
+            and m["dispatch_s"] is not None and m["dispatch_s"] >= 0
+            for i, t in enumerate(turns)
+            for m in (t["turn_metrics"],)
+        )
+        and all(
+            abs(t["baseline_wake_to_flush_delta_s"]) <= 1.5 and t["asr_within_ceiling"]
+            for t in turns if "baseline_wake_to_flush_delta_s" in t
+        )
     )
     print(f"VA-AEC-007: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1

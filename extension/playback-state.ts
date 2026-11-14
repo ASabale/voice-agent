@@ -173,8 +173,15 @@ export function sourcesSpeaking(
   return playbackIsSpeaking(legacy, now, alive, tail);
 }
 
-export function projectAggregate(slots: PlaybackSlot[]): LegacyPlayback {
-  const live = slots.filter((slot) => slot.playing === true);
+export function projectAggregate(
+  slots: PlaybackSlot[],
+  alive: (pid: number) => boolean = () => true,
+  now: number = Date.now() / 1000,
+): LegacyPlayback {
+  // Same rule as slotIsSpeaking: a slot is live only while its afplay (or
+  // its writer under a lease) is alive. Without a witness pid the guardian
+  // cannot check the projection, so a dead writer must not freeze it.
+  const live = slots.filter((slot) => slotIsSpeaking(slot, now, alive, 0));
   if (live.length) {
     const pick = live.reduce((best, slot) => ((slot.started_at ?? 0) >= (best.started_at ?? 0) ? slot : best));
     const out: LegacyPlayback = { playing: true };
@@ -207,14 +214,45 @@ function writeJsonAtomic(file: string, value: unknown): void {
   fs.renameSync(tmp, file);
 }
 
-export function readSlots(stateDir: string): PlaybackSlot[] {
+export function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // ESRCH means the process is gone; EPERM means it exists but belongs
+    // to someone else.
+    return err instanceof Error && "code" in err && err.code === "EPERM";
+  }
+}
+
+// Mirrors the controller's REVERB_TAIL_GUARD_SECONDS.
+export const REVERB_TAIL_GUARD_SECONDS = 0.6;
+
+export function readSlots(
+  stateDir: string,
+  alive: (pid: number) => boolean = pidAlive,
+  now: number = Date.now() / 1000,
+): PlaybackSlot[] {
   const dir = path.join(stateDir, "tts-playing");
   if (!fs.existsSync(dir)) return [];
   const slots: PlaybackSlot[] = [];
   for (const name of fs.readdirSync(dir)) {
     if (!/^\d+\.json$/.test(name)) continue;
     const data = readJson(path.join(dir, name));
-    if (data && typeof data === "object") slots.push(data as PlaybackSlot);
+    if (!data || typeof data !== "object") continue;
+    const pid = Number.parseInt(name, 10);
+    // A slot whose session process is gone can never become active again.
+    // Keep it while it still counts as audible, then unlink it so a dead
+    // session's stale playing:true never pollutes the projection.
+    if (!alive(pid) && !slotIsSpeaking(data as PlaybackSlot, now, alive, REVERB_TAIL_GUARD_SECONDS)) {
+      try {
+        fs.unlinkSync(path.join(dir, name));
+      } catch {
+        // ignore
+      }
+      continue;
+    }
+    slots.push(data as PlaybackSlot);
   }
   return slots;
 }
@@ -226,10 +264,16 @@ function readOwnSlot(stateDir: string, sessionId: string): PlaybackSlot | null {
   return data as PlaybackSlot;
 }
 
-function publish(stateDir: string, sessionId: string, slot: PlaybackSlot): void {
+function publish(
+  stateDir: string,
+  sessionId: string,
+  slot: PlaybackSlot,
+  alive: (pid: number) => boolean = pidAlive,
+  now: number = Date.now() / 1000,
+): void {
   if (!/^\d+$/.test(sessionId)) throw new Error(`bad session id ${sessionId}`);
   writeJsonAtomic(path.join(stateDir, "tts-playing", `${sessionId}.json`), slot);
-  writeJsonAtomic(path.join(stateDir, "tts-playing.json"), projectAggregate(readSlots(stateDir)));
+  writeJsonAtomic(path.join(stateDir, "tts-playing.json"), projectAggregate(readSlots(stateDir, alive, now), alive, now));
 }
 
 export function commitBegin(
@@ -242,9 +286,10 @@ export function commitBegin(
   now: number,
   reference?: WavReference | null,
   playbackRate?: number,
+  alive: (pid: number) => boolean = pidAlive,
 ): PlaybackSlot {
   const next = beginSlot(readOwnSlot(stateDir, sessionId), turn, clip, writerPid, afplayPid, now, reference, playbackRate);
-  publish(stateDir, sessionId, next);
+  publish(stateDir, sessionId, next, alive, now);
   return next;
 }
 
@@ -254,8 +299,9 @@ export function commitEnd(
   turn: number,
   clip: number,
   now: number,
+  alive: (pid: number) => boolean = pidAlive,
 ): PlaybackSlot | null {
   const next = endSlot(readOwnSlot(stateDir, sessionId), turn, clip, now);
-  if (next) publish(stateDir, sessionId, next);
+  if (next) publish(stateDir, sessionId, next, alive, now);
   return next;
 }
