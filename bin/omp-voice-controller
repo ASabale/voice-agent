@@ -345,7 +345,10 @@ def slot_reference(slot: dict) -> dict | None:
     return {"sample_rate": rate, "channels": channels, "frames": frames, "wav": wav}
 
 
-def resample_to_mic_rate(pcm: np.ndarray, src_rate: int, dst_rate: int = 16000) -> np.ndarray:
+MIC_RENDER_RATE = 16000
+
+
+def resample_to_mic_rate(pcm: np.ndarray, src_rate: int, dst_rate: int = MIC_RENDER_RATE) -> np.ndarray:
     """Linear map of mono PCM onto the microphone rate. Same-rate input is copied.
 
     This is not a band-limited resampler. It exists so a 22050 Hz VoiceBox file
@@ -608,7 +611,7 @@ def subtract_playback_at(
     playback_rate is afplay -r. One wall-clock second consumes that many seconds of the file.
     paused_seconds is time afplay spent stopped, which does not advance the file.
     """
-    end_position = render_cursor(started_at, captured_at - paused_seconds, 16000, playback_rate)
+    end_position = render_cursor(started_at, captured_at - paused_seconds, MIC_RENDER_RATE, playback_rate)
     return remove_render_from_block(frame, render, end_position, max_delay, min_corr)
 
 
@@ -684,8 +687,8 @@ def make_echo_canceller(delay_ms: int = 0):
         enable_agc=False,
         enable_vad=False,
     )
-    processor.set_stream_format(16000, 1)
-    processor.set_reverse_stream_format(16000, 1)
+    processor.set_stream_format(MIC_RENDER_RATE, 1)
+    processor.set_reverse_stream_format(MIC_RENDER_RATE, 1)
     processor.set_stream_delay(delay_ms)
     return processor
 
@@ -703,7 +706,7 @@ def render_block_at(
     Sample zero of the block is the file sample at the start of the capture.
     Samples outside the file are silence. This is not an acoustic delay.
     """
-    end_position = render_cursor(started_at, captured_at - paused_seconds, 16000, playback_rate)
+    end_position = render_cursor(started_at, captured_at - paused_seconds, MIC_RENDER_RATE, playback_rate)
     origin = end_position - n
     block = np.zeros(n, dtype=np.int16)
     src_lo = max(0, origin)
@@ -794,6 +797,7 @@ def render_status_fields(connected: dict | None) -> dict:
         "render_rate": connected["sample_rate"],
         "render_channels": connected["channels"],
         "render_frames": connected["frames"],
+        "render_processed_frames": connected.get("processed_frames", connected["frames"]),
         "render_cursor": connected["cursor"],
         "render_aligned": connected["aligned"],
     }
@@ -889,6 +893,13 @@ def refresh_render_reference(now: float | None = None) -> dict:
         mono = downmix_to_mono(raw, int(connected["channels"]))
         _render_samples = resample_to_mic_rate(mono, int(connected["sample_rate"]))
         _render_parsed["aligned"] = _render_samples.size > 0
+        # The published cursor must count on the same 16 kHz grid the canceller reads.
+        _render_parsed["processed_frames"] = int(_render_samples.size)
+        started = chosen.get("started_at")
+        cursor = 0
+        if isinstance(started, (int, float)) and not isinstance(started, bool):
+            cursor = render_cursor(float(started), moment, MIC_RENDER_RATE, playback_rate_of(chosen))
+        _render_parsed["cursor"] = min(cursor, int(_render_samples.size))
     elif _render_parsed is None:
         _render_fields = render_status_fields(None)
         return _render_fields
@@ -899,11 +910,12 @@ def refresh_render_reference(now: float | None = None) -> dict:
             # Wall time includes SIGSTOP. The file does not move during that interval.
             playing_at = moment - paused_playback_seconds(moment)
             cursor = render_cursor(
-                float(started), playing_at, int(_render_parsed["sample_rate"]), playback_rate_of(chosen)
+                float(started), playing_at, MIC_RENDER_RATE, playback_rate_of(chosen)
             )
         _render_parsed = {**_render_parsed, "playback_rate": playback_rate_of(chosen)}
-        if cursor > int(_render_parsed["frames"]):
-            cursor = int(_render_parsed["frames"])
+        processed = int(_render_parsed.get("processed_frames", 0))
+        if cursor > processed:
+            cursor = processed
         _render_parsed = {**_render_parsed, "cursor": cursor}
     if _render_parsed and _render_parsed.get("aligned") and _render_samples is not None and len(_render_samples):
         _render_hold_until = moment + REVERB_TAIL_GUARD_SECONDS
