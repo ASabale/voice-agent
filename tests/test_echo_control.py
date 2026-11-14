@@ -138,6 +138,61 @@ def test_stereo_playback_echo_is_cancelled_on_the_production_path(
     assert _erle(mic, np.concatenate(cleaned)) >= 12.0
 
 
+def _grid_slot(tmp_path: Path, seconds: float) -> dict:
+    speech16 = _tile(_wav("sentence-stop-say.wav"), seconds)
+    speech24 = controller.resample_to_mic_rate(speech16, 16000, 24000)
+    right = (speech24.astype(np.float32) * 0.5).astype(np.int16)
+    wav = tmp_path / "grid-clip.wav"
+    frames = _stereo_wav(wav, speech24, right, 24000)
+    return {
+        "reference": {"wav": str(wav), "sample_rate": 24000, "channels": 2, "frames": frames},
+        "started_at": 100.0,
+        "playing": True,
+        "afplay_pid": 4242,
+        "playback_rate": 1.18,
+    }
+
+
+def test_the_published_cursor_counts_on_the_aec_grid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A 24 kHz clip published a cursor in 24 kHz file samples while both
+    # cancellers read the resampled 16 kHz reference. One wall second is now
+    # 16000 grid samples, not 24000, and the clamp is the grid length.
+    slot = _grid_slot(tmp_path, 4.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [slot])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    fields = controller.refresh_render_reference(100.5)
+    assert fields["render_frames"] == 4 * 24000
+    assert fields["render_processed_frames"] == 4 * 16000
+    assert fields["render_cursor"] == int(0.5 * 16000 * 1.18)
+    # Past the end of the clip the cursor clamps to the grid, not the file.
+    late = controller.refresh_render_reference(110.0)
+    assert late["render_cursor"] == 4 * 16000
+    # The published cursor equals the position render_block_at actually reads.
+    started = controller.refresh_render_reference(101.0)["render_cursor"]
+    block = controller.render_block_at(
+        controller._render_samples, 100.0, 101.0, 1280, 1.18, 0.0
+    )
+    assert np.array_equal(block, controller._render_samples[started - 1280 : started])
+
+
+def test_the_grid_cursor_freezes_while_afplay_is_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = _grid_slot(tmp_path, 4.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [slot])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    before = controller.refresh_render_reference(101.0)
+    assert before["render_cursor"] == int(1.0 * 16000 * 1.18)
+    controller.note_render_paused(101.0)
+    stopped = controller.refresh_render_reference(101.5)
+    assert stopped["render_cursor"] == int(1.0 * 16000 * 1.18)
+    controller.note_render_resumed(101.5)
+    resumed = controller.refresh_render_reference(102.0)
+    assert resumed["render_cursor"] == int(1.5 * 16000 * 1.18)
+
+
 def test_echo_block_returns_each_frame_in_order() -> None:
     seen: list[bytes] = []
 

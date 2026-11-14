@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-14 00:04 UTC — the status cursor now matches the canceller's grid
+
+**Status:** PASS for VA-AEC-003 at LEVEL 1. `render_cursor` counted file samples while both cancellation paths indexed the resampled 16 kHz reference; a 24 kHz clip published 1.5x the true position. The cursor now counts grid samples, clamps to `render_processed_frames`, and still freezes across SIGSTOP. Full controller suite: 210 passed. Pid 64238 was not restarted and still runs the old path, so `status.json` from the live process keeps the old units until it reloads. Not a speaker test and not VA-INT-001.
+
 ## 2026-11-13 23:45 UTC — stereo render references are downmixed, room still unmeasured
 
 **Status:** PASS for VA-AEC-002 at LEVEL 1. A stereo WAV now averages to a 16 kHz mono reference instead of skipping AEC; a planted 20 ms echo through `cancel_playback_echo` lost at least 12 dB on a synthetic 24 kHz stereo clip. Two stale contract tests in `tests/test_command_semantics.py` and `tests/test_handy_file_phrases.py` still expected a non-stop barge to resume the clip; they now assert no resume, matching VA-TTS-008. Full controller suite: 208 passed. Pid 64238 was not restarted and still owns the microphone, so this is not a room result and not VA-INT-001.
