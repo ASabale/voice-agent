@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-13 20:20 UTC — barge-in works against cancelled echo at LEVEL 4
+
+**Status:** PASS for VA-AEC-006. `scripts/run_double_talk_probe.py` mixes a synthesized "Stop. Stop. Stop." with the four-tap echo of a 6.7 s assistant clip: the echo-only window measured -27.4 dB with no wake or barge, the mixed frames held at rms 6257 over a floor of 8, Whisper heard "stop.", `stop_playback` killed the stand-in clip pid, and the render reference went unavailable. Two probe-specific traps surfaced: a single `say "Stop."` clip produces only 2 hot frames (the gate needs 3), and an unreaped zombie stand-in still passes `pid_alive`, so the probe reaps it every block. Pid 64238 untouched; the real speaker-to-mic path remains untested. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-006-double-talk-stop.md`.
+
 ## 2026-11-13 19:51 UTC — echo alone cannot wake the system in the fixture loop
 
 **Status:** PASS for VA-AEC-005 at LEVEL 4. `scripts/run_aec_fixture_probe.py` feeds a four-tap echo of a 4.5 s wake-phrase clip through `handle_captured_frame` with real openwakeword, VAD, and `handy --transcribe-file`: the mic stayed IDLE for the whole echo phase, the status window measured -34.8 dB residual across 57 blocks, and after the slot closed the real wake scored 0.98 with a verbatim transcript (held at a dead bridge port, never typed). The first attempt failed at -2.7 dB because the echo blocks were generated on a drifting wall clock instead of the 16 kHz grid — a test-design bug worth remembering. Pid 64238 was not restarted; the physical speaker-to-mic path remains untested. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-005-echo-wake-suppression.md`.
