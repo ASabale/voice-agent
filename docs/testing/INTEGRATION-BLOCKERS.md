@@ -2,6 +2,10 @@
 
 Newest first. `BLOCKED` is not a pass. Re-check processes before trusting a pid in this file.
 
+## 2026-11-13 19:51 UTC — echo alone cannot wake the system in the fixture loop
+
+**Status:** PASS for VA-AEC-005 at LEVEL 4. `scripts/run_aec_fixture_probe.py` feeds a four-tap echo of a 4.5 s wake-phrase clip through `handle_captured_frame` with real openwakeword, VAD, and `handy --transcribe-file`: the mic stayed IDLE for the whole echo phase, the status window measured -34.8 dB residual across 57 blocks, and after the slot closed the real wake scored 0.98 with a verbatim transcript (held at a dead bridge port, never typed). The first attempt failed at -2.7 dB because the echo blocks were generated on a drifting wall clock instead of the 16 kHz grid — a test-design bug worth remembering. Pid 64238 was not restarted; the physical speaker-to-mic path remains untested. Not VA-INT-001. See `docs/testing/scenarios/VA-AEC-005-echo-wake-suppression.md`.
+
 ## 2026-11-14 04:15 UTC — the canceller now reports its own residual
 
 **Status:** PASS for VA-OBS-001 at LEVEL 1. `cancel_playback_echo` accumulates raw and cleaned energy per block (silent references skipped) and `publish_capture_totals` writes `aec_echo_db` and `aec_blocks` into `status.json`. Measured -33.1 dB over the 8 s four-path room feed, 101 blocks. A latent bug surfaced on the way: int16 energies overflowed in `np.dot`, so the widening to int64 is now asserted by the test. Full controller suite: 215 passed. Pid 64238 was not restarted, so the live status file still lacks these fields until the new code runs. Not a room measurement, not VA-INT-001. See `docs/testing/scenarios/VA-OBS-001-aec-residual.md`.
