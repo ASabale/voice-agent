@@ -28,7 +28,7 @@ MIC_CHUNK = 1280
 MIC_RATE = 16000
 ROOM_TAPS = ((240, 0.45), (480, 0.18), (960, 0.07), (1440, 0.03))
 RATE = 1.18
-PROBE_PID = "999996"
+PROBE_PID = str(os.getpid())  # must be a live pid: the controller prunes slots whose session pid is dead
 
 
 def load_wav(path: Path):
@@ -65,6 +65,8 @@ def main() -> int:
     work = ROOT / ".local" / "voice-agent" / "fixture-008"
     state = work / "state"
     state.mkdir(parents=True, exist_ok=True)
+    for stale in state.glob("*.json"):
+        stale.unlink()
 
     clip_one = work / "assistant-one.wav"
     render_one = say_wav(clip_one, "The first render reference is about to disappear from disk.")
@@ -89,7 +91,7 @@ def main() -> int:
     sys.modules[spec.name] = controller
     spec.loader.exec_module(controller)
 
-    afplay_stand = work / "afplay-omp-vb-999996-clip.py"
+    afplay_stand = work / f"afplay-omp-vb-{PROBE_PID}-clip.py"
     afplay_stand.write_text("import time; time.sleep(240)\n", encoding="utf8")
     idle_proc = subprocess.Popen(["python3", str(afplay_stand)])
     oww, vad, jobs = controller.load_fixture_listeners()

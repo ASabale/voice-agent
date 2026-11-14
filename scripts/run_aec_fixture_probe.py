@@ -25,7 +25,7 @@ RUN_ID = "VA-AEC-005"
 MIC_CHUNK = 1280
 MIC_RATE = 16000
 ROOM_TAPS = ((240, 0.45), (480, 0.18), (960, 0.07), (1440, 0.03))
-PROBE_PID = "999999"
+PROBE_PID = str(os.getpid())  # must be a live pid: the controller prunes slots whose session pid is dead
 
 
 def load_wav(path: Path):

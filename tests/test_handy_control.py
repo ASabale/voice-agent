@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import queue
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -298,7 +299,9 @@ def test_a_held_send_flush_stays_dictating_and_keeps_both_holds(monkeypatch: pyt
         assert injected == []
         assert controller._undelivered_transcript == "Ship the notes."
         assert controller._pending_send_prefix == "ship please"
-        assert status == [("DICTATING", {"last_action": "held"})]
+        # The status payload also carries turn latency metadata; only the
+        # state transition and the action are contractual here.
+        assert [(state, fields["last_action"]) for state, fields in status] == [("DICTATING", "held")]
     finally:
         controller._undelivered_transcript = ""
         controller._pending_send_prefix = ""
@@ -374,7 +377,7 @@ def test_an_appended_flush_records_appended_and_stays_dictating(monkeypatch: pyt
     assert posted == ["Thanks."]
     assert starts == 1
     assert calls == [[controller.HANDY_BIN, "--toggle-transcription"]]
-    assert status == [("DICTATING", {"last_action": "appended"})]
+    assert [(state, fields["last_action"]) for state, fields in status] == [("DICTATING", "appended")]
 
 
 def test_an_older_history_read_does_not_replace_the_consumed_flush_row(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1126,3 +1129,143 @@ def test_a_failed_status_holds_the_flush_once_and_does_not_type(monkeypatch: pyt
     assert delivered.get("draft") == "Ship the notes. Thanks."
     assert posted == ["Ship the notes. Thanks."]
     assert controller._undelivered_transcript == ""
+
+
+# --- VA-LAT-001: turn latency fields (wake_to_flush_s, asr_s, dispatch_s,
+# stop_latency_s, turn_seq), all on time.monotonic(). ---
+
+
+def test_a_wake_resets_stale_turn_latencies_and_bumps_turn_seq(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, running=True)
+    monkeypatch.setenv("OMP_VOICE_HANDY", "transcribe-file")
+    monkeypatch.setattr(controller, "silence_speech", lambda _abort: None)
+    monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
+    monkeypatch.setattr(controller, "latest_history_row", lambda: (0, ""))
+    monkeypatch.setattr(controller, "write_status", lambda *_a, **_k: None)
+
+    mic = controller.MicState()
+    mic.enter_dictating("wake one", _Reset(), _Reset())
+    first = mic.turn_metrics()
+    assert first["turn_seq"] == 1
+    assert first["wake_to_flush_s"] is None
+    assert first["asr_s"] is None
+    assert first["dispatch_s"] is None
+
+    # A finished turn's numbers must not leak into the status of the next one.
+    mic.flush_mono = mic.wake_mono + 7.2
+    mic.asr_s = 0.41
+    mic.dispatch_s = 0.03
+    mic.stop_latency_s = 0.6
+    mic.enter_dictating("wake two", _Reset(), _Reset())
+    second = mic.turn_metrics()
+    assert second["turn_seq"] == 2
+    assert second["wake_to_flush_s"] is None
+    assert second["asr_s"] is None
+    assert second["dispatch_s"] is None
+    # stop_latency_s is the last barge stop, not a per-dictation-turn value.
+    assert second["stop_latency_s"] == 0.6
+
+
+def test_a_flushed_turn_publishes_fresh_latencies_in_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, running=True)
+    posted: list[str] = []
+    status: list[tuple[str, dict]] = []
+
+    def dispatch(text: str) -> dict[str, str]:
+        posted.append(text)
+        return {"action": "appended", "draft": "ship all done"}
+
+    monkeypatch.setattr(controller, "dispatch_transcript", dispatch)
+    monkeypatch.setattr(controller, "wait_for_new_history_row", lambda _prev, timeout_sec=2.2: (8, "ship all done"))
+    monkeypatch.setattr(controller, "latest_history_row", lambda: (0, ""))
+    monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
+    monkeypatch.setattr(controller, "write_status", lambda state, payload: status.append((state, payload)))
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    monkeypatch.setattr(controller, "handy_start_recording", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        controller,
+        "fallback_macos_inject",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("inject")),
+    )
+    for name in (
+        "silence_speech",
+        "stop_playback",
+        "handy_cancel",
+        "pause_tts_clips",
+        "kill_tts_clips",
+        "bridge_request",
+    ):
+        monkeypatch.setattr(
+            controller,
+            name,
+            lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)),
+        )
+
+    mic = controller.MicState()
+    monkeypatch.setattr(controller, "silence_speech", lambda _abort: None)
+    mic.enter_dictating("wake", _Reset(), _Reset())
+    now = 100.0
+    mic.chunk_started_at = now
+    mic.last_handy_ui_check = now
+    mic.last_speech_at = now - 10
+    mic.speech_seen_in_chunk = True
+    mic.dict_speech_frames = [np.zeros(1280, dtype=np.int16)]
+    mic.handle_dictating_frame(
+        np.zeros(1280, dtype=np.int16),
+        now,
+        0.0,
+        0.0,
+        False,
+        _Reset(),
+        _Reset(),
+        5.0,
+        15.0,
+        queue.Queue(),
+    )
+    turn = status[-1][1]["turn"]
+    assert turn == mic.turn_metrics()
+    assert turn["turn_seq"] == 1
+    assert turn["wake_to_flush_s"] is not None and turn["wake_to_flush_s"] >= 0
+    assert turn["asr_s"] is not None and turn["asr_s"] >= 0
+    assert turn["dispatch_s"] is not None and turn["dispatch_s"] >= 0
+    assert turn["stop_latency_s"] is None  # no barge happened in this test
+
+
+def test_stop_playback_returns_the_confirmed_death_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = {"n": 0}
+
+    def alive(_pid: int) -> bool:
+        seen["n"] += 1
+        return seen["n"] <= 1
+
+    monkeypatch.setattr(controller, "_omp_vb_pids", lambda: ["4242"])
+    monkeypatch.setattr(controller, "silence_speech", lambda _abort: None)
+    monkeypatch.setattr(controller, "pid_alive", alive)
+    before = time.monotonic()
+    died_at = controller.stop_playback("test stop")
+    assert died_at is not None and died_at >= before
+    assert seen["n"] >= 2, "stop_playback returned without confirming the clip process died"
+
+
+def test_stop_playback_reports_none_when_a_clip_survives_the_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(controller, "_omp_vb_pids", lambda: ["4242"])
+    monkeypatch.setattr(controller, "silence_speech", lambda _abort: None)
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    ticks = iter([1000.0, 1001.0, 1002.0])
+    monkeypatch.setattr(controller.time, "monotonic", lambda: next(ticks))
+    assert controller.stop_playback("test stop") is None
+
+
+def test_barge_stop_latency_spans_hold_onset_to_death_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
+    onset = time.monotonic()
+
+    def fake_stop(_reason: str) -> float:
+        return onset + 0.579
+
+    monkeypatch.setattr(controller, "stop_playback", fake_stop)
+    mic = controller.MicState()
+    mic.barge_onset_mono = onset
+    mic.apply_whisper("tts_barge", "Stop.", _Reset(), None, queue.Queue())
+    assert mic.stop_latency_s == 0.579
+    assert mic.turn_metrics()["stop_latency_s"] == 0.579

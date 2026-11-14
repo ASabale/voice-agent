@@ -56,10 +56,14 @@ Four simultaneous arrivals (15/30/60/90 ms at gains 0.45/0.18/0.07/0.03) fed thr
 
 The extension default `afplay -r` is 1.18. Half a second of wall clock then ends at file sample 9440 on the 16 kHz grid, and the 1280-sample reference is samples 8160 through 9439. A 0.25 s pause inside that half second ends at sample 4720, so the reference is samples 3440 through 4719. `cancel_playback_echo` sends that slice. A rate of 1.0 is not assumed.
 
+## Cursor-offset tolerance (VA-AEC-009, 2026-11-14)
+
+Priority A asked how much drift the wall-clock render cursor can absorb before echo leaks. Sweeping an echo that trails the reverse block by a fixed delta through `cancel_playback_echo`, residual dB: 0 ms −10.8, 50 ms −36.8, 100 ms −63.2, 150 ms −38.3, 200 ms −62.1, 300 ms −62.3. The curve is not monotonic — WebRTC's delay estimator snaps to nearby bins — and the exactly-aligned case (delta 0) is the weakest, topping out near −16 dB even on a 6 s clip. A physical echo always trails (afplay startup, output buffer, flight time), so the wall-clock cursor is adequate without a sample-accurate sync mechanism; the real budget is WebRTC's delay search window, not the clock. Actual `afplay` startup latency is still unmeasured and must be recorded at Level 4 in VA-INT-001. Evidence: `tests/test_echo_control.py` (`offset_residual_row`), `.local/voice-agent/runs/VA-AEC-009-unit-table.json`.
+
 ## Not claimed
 
 No room ERLE. The energy checks are not an intelligibility score. Pid 64238 was not restarted, so the live microphone still takes the old path. Physical playback into that microphone stays blocked while that process owns it.
 
 ## Next build
 
-When the live controller can be restarted without taking the user's session, the new path is what it should run. The speaker-to-microphone trial stays blocked until pid 64238 is idle and a test lock owns the device. Do not open the microphone beside it.
+When the live controller can be restarted without taking the user's session, the new path is what it should run. The speaker-to-microphone trial stays blocked until pid 64238 is idle and a test lock owns the device. Do not open the microphone beside it. Any VoiceBox service recovery during that trial follows `docs/testing/VOICEBOX-SERVICE-RUNBOOK.md`: no hand-launched `voicebox-server`, no re-opening a GUI that is already running, no killing the GUI from an agent.

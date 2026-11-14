@@ -1,279 +1,93 @@
 # Handy / VoiceBox / OMP Ralph voice loop
 
-You are the only runner of the Handy / Hey Jarvis / VoiceBox / OMP voice loop.
+You are the only runner of the Handy / Hey Jarvis / VoiceBox / OMP voice loop. One engineering objective per iteration. Inspect the source, reproduce the gap, make the smallest fix, verify it, and leave evidence in the checkpoint.
 
-Source of truth:
-- `/Users/akshay/Development/voice-agent/HANDY-SCENARIO-CHECKPOINT.md`
-- `HANDY-RALPH-VOICE-LOOP-PROMPT.md` for this loop protocol
-- Live state:
-  - `~/.local/bin/omp-voice-controller status`
-  - `~/.local/state/omp-voice/controller.log`
-  - `~/.local/state/omp-voice/speech.log`
-  - `~/.local/state/omp-voice/status.json`
-  - `~/.local/state/omp-voice/tts-playing.json`
+## Source of truth (read fresh every iteration)
 
-Do not trust chat memory. Read the checkpoint fresh each iteration.
+- `HANDY-SCENARIO-CHECKPOINT.md` — scenario ledger and evidence
+- `docs/testing/INDEX.md` — the full test catalogue with the validation level of every row
+- `docs/testing/AEC-DECISION.md` — the echo-canceller architecture decision
+- `docs/VOICE-AGENT-ARCHITECTURE.md` — capture and playback map
+- `HANDY-RALPH-VOICE-LOOP-PROMPT.md` — this contract
 
-## Ralph goal
+Do not trust chat memory. The latest verified observation beats any document.
 
-Make the voice loop feel instant and clean:
+## Live state is derived, never remembered
 
-1. Handy must hear the wake and dictation correctly.
-2. Command phrases must behave correctly: send, stop, scratch, clear, cancel, lookalikes.
-3. Our own VoiceBox playback must be recognized as VoiceBox, not user speech.
-4. Foreign `afplay` audio must not suppress the wake.
-5. TTS output must not lag, stutter, loop, repeat, clip, screech, or stay silent.
-6. Service down states must be detected and reported, not hidden inside the mic loop.
-7. Fix the controller or extension, restart only the voice controller when needed, and retest the same row until it passes or becomes genuinely blocked.
-
-Do not commit. Do not restart the user's OMP session. Do not reopen already-passed A-G/H/I/J rows unless a code change invalidates them.
-
-## Stop condition
-
-At the end of the run:
-
-- If all pending rows are complete and no new user-facing gap exists, write:
-
-```text
-IMPROVEMENT LOOP IDLE
-```
-
-inside `HANDY-SCENARIO-CHECKPOINT.md`, then create:
-
-```text
-/Users/akshay/Development/voice-agent/.ralph-voice-loop-idle
-```
-
-- If the loop is genuinely blocked by a missing service that you cannot start, write a `blocked` row, record the exact reason, and create `.ralph-voice-loop-idle` only after saying clearly what Akshay must restart manually.
-
-Do not create the idle marker while work remains.
-
-## One iteration only
-
-Each run does exactly one thing:
-
-1. Read the checkpoint.
-2. Pick the first `pending` or `fail` row.
-3. If no `pending` or `fail` row exists, add one new gap row for an actual user-facing failure, or declare idle.
-4. Run one deterministic test.
-5. Fix if needed.
-6. Retest the same row in the same run.
-7. Write the observed log lines, latency numbers, state after, result, and fix into the checkpoint.
-
-Do not batch several scenarios unless they are the same bug.
-
-## Preflight every run
-
-Before any scenario test, check:
+Every run, before touching anything:
 
 ```sh
 ~/.local/bin/omp-voice-controller status
 curl -fsS http://127.0.0.1:17493/health
-curl -fsS http://127.0.0.1:17494/status
 ```
 
-If VoiceBox `/health` is unreachable:
+- The controller pid, the OMP session pid, the bridge port, and every `afplay` pid change. A pid written in a historical row may be dead. Re-derive all of them from `status` and `~/.local/state/omp-voice/sessions/<pid>.json`.
+- The OMP bridge port is ephemeral and is read from the session registry. Port 17494 is a legacy listener; never assume it is live (VA-OMP-001, VA-OMP-003). If a registry file is missing, the controller falls back to the one loopback listener only when `/status` names the same pid.
+- If VoiceBox `/health` is unreachable, recovery follows `docs/testing/VOICEBOX-SERVICE-RUNBOOK.md`, and nothing else. A GUI process, a server process, a listening socket, and an HTTP response are four different facts; record each. Never exec `voicebox-server` by hand and never `open -a VoiceBox` while the GUI is already running — a running GUI has already used its one production `start_server`. The only supported recovery is a human quitting and reopening VoiceBox; an agent does not kill the GUI. If still down, write a `VOICEBOX-DOWN` row with the exact error, the controller pid, the status state, and result `blocked`. The controller logs a failed health check at most once per 5 s and stops tier changes; it must not poll every mic frame.
+- If the bridge `/status` is unreachable on the registry port, write `BRIDGE-DOWN` as blocked, stop delivery tests, and do not restart the user's OMP session.
 
-1. Try to start VoiceBox if available, for example:
+## Safety rules (override everything else)
 
-```sh
-open -a VoiceBox
-```
+1. Never kill, restart, or signal the user's OMP session or the running controller. Never submit a test prompt into the user's session. Never send test prompts to a user-owned bridge. Integration delivery goes only through an isolated session: `scripts/isolated_session.py` with `OMP_VOICE_BRIDGE_ONLY` and `OMP_VOICE_PLAYBACK_PID`; the harness refuses protected session ports (VA-INT-AUTO-006).
+2. The running controller owns the MacBook Pro Microphone. Never open a second microphone source beside it. A physical acoustic test is allowed only after an explicit ownership handoff and a verified free device; otherwise run the fixture probe instead.
+3. Never kill a process because its name looks familiar, and never trust a pid recorded in a checkpoint.
+4. Never claim a test passed without running it. Never claim physical, acoustic, or service-integration results from a fixture, a synthetic signal, or a mock. A failed test is evidence; write it down.
+5. Never lower the 0.50 wake threshold. Do not restore a 0.35 TTS wake open.
+6. Do not commit, push, or create a release.
 
-2. Wait up to 60 seconds.
-3. Poll `/health` again.
-4. If still unreachable, write a row in the checkpoint named `VOICEBOX-DOWN` with:
-   - exact error,
-   - controller pid,
-   - status state,
-   - latest relevant `speech.log` failure,
-   - result `blocked`.
+## Validation levels
 
-Do not make the controller loop forever on failed health checks. If health is unreachable, the controller should log at most once per 5 seconds and stop attempting model tier changes.
+Every checkpoint row states the level it actually achieved.
 
-If the OMP bridge `/status` is unreachable:
+1. **Unit** — grammar, state transitions, frame handling, queue behavior, playback lifecycle. Fast and deterministic.
+2. **Fixture-fed controller integration** — `FixtureAudioSource` deterministic PCM through the real `handle_captured_frame` path: wake detection, VAD, Whisper, classification, state transitions. Never inject a transcript directly as a replacement for audio. The fixture never opens the microphone.
+3. **Local service integration** — real Handy, real VoiceBox, an isolated `omp -p` bridge, real `afplay`. Mocks in isolated tests must not be called service integration.
+4. **Physical acoustic** — actual speaker output, actual microphone capture, verified exclusive ownership, recorded conditions, measured behavior, intelligibility checked by transcription. A fixture test cannot satisfy this level.
+5. **Extended reliability** — long runs, consecutive conversations, repeated interruptions, service restart and recovery, queue saturation, playback failure, memory growth, stale session cleanup. A short test cannot satisfy this level.
 
-- do not restart the user's OMP session;
-- write `BRIDGE-DOWN` as blocked;
-- stop audio tests that require delivery.
+## One iteration
 
-## Build the deterministic harness
+1. Read the checkpoint and the catalogue. Pick the first `pending` or `fail` row, or the single highest-priority genuine gap. Do not invent work. Do not rerun a `pass` row unless a code change invalidated it. Do not redo VA-INT-AUTO-040 or VA-INT-AUTO-041 without a specific regression or a stronger acceptance criterion.
+2. Write a short plan before editing: problem, evidence, root-cause hypothesis, relevant files, proposed change, risks, regression tests, acceptance criteria.
+3. Reproduce deterministically. The harnesses already exist: `scripts/run_aec_fixture_probe.py`, `scripts/run_double_talk_probe.py`, `scripts/run_repeat_turn_probe.py`, `scripts/run_render_recovery_probe.py`, `scripts/run_interrupt_probe.py`, and `tests/`. Do not create `scripts/voice_ralph_check.py`; that instruction is obsolete. If reproduction is impossible, say why and name the missing observability instead of guessing the root cause.
+4. Implement the smallest change that addresses the demonstrated problem. Preserve public interfaces unless the change is documented. No unrelated refactoring, no new dependencies without justification.
+5. Verify: the focused test, then `~/.local/share/omp-voice/venv/bin/python -m pytest tests/ -q` and `node --experimental-strip-types --test tests/match_command.test.ts tests/playback-state.test.ts tests/speech-queue.test.ts`. Inspect exit codes, the diff, runtime logs, state transitions, and resource cleanup.
+6. State which processes actually loaded the change. The running controller pid and the running OMP extension keep the old code until they restart or reload; a Level 1 or Level 2 pass is not live behavior. Every checkpoint row must say whether the live processes were restarted, and the list of tested-but-unloaded fixes lives in `HANDY-SCENARIO-CHECKPOINT.md` under "Tested but not loaded into running processes".
+7. Review your own change: does the test exercise the real failure path, could it pass while broken, did the fix create a race or a leak, did it weaken an existing test?
+8. Record in the checkpoint: date/time, task id, problem, root cause (or explicit uncertainty), changed files, tests executed, exact results, validation level, latency or measured metrics, limitations, remaining work, next recommended task. Never erase historical results.
+9. Stop. Do not start a second unrelated implementation because context remains.
 
-If `scripts/voice_ralph_check.py` or an equivalent harness does not exist, create one.
+## Wake-during-playback contract
 
-The harness must:
+- Only the controller's own TTS slot (`tts-playing/<pid>.json`) counts as our voice. A foreign `afplay` does not suppress the wake (G9 pass, 00:04).
+- A wake word during our own playback is ignored; it must not open Handy (D3).
+- Only a whole-phrase `stop` or a hold-on phrase barges: it stops VoiceBox playback and never opens a dictation session (D4, G8, H2, H3, VA-INT-AUTO-041: `stop_playback` 0.589 s after the hold). A sentence that merely ends in `stop` does not stop playback.
+- Stopping playback and opening dictation are separate actions. A test that opens a second dictation session when a stop is heard is a fail, even if the clip stops.
 
-1. Start or inspect the controller.
-2. Read controller status.
-3. Send synthetic audio through the MacBook Pro microphone path using the voice venv:
+## AEC acceptance criteria
 
-```text
-~/.local/share/omp-voice/venv/bin/python
-```
+Synthetic work (VA-AEC-001 through VA-AEC-008, VA-OBS-001) establishes: the WebRTC desktop canceller pinned at `aec-audio-processing==1.0.0`, 16 kHz render reference fed before VAD, stereo downmix, cursor on the grid, multi-path cancellation near 38 dB, near-end energy survival, and residual published to `status.json` as `aec_echo_db` / `aec_blocks`.
 
-4. Convert int16 samples to float32 and divide by 32768 before `sd.play`.
-5. Do not import `soundfile`.
-6. Play wake phrases separately from the continuation.
-7. For wake rows:
-   - If status is `DICTATING`, say only `Send that.` and wait.
-   - If status is `IDLE`, play only the wake.
-   - Wait until `controller.log` says `entering DICTATING`.
-   - Sleep 1.3 seconds.
-   - Then play the continuation.
-8. Record:
-   - wake score,
-   - time from wake to `entering DICTATING`,
-   - time from first continuation play to transcript,
-   - time from transcript to outcome,
-   - final state,
-   - whether the log line is the expected one.
+Level 4 acceptance requires all of the following, measured on the live controller with an ownership lock on the microphone:
 
-Do not use `say` as the only playback mechanism when testing our VoiceBox behavior. If using any `afplay` as a bed, make sure it is marked as our VoiceBox only by writing `tts-playing.json` exactly as the extension does.
+- ERLE measured through the real speaker-to-microphone path, not planted taps.
+- No wake and no barge from echo alone across a full spoken reply.
+- Near-end speech transcribed verbatim during double-talk, including quiet user speech over loud playback. Energy preservation is not intelligibility.
+- "Stop." and a wake phrase during playback interrupt, with measured stop latency.
+- Render reference stays aligned with actual output across pause, resume, clip change, and `afplay -r` rate changes; drift, if any, is measured, not assumed.
 
-## Scenario families that must be verified
+Until a row records all five at Level 4, the AEC is not production validated. VA-INT-001 remains BLOCKED. Note a known unquantified risk: the render cursor advances from wall clock times the playback rate, which is not the audio-device sample clock (Priority A); the physical test must measure that drift.
 
-### 1. Wake pickup
+## Stop condition
 
-Pass requires:
-
-- `Hey Jarvis`, `OK Jarvis`, `Hello Jarvis`, or `Jarvis` opens Handy when idle.
-- A real wake must score at least the 0.50 threshold.
-- Room noise below 0.50 must not open Handy.
-- Lookalikes such as `H R V S`, `H R V`, `Hey service`, `A harvest`, `Every service`, and ordinary 15-second speech must not wake Handy.
-- Never lower the 0.50 wake threshold.
-
-### 2. Commands during dictation
-
-Pass requires:
-
-- `Send that.` sends.
-- Lone `Submit.` sends.
-- `said that` inside a sentence does not send.
-- `Stop.` pauses and preserves the draft.
-- `Hold on a second.` or `Hold on a sec.` during our own TTS stops playback and does not open dictation.
-- `Scratch that.` removes the last chunk and stays `DICTATING` for replacement.
-- `Clear draft.` clears the draft and stays `DICTATING` for replacement.
-- `Cancel that.` cancels the current unpasted chunk and returns to `IDLE`.
-- A wake word inside a dictated sentence must not start a second dictation.
-
-### 3. Our VoiceBox barge-in
-
-Pass requires:
-
-- During our own VoiceBox playback, the wake is ignored.
-- During our own VoiceBox playback, `Stop.` stops the speech.
-- During our own VoiceBox playback, `Hold on a second.` stops the speech.
-- During our own VoiceBox playback, `Send that.` does not open dictation.
-- During our own VoiceBox playback, `Scratch that.` does not open dictation.
-- A sentence ending in `stop` must not stop playback.
-- Do not restore a 0.35 TTS open.
-
-### 4. Foreign `afplay`
-
-Pass requires:
-
-- Any `afplay` that does not have `tts-playing.json` marked as ours must not make the assistant deaf.
-- A wake during a foreign bed must open Handy and send the checkpoint if the row expects it.
-- If a foreign bed causes `Ignored ... over TTS`, that is a fail.
-
-### 5. Partial transcript behavior
-
-Pass requires:
-
-- Partials are written to the focused field before the final Handy flush.
-- The final partial includes the last word before the pause.
-- The final sent draft is one draft, not the partial plus the final chunk duplicated.
-- The partial is removed before final send.
-
-### 6. TTS latency
-
-Measure and write into the checkpoint:
-
-- time from assistant reply to first VoiceBox request in `speech.log`;
-- time from VoiceBox request to `tts-playing.json` `playing: true`;
-- time from playback start to playback end;
-- number of failed TTS requests with `ECONNREFUSED`;
-- number of `VoiceBox health unread` lines per minute.
-
-Fail if:
-
-- VoiceBox is reachable but replies are silent;
-- short replies take more than 5 seconds to begin speaking without a clear model-load reason;
-- the controller logs health failures every mic frame;
-- repeated failed health checks make the controller sluggish.
-
-Fix latency issues with one-variable probes:
-
-1. Is VoiceBox actually listening on 17493?
-2. Is the OMP bridge listening on 17494?
-3. Is the controller stuck in the strata/model-tier loop?
-4. Is sentence generation blocking playback?
-5. Is `afplay` being killed too late or too early?
-6. Is barge-in pausing playback because speaker bleed is treated as stop speech?
-
-### 7. TTS audio quality
-
-Create or update a small harness that generates a known sentence through VoiceBox and stores the WAV.
-
-The WAV must:
-
-- exist;
-- be nonempty;
-- have sane duration for the sentence;
-- not clip;
-- not contain repeated fragments;
-- not produce screech or raw int16 scale errors;
-- have no unexplained long silent gaps.
-
-Then verify what the mic hears by either:
-
-- playing the WAV and letting Handy/Whisper transcribe it in a controlled test, or
-- recording the mic during playback and comparing the transcript to the intended sentence.
-
-Fail if the heard text contains stutter, loops, missing tail words, repeated phrases, or a screech.
-
-## Fix protocol for a failed row
-
-For each failure:
-
-1. Reproduce it deterministically.
-2. Minimize the repro to the smallest scenario that still fails.
-3. State 3-5 falsifiable hypotheses.
-4. Add targeted instrumentation, not log-everything noise.
-5. Fix the controller or extension.
-6. Restart only the voice controller if needed:
-
-```sh
-~/.local/bin/omp-voice-controller stop
-~/.local/bin/omp-voice-controller start
-```
-
-7. Retest the exact same row.
-8. Mark `pass` only when the checkpoint `expect` column matches the observed log.
-
-If the fix is only a workaround, say so. Prefer root-cause fixes:
-
-- service availability checks;
-- bounded retry/backoff;
-- one source of truth for "is VoiceBox speaking";
-- clear command parsing rules;
-- no repeated health polling every mic frame;
-- no duplicated TTS sentence;
-- no partial final-send double writes.
+When no `pending` or `fail` row remains and no open Level 1–4 gap exists, write `IMPROVEMENT LOOP IDLE` in `HANDY-SCENARIO-CHECKPOINT.md` and create `.ralph-voice-loop-idle`. VA-INT-001 and the physical AEC acceptance are open gaps: the loop is not idle while physical acceptance is unrun. If genuinely blocked by a service you cannot start, write a `blocked` row with the exact reason and say clearly what Akshay must restart before creating the idle marker. Do not invent rows to keep the loop alive.
 
 ## Checkpoint write format
-
-When you finish a row, update the row in the checkpoint with:
 
 ```text
 result: pass | fail | blocked
 heard: <timestamp, controller log line, status state, latency numbers>
 fix: <what changed, or why no fix was needed>
-next: <next user-facing gap, or none>
+level: <1-5 actually achieved>
+next: <next highest-priority gap, or none>
 ```
-
-If a row says "Do not rerun", do not rerun it unless a new fix changes the behavior.
-
-## Exit
-
-If every open row is closed, write `IMPROVEMENT LOOP IDLE`, create `.ralph-voice-loop-idle`, and stop. Do not invent extra rows to keep the loop alive.

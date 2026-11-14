@@ -28,7 +28,7 @@ MIC_CHUNK = 1280
 MIC_RATE = 16000
 RATE = 1.18
 ROOM_TAPS = ((240, 0.45), (480, 0.18), (960, 0.07), (1440, 0.03))
-PROBE_PID = "999998"
+PROBE_PID = str(os.getpid())  # must be a live pid: the controller prunes slots whose session pid is dead
 ECHO_ONLY_BLOCKS = 40  # 3.2 s of assistant-only echo before the user talks
 
 
@@ -62,6 +62,8 @@ def main() -> int:
     work = ROOT / ".local" / "voice-agent" / "fixture-006"
     state = work / "state"
     state.mkdir(parents=True, exist_ok=True)
+    for stale in state.glob("*.json"):
+        stale.unlink()
 
     assistant_clip = work / "assistant.wav"
     say_wav(assistant_clip, "The deployment manifest is loading. The sensor calibration finished overnight and the fleet is ready for the morning shift.")
@@ -89,7 +91,7 @@ def main() -> int:
     # The stand-in playback process is named like a real VoiceBox clip so
     # kill_tts_clips (which greps ps for afplay + omp-vb-<owner>-) actually
     # stops it when the barge confirms. It sleeps; it plays no sound.
-    afplay_stand = work / "afplay-omp-vb-999998-clip.py"
+    afplay_stand = work / f"afplay-omp-vb-{PROBE_PID}-clip.py"
     afplay_stand.write_text("import time; time.sleep(120)\n", encoding="utf-8")
     idle_proc = subprocess.Popen(["python3", str(afplay_stand)])
     oww, vad, jobs = controller.load_fixture_listeners()

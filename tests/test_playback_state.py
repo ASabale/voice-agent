@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -542,3 +543,121 @@ def test_a_paused_afplay_does_not_advance_the_published_cursor(tmp_path: Path, m
     controller._render_file_key = None
     controller._render_paused_at = None
     controller._render_paused_seconds = 0.0
+
+
+def test_dead_session_slots_are_pruned(tmp_path: Path, monkeypatch) -> None:
+    """A session process that is gone leaves a slot that can never become
+    active again; nine such files had accumulated in the live state dir."""
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: False)
+    slot_dir = tmp_path / "tts-playing"
+    slot_dir.mkdir()
+    (slot_dir / "11.json").write_text(
+        json.dumps({"playing": False, "ended_at": time.time() - 100}), encoding="utf-8"
+    )
+    (slot_dir / "22.json").write_text(
+        json.dumps({"playing": True, "afplay_pid": 5, "started_at": time.time() - 100}),
+        encoding="utf-8",
+    )
+    assert controller._read_playback_slots() == []
+    assert not (slot_dir / "11.json").exists()
+    assert not (slot_dir / "22.json").exists()
+
+
+def test_a_slot_still_in_the_reverb_tail_is_not_pruned(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: False)
+    slot_dir = tmp_path / "tts-playing"
+    slot_dir.mkdir()
+    (slot_dir / "11.json").write_text(
+        json.dumps({"playing": False, "ended_at": time.time()}), encoding="utf-8"
+    )
+    assert controller.is_voicebox_speaking() is True
+    assert (slot_dir / "11.json").exists()
+
+
+def test_a_live_session_slot_is_never_pruned(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: pid == 11)
+    slot_dir = tmp_path / "tts-playing"
+    slot_dir.mkdir()
+    (slot_dir / "11.json").write_text(
+        json.dumps({"playing": False, "ended_at": time.time() - 1000}), encoding="utf-8"
+    )
+    assert len(controller._read_playback_slots()) == 1
+    assert (slot_dir / "11.json").exists()
+
+
+def test_project_aggregate_matches_the_legacy_projection_shape() -> None:
+    live = {"playing": True, "started_at": 10.0, "afplay_pid": 7}
+    ended = {"playing": False, "ended_at": 5.0}
+    assert controller.project_aggregate([live, ended]) == {"playing": True, "started_at": 10.0, "pid": 7}
+    assert controller.project_aggregate([ended]) == {"playing": False, "ended_at": 5.0}
+    assert controller.project_aggregate([]) == {"playing": False}
+    assert controller.project_aggregate([{"playing": True, "started_at": 1, "afplay_pid": True}]) == {
+        "playing": True,
+        "started_at": 1,
+    }
+
+
+def test_project_aggregate_never_freezes_without_a_live_witness() -> None:
+    now = 100.0
+    dead = lambda _pid: False
+    live = lambda pid: pid == 22
+    assert controller.project_aggregate(
+        [{"playing": True, "started_at": 90.0, "afplay_pid": 42}], dead, now
+    ) == {"playing": False}
+    # Writer-lease slot with no afplay pid: the bare flag would freeze the
+    # projection with no pid the guardian can check.
+    assert controller.project_aggregate(
+        [{"playing": True, "started_at": 90.0, "writer_pid": 42, "lease_until": 1000.0}], dead, now
+    ) == {"playing": False}
+    assert controller.project_aggregate(
+        [{"playing": True, "started_at": 90.0, "afplay_pid": 22}], live, now
+    ) == {"playing": True, "started_at": 90.0, "pid": 22}
+
+
+def test_pruning_refreshes_a_projection_frozen_by_a_crashed_session(tmp_path: Path, monkeypatch) -> None:
+    """The flat tts-playing.json is only written by live sessions. A session
+    SIGKILLed mid-clip leaves playing:true there forever, which would make
+    the memory guardian believe voice is always playing and skip voice
+    shedding before killing the model engine."""
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "TTS_STATE_FILE", tmp_path / "tts-playing.json")
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: False)
+    slot_dir = tmp_path / "tts-playing"
+    slot_dir.mkdir()
+    (slot_dir / "11.json").write_text(
+        json.dumps(
+            {"playing": True, "writer_pid": 11, "afplay_pid": 5, "started_at": time.time() - 100}
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "tts-playing.json").write_text(json.dumps({"playing": True, "pid": 5}), encoding="utf-8")
+    assert controller.is_voicebox_speaking() is False  # slots are the authority, and they are dead
+    assert controller._read_playback_slots() == []
+    projection = json.loads((tmp_path / "tts-playing.json").read_text(encoding="utf-8"))
+    assert projection == {"playing": False}
+    assert not (slot_dir / "11.json").exists()
+
+
+def test_pruning_rebuilds_the_projection_from_the_live_session(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "TTS_STATE_FILE", tmp_path / "tts-playing.json")
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: pid in {22, 7})
+    slot_dir = tmp_path / "tts-playing"
+    slot_dir.mkdir()
+    now = time.time()
+    (slot_dir / "11.json").write_text(
+        json.dumps({"playing": True, "writer_pid": 11, "afplay_pid": 6, "started_at": now - 100}),
+        encoding="utf-8",
+    )
+    (slot_dir / "22.json").write_text(
+        json.dumps({"playing": True, "writer_pid": 22, "afplay_pid": 7, "started_at": now}),
+        encoding="utf-8",
+    )
+    (tmp_path / "tts-playing.json").write_text(json.dumps({"playing": True, "pid": 6}), encoding="utf-8")
+    slots = controller._read_playback_slots()
+    assert len(slots) == 1
+    projection = json.loads((tmp_path / "tts-playing.json").read_text(encoding="utf-8"))
+    assert projection == {"playing": True, "started_at": now, "pid": 7}

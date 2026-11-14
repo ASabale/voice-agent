@@ -38,12 +38,12 @@ flowchart LR
 
 ## What you need
 
-- macOS on Apple Silicon or Intel
+- macOS on Apple Silicon or Intel. WebRTC echo cancellation (`aec-audio-processing==1.0.0`) ships only an Apple Silicon wheel built for CPython 3.12; on Intel or other Python versions the install script skips it and the controller falls back to render-subtraction echo control.
 - Homebrew
 - A microphone, and permission for Handy and the terminal to use it
 - The three apps above
 
-Python packages for the wake word and silence detection are installed into `~/.local/share/omp-voice/venv` by the install script. You do not need a separate Python project.
+Python packages for the wake word and silence detection are installed into `~/.local/share/omp-voice/venv` by the install script. You do not need a separate Python project. The openWakeWord pip wheel carries no model files; the controller downloads the wake, feature, and VAD models (~5 MB) from GitHub releases the first time it starts.
 
 ## Set up
 
