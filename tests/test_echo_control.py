@@ -543,8 +543,35 @@ def test_the_residual_metric_reports_the_cancelled_echo(
     print(f"window residual: {fields}")
     assert fields["aec_blocks"] > 0
     assert fields["aec_echo_db"] <= -15.0
+    assert fields["aec_guard_blocks"] == 0
     # The window resets: a read with no new blocks reports nothing.
     assert controller.aec_window_fields() == {}
+
+
+@aec_required
+def test_guard_returned_blocks_are_counted_in_the_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A filter fit that crushes a block the render reference cannot explain is
+    # near-end speech, and the guard returns it raw. The window must count
+    # those blocks so a 0 dB ratio can be attributed instead of read as a
+    # cancelling filter.
+    speech = _tile(_wav("sentence-stop-say.wav"), 8.0)
+    monkeypatch.setattr(controller, "_read_playback_slots", lambda: [_mono_slot(tmp_path, speech)])
+    monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(controller, "process_echo_block", lambda _p, mic, _r: (mic // 1000).astype(np.int16))
+    controller.refresh_render_reference(100.0)
+    controller.aec_window_fields()
+    rng = np.random.default_rng(3)
+    near = rng.integers(-3000, 3000, size=8 * _RATE).astype(np.int16)
+    fed = 0
+    for i in range(len(near) // 1280):
+        block = near[i * 1280 : (i + 1) * 1280]
+        if _rms(block) > 200:
+            controller.cancel_playback_echo(block, 100.0 + (i + 1) * 0.08)
+            fed += 1
+    fields = controller.aec_window_fields()
+    assert fields["aec_blocks"] == fed
+    assert fields["aec_guard_blocks"] == fed
+    assert fields["aec_echo_db"] == 0.0
 
 
 def test_the_residual_metric_skips_silent_references(

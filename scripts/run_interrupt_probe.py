@@ -140,7 +140,11 @@ def main() -> int:
         evidence["resumed"] = afplay_alive(afplay)
         second = post(port, "Reply with exactly: Second voice check complete. Send prompt.")
         evidence["second_action"] = second.get("action")
-        evidence["second_playback"] = bool(pipe.wait_playing(pid, 60))
+        # 120 s, not 60: the isolated session queues its reply behind every
+        # other request on the single-slot local engine (runs 3/4 lost the
+        # second turn by ~1.5 s at the old 60 s deadline, dropping it with
+        # reason "abort" on session shutdown). Harness timing only.
+        evidence["second_playback"] = bool(pipe.wait_playing(pid, 120))
         evidence["state"] = mic.state
     finally:
         controller._daemon_running.clear()

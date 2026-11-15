@@ -5,7 +5,9 @@
     "alive": [],
     "tail": 0.6,
     "slots": null,
-    "legacy": { "playing": true },
+    "legacy": {
+      "playing": true
+    },
     "expect": true
   },
   {
@@ -14,7 +16,10 @@
     "alive": [],
     "tail": 0.6,
     "slots": null,
-    "legacy": { "playing": false, "ended_at": 999.9 },
+    "legacy": {
+      "playing": false,
+      "ended_at": 999.9
+    },
     "expect": true
   },
   {
@@ -23,13 +28,18 @@
     "alive": [],
     "tail": 0.6,
     "slots": null,
-    "legacy": { "playing": false, "ended_at": 998 },
+    "legacy": {
+      "playing": false,
+      "ended_at": 998
+    },
     "expect": false
   },
   {
     "name": "other session stays speaking",
     "now": 1002,
-    "alive": [111],
+    "alive": [
+      111
+    ],
     "tail": 0.6,
     "slots": [
       {
@@ -53,7 +63,9 @@
         "reason": "end"
       }
     ],
-    "legacy": { "playing": true },
+    "legacy": {
+      "playing": true
+    },
     "expect": true
   },
   {
@@ -73,13 +85,18 @@
         "reason": "begin"
       }
     ],
-    "legacy": { "playing": true, "pid": 111 },
+    "legacy": {
+      "playing": true,
+      "pid": 111
+    },
     "expect": false
   },
   {
     "name": "orphan afplay inside the lease",
     "now": 1050,
-    "alive": [111],
+    "alive": [
+      111
+    ],
     "tail": 0.6,
     "slots": [
       {
@@ -99,7 +116,9 @@
   {
     "name": "orphan afplay past the lease",
     "now": 1061,
-    "alive": [111],
+    "alive": [
+      111
+    ],
     "tail": 0.6,
     "slots": [
       {
@@ -119,7 +138,9 @@
   {
     "name": "writer lease without afplay",
     "now": 1059,
-    "alive": [11],
+    "alive": [
+      11
+    ],
     "tail": 0.6,
     "slots": [
       {
@@ -138,7 +159,9 @@
   {
     "name": "writer lease expired",
     "now": 1060,
-    "alive": [11],
+    "alive": [
+      11
+    ],
     "tail": 0.6,
     "slots": [
       {
@@ -157,10 +180,14 @@
   {
     "name": "empty slot directory beats a legacy playing flag",
     "now": 1000,
-    "alive": [111],
+    "alive": [
+      111
+    ],
     "tail": 0.6,
     "slots": [],
-    "legacy": { "playing": true },
+    "legacy": {
+      "playing": true
+    },
     "expect": false
   },
   {
@@ -180,5 +207,90 @@
     ],
     "legacy": null,
     "expect": true
+  },
+  {
+    "name": "orphan afplay mid-clip of a 120 s clip",
+    "now": 1070,
+    "alive": [
+      111
+    ],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin",
+        "reference": {
+          "sample_rate": 24000,
+          "channels": 1,
+          "frames": 2880000,
+          "wav": "/tmp/long.wav"
+        }
+      }
+    ],
+    "legacy": null,
+    "expect": true
+  },
+  {
+    "name": "orphan afplay past the end of its clip",
+    "now": 1126,
+    "alive": [
+      111
+    ],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "reason": "begin",
+        "reference": {
+          "sample_rate": 24000,
+          "channels": 1,
+          "frames": 2880000,
+          "wav": "/tmp/long.wav"
+        }
+      }
+    ],
+    "legacy": null,
+    "expect": false
+  },
+  {
+    "name": "orphan afplay sped up by playback rate",
+    "now": 1070,
+    "alive": [
+      111
+    ],
+    "tail": 0.6,
+    "slots": [
+      {
+        "playing": true,
+        "turn": 1,
+        "clip": 1,
+        "writer_pid": 11,
+        "afplay_pid": 111,
+        "started_at": 1000,
+        "lease_until": 1060,
+        "playback_rate": 2.0,
+        "reason": "begin",
+        "reference": {
+          "sample_rate": 24000,
+          "channels": 1,
+          "frames": 2880000,
+          "wav": "/tmp/long.wav"
+        }
+      }
+    ],
+    "legacy": null,
+    "expect": false
   }
 ]

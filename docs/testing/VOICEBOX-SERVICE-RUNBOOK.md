@@ -78,15 +78,19 @@ That is generation and a finished player. It is not a person confirming the spea
 
 ## Crashes already on disk
 
-All three are MLX Metal failures. The GUI that is still running spawned a server once and did not spawn another.
+Every crash on disk is an MLX Metal failure. The GUI that is still running spawned a server once and did not spawn another.
 
 | Local time | Signal | Server pid | GUI parent | Lifetime | Fault |
 |---|---|---|---|---|---|
-| 08:57:35 | `SIGABRT` | 75213 | voicebox 75181 | since 2026-11-10 18:14:38 | `abort() called` from `mlx::core::gpu::check_error(MTL::CommandBuffer*)`. Report `voicebox-server-2026-11-13-085736.ips`. |
-| 10:08:44 | `SIGABRT` | 7303 | voicebox 7271 | since 09:03:57 the same morning | Same `check_error` abort. Report `voicebox-server-2026-11-13-100845.ips`. |
-| 10:12:46 | `SIGSEGV` | 29328, parent server 29308 | voicebox 29277 | 38 s (launch 10:12:08) | `EXC_BAD_ACCESS` at address `0x8` in `mlx::core::eval_impl`, during `mlx::core::metal::MetalAllocator::malloc`. Report `voicebox-server-2026-11-13-101246.ips`. |
+| 11-13 08:57:35 | `SIGABRT` | 75213 | voicebox 75181 | since 2026-11-10 18:14:38 | `abort() called` from `mlx::core::gpu::check_error(MTL::CommandBuffer*)`. Report `voicebox-server-2026-11-13-085736.ips`. |
+| 11-13 10:08:44 | `SIGABRT` | 7303 | voicebox 7271 | since 09:03:57 the same morning | Same `check_error` abort. Report `voicebox-server-2026-11-13-100845.ips`. |
+| 11-13 10:12:46 | `SIGSEGV` | 29328, parent server 29308 | voicebox 29277 | 38 s (launch 10:12:08) | `EXC_BAD_ACCESS` at address `0x8` in `mlx::core::eval_impl`, during `mlx::core::metal::MetalAllocator::malloc`. Report `voicebox-server-2026-11-13-101246.ips`. |
+| 11-14 00:51:02/04 | `SIGSEGV` + `SIGSEGV` | 11991 (launcher), 12018 (worker), parent voicebox 11972 | — | launch 23:54:22, dead 00:51:04 | Launcher `__pthread_kill` abort; worker `EXC_BAD_ACCESS` in `mlx::core::eval_impl` called from `_PyEval_EvalFrameDefault`. Reports `voicebox-server-2026-11-14-005102/005104.ips`. |
+| 11-14 21:37:15/16 | `SIGABRT` | 38509 (launcher), 38531 (worker), parent voicebox 38478 | — | launch 16:16:41, dead 21:37:15 during the VA-SOAK-006 run | Worker report `voicebox-server-2026-11-14-213716.ips` carries the `mlx::core::gpu::check_error` / `terminate` symbols — same abort signature as 11-13. Footprint had climbed ~5.6 → ~9.0 GB over the soak's generations before the abort. |
 
-Reports live in `~/Library/Logs/DiagnosticReports/`. The 08:57 process had been up for days, so this is not only a startup out-of-memory failure.
+Reports live in `~/Library/Logs/DiagnosticReports/`. The 08:57 process had been up for days, so this is not only a startup out-of-memory failure. The 21:37 crash is the first measured crash under repeated TTS load with the Flash-Next engine resident: the abort path is a Metal command-buffer error surfaced as an uncaught C++ exception (`check_error` → `terminate` → `abort`), and the two `eval_impl`/`MetalAllocator::malloc` segfaults are the same GPU allocation failure surfacing as a bad dereference instead of an exception. Confirming the trigger (footprint growth per generation under ~62 GiB system pressure) requires the owner to reopen VoiceBox and instrument a live reload.
+
+Upstream, both signatures are known and unfixed: MLX throws from the Metal completion handler and is explicitly not exception-safe (ml-explore/mlx #3224, merged into the umbrella #2670; same throw-from-handler bug in mlx-swift #407); the exception's cause is command-buffer "Insufficient Memory" (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) after wired/Metal allocations grow past what the machine has (waybarrios/vllm-mlx #442, where RSS underreports the true wired footprint — matching our 11 MB of 5,656 MB unload result). Reporter-documented mitigations: `MLX_BUFFER_CACHE_LIMIT`, KV/context caps, lower concurrency, and never running two Metal processes near the unified-memory ceiling. On our side the guardian tiers are the implemented version of that last rule. Full evidence with VERIFIED/INFERENCE split: `docs/research/mlx-metal-abort-under-memory-pressure.md`.
 
 ## Keep-running sentinel
 

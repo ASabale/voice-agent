@@ -46,7 +46,48 @@ a recovery, or a retry timer that never terminates were all untested.
 
 ## Probe evidence
 
-SEE_EVIDENCE
+Run 2026-11-14 21:37 UTC (`node --experimental-strip-types .local/voice-agent/probes/recovery_cycle_probe.mjs`, mock on 17990, `OMP_VOICEBOX_PROFILE=test-voice`):
+
+```
+t=2009ms  refused /profiles           (outage 1; first call, profile not cached)
+t=7014ms  refused /profiles           (refusal hold tick)
+t=12017ms refused /profiles
+t=17019ms refused /profiles
+t=22029ms 200 A one.                  (recovery 1: held reply replays oldest-first)
+t=23169ms 200 A two.
+t=24252ms 200 A three.
+t=25336ms 200 B one.                  (reply B enqueued at t=22000 during recovery,
+t=26418ms 200 B two.                   held behind nothing — queue already drained)
+t=27502ms 200 B three.
+t=42004ms refused /generate/stream    (outage 2: socket destroyed mid-request)
+t=47007ms refused /generate/stream
+t=52010ms refused /generate/stream
+t=57012ms refused /generate/stream
+t=62014ms 200 C one.                  (recovery 2)
+t=63114ms 500 C two.                  (half-healthy service; C three. waits behind it)
+t=68116ms 200 C two.                  (next 5 s tick)
+t=69216ms 200 C three.
+t=70297ms 200 D one.
+t=71381ms 200 D two.
+
+tmp files left: 0
+rss delta: -8.4 MB
+deferred=0 expired=0
+spoken="A one. A two. A three. B one. B two. B three. C one. C two. C three. D one. D two."
+RESULT PASS (all four replies spoken in order, queue drained; order=true)
+```
+
+Process exit code 0 without any forced exit: the deferred-retry timer and all
+handles terminated on their own, which is the timer-leak assertion. Unit run
+the same day: `tests/voicebox-refusal.test.ts` 22 passed; full Node suite 104
+passed; Python 256 passed.
+
+Probe debugging, worth recording: the first three runs failed for probe-side
+reasons, not product reasons — a WAV header with `blockAlign`/`bitsPerSample`
+swapped (mock audio rejected by `wavReference`, everything held), a
+`const ok = ok && ...` self-shadow in the restart helper, and a "first 200
+count" test that made `C two.` 500 on every attempt. The mock's own request
+log was what exposed each of these.
 
 ## Limits
 

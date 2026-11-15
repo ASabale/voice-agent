@@ -767,7 +767,9 @@ function logSpeech(event: string, text: string, extra: Record<string, unknown> =
   }
 }
 
-async function generate(
+// Exported so the memory-deferral contract (waitForHeadroom gating the HTTP
+// call) is testable against a mock VoiceBox without re-implementing generate.
+export async function generate(
   text: string,
   epoch: number,
 ): Promise<GenResult> {

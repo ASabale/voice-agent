@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import queue
 import sys
 from pathlib import Path
 
@@ -2823,7 +2824,7 @@ def test_closing_partial_posts_six_loud_frames_and_not_a_short_chunk(monkeypatch
             self.answer = answer
             self.prompts: list[str] = []
 
-        def put(self, item: dict, timeout: float | None = None) -> None:
+        def put_nowait(self, item: dict) -> None:
             self.prompts.append(item["prompt"])
             if self.answer is None:
                 raise RuntimeError("worker down")
@@ -2861,6 +2862,24 @@ def test_closing_partial_posts_six_loud_frames_and_not_a_short_chunk(monkeypatch
     assert posts == [{"text": "hello there"}]
     assert ready.partial_shown == "hello there"
     assert ready.partial_sent_frames == 6
+
+    # A partial already in flight must not stall the frame consumer.
+    busy = frames(6, 400)
+    busy.whisper_pending = {"kind": "partial", "slot": queue.Queue(maxsize=1)}
+    busy_jobs = Jobs("hello there")
+    busy.show_closing_partial(busy_jobs)  # type: ignore[arg-type]
+    assert busy_jobs.prompts == []
+    assert len(posts) == 1
+
+    # A free worker that never answers must return within the bound, without
+    # leaving a pending slot that blocks later jobs.
+    monkeypatch.setattr(controller, "CLOSING_PARTIAL_WAIT_SECONDS", 0.2)
+    slow = frames(6, 400)
+    slow_jobs: queue.Queue = queue.Queue(maxsize=1)
+    slow.show_closing_partial(slow_jobs)  # type: ignore[arg-type]
+    assert not slow_jobs.empty()  # the job reached the worker; nobody waits on it
+    assert slow.whisper_pending is None
+    assert slow.partial_sent_frames == 0
 
     blank = frames(6, 400)
     blank.show_closing_partial(Jobs("   "))  # type: ignore[arg-type]
