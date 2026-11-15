@@ -1,0 +1,181 @@
+"""The PID-file flock is the only thing serializing controller starts.
+
+VA-OPS-001: the controller has no supervisor, and any future crash-recovery
+unit (launchd KeepAlive, a second `start` while a daemon is alive) can only be
+safe if a second process can never get past `_open_pid_lock` while the daemon
+holds it, and can get past it the moment the daemon dies — even uncleanly.
+The daemon holds the flock for its whole life (`cmd_start_bg` passes the locked
+fd to the child via `pass_fds`); the kernel releases it when the holder exits.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_PATH = Path(__file__).resolve().parents[1] / "bin" / "omp-voice-controller"
+_loader = importlib.machinery.SourceFileLoader("omp_voice_controller_lock", str(_PATH))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+assert _spec and _spec.loader
+controller = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = controller
+_spec.loader.exec_module(controller)
+
+HOLDER_CODE = (
+    "import fcntl, sys, time\n"
+    "handle = open(sys.argv[1], 'a+', encoding='utf-8')\n"
+    "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
+    "time.sleep(30)\n"
+)
+INHERIT_CODE = (
+    "import os, time\n"
+    "handle = os.fdopen(int(os.environ['OMP_VOICE_PID_LOCK_FD']), 'a+')\n"
+    "handle.flush()\n"
+    "time.sleep(30)\n"
+)
+
+_ARGS = argparse.Namespace(
+    wake_word="hey_jarvis",
+    wake_threshold=0.5,
+    pause_seconds=5.0,
+    idle_timeout=15.0,
+)
+
+
+class _PointedState:
+    """Point the controller's state paths at a temp directory for one test."""
+
+    def __init__(self, tmp: Path) -> None:
+        self.tmp = tmp
+        self.saved = (controller.STATE_DIR, controller.PID_FILE, controller.LOG_FILE,
+                      controller.START_SPAWN_WAIT_SECONDS)
+
+    def __enter__(self) -> Path:
+        controller.STATE_DIR = self.tmp
+        controller.PID_FILE = self.tmp / "controller.pid"
+        controller.LOG_FILE = self.tmp / "controller.log"
+        controller.START_SPAWN_WAIT_SECONDS = 0
+        return self.tmp
+
+    def __exit__(self, *exc: object) -> None:
+        controller.STATE_DIR, controller.PID_FILE, controller.LOG_FILE, \
+            controller.START_SPAWN_WAIT_SECONDS = self.saved
+
+
+def _hold_lock(pid_file: Path) -> subprocess.Popen:
+    proc = subprocess.Popen([sys.executable, "-c", HOLDER_CODE, str(pid_file)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if controller._open_pid_lock(block=False) is None:
+            return proc
+        time.sleep(0.05)
+    proc.kill()
+    proc.wait()
+    raise AssertionError("holder subprocess never acquired the lock")
+
+
+def _wait_for_release(pid_file: Path, released: bool, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        handle = controller._open_pid_lock(block=False)
+        if handle is not None:
+            handle.close()
+            if released:
+                return True
+        else:
+            if not released:
+                return True
+        time.sleep(0.05)
+    return False
+
+
+class _SpawnRecorder:
+    """Record what `cmd_start_bg` would spawn without touching the microphone."""
+
+    def __init__(self) -> None:
+        self.argvs = []
+
+    def Popen(self, cmd, **kwargs):  # noqa: N802 - mirrors subprocess.Popen
+        self.argvs.append(cmd)
+
+        class _Fake:
+            pid = 999999
+
+        return _Fake()
+
+
+def test_a_second_start_refuses_while_the_daemon_holds_the_lock(tmp_path, capsys, monkeypatch):
+    with _PointedState(tmp_path) as state:
+        holder = _hold_lock(state / "controller.pid")
+        recorder = _SpawnRecorder()
+        monkeypatch.setattr(controller.subprocess, "Popen", recorder.Popen)
+        try:
+            assert controller.cmd_start_bg(_ARGS) == 0
+            out = capsys.readouterr().out
+            assert "already running" in out
+            assert recorder.argvs == [], "a held lock must never spawn a second mic owner"
+        finally:
+            holder.kill()
+            holder.wait()
+
+
+def test_a_crashed_daemon_releases_the_lock_and_the_stale_pid_is_ignored(tmp_path, capsys, monkeypatch):
+    """SIGKILL releases the flock at the kernel level; the stale pid in the
+    file must not stop a restart (the `os.kill(pid, 0)` probe raises OSError)."""
+    with _PointedState(tmp_path) as state:
+        pid_file = state / "controller.pid"
+        holder = _hold_lock(pid_file)
+        holder.kill()
+        holder.wait()
+        assert _wait_for_release(pid_file, released=True), "kernel did not release the flock"
+        pid_file.write_text(str(holder.pid), encoding="utf-8")  # stale, dead pid
+        recorder = _SpawnRecorder()
+        monkeypatch.setattr(controller.subprocess, "Popen", recorder.Popen)
+        assert controller.cmd_start_bg(_ARGS) == 0
+        out = capsys.readouterr().out
+        assert "Started" in out
+        assert len(recorder.argvs) == 1 and "run" in recorder.argvs[0]
+        assert pid_file.exists()
+
+
+def test_the_spawned_daemon_inherits_the_lock_so_starts_stay_serialized(tmp_path):
+    """The daemon itself holds the flock via the inherited fd; while it lives,
+    every probe must be refused, and once it dies the probe must succeed."""
+    with _PointedState(tmp_path) as state:
+        pid_file = state / "controller.pid"
+        probe = controller._open_pid_lock(block=False)
+        assert probe is not None
+        child = subprocess.Popen(
+            [sys.executable, "-c", INHERIT_CODE],
+            pass_fds=(probe.fileno(),),
+            env={**os.environ, "OMP_VOICE_PID_LOCK_FD": str(probe.fileno())},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        probe.close()
+        try:
+            assert _wait_for_release(pid_file, released=False), "child did not take over the lock"
+            child.kill()
+            child.wait()
+            assert _wait_for_release(pid_file, released=True), "lock stuck after child death"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+def test_stop_on_a_dead_pid_file_leaves_no_stale_state(tmp_path, capsys):
+    with _PointedState(tmp_path) as state:
+        pid_file = state / "controller.pid"
+        pid_file.write_text("999999999", encoding="utf-8")
+        assert controller.cmd_stop() == 0
+        assert "not running" in capsys.readouterr().out.lower()
+        assert not pid_file.exists()
+
+
+

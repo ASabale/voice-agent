@@ -137,6 +137,11 @@ KILL_RETRY_SECONDS = 0.25
 KILL_RETRY_COUNT = 8
 OSASKA_PROBE_TIMEOUT_SECONDS = 1.0
 MIC_FRAME_WAIT_CAP_SECONDS = 0.5
+# The flush path waits on the Whisper worker synchronously; these bounds keep
+# that wait inside the mic queue buffer (MIC_QUEUE_BLOCKS, below) so frames
+# arriving during the stall are never dropped.
+CLOSING_PARTIAL_WAIT_SECONDS = 6.0
+LOCAL_FALLBACK_WAIT_SECONDS = 12.0
 WATCH_POLL_SECONDS = 0.4
 STRATA_RETRY_SECONDS = 5.0
 START_SPAWN_WAIT_SECONDS = 1.2
@@ -713,33 +718,44 @@ def process_echo_block(processor, mic: np.ndarray, reverse: np.ndarray) -> np.nd
 _aec_mic_energy = 0.0
 _aec_clean_energy = 0.0
 _aec_blocks = 0
+_aec_guard_blocks = 0
 
 
-def _aec_observe(mic: np.ndarray, cleaned: np.ndarray, reverse: np.ndarray) -> None:
-    """Accumulate echo energy for the residual metric. Silent references are skipped."""
-    global _aec_mic_energy, _aec_clean_energy, _aec_blocks
+def _aec_observe(mic: np.ndarray, cleaned: np.ndarray, reverse: np.ndarray, guarded: bool = False) -> None:
+    """Accumulate echo energy for the residual metric. Silent references are skipped.
+
+    `guarded` marks a block the guard returned raw: the canceller's own fit was
+    rejected, so that block contributes a 1.0 ratio and drags the window toward
+    0 dB no matter how well the filter cancels the rest.
+    """
+    global _aec_mic_energy, _aec_clean_energy, _aec_blocks, _aec_guard_blocks
     if not reverse.any():
         return
     # int16 squared overflows in 16-bit; widen before summing.
     _aec_mic_energy += float(np.dot(mic.astype(np.int64), mic.astype(np.int64)))
     _aec_clean_energy += float(np.dot(cleaned.astype(np.int64), cleaned.astype(np.int64)))
     _aec_blocks += 1
+    if guarded:
+        _aec_guard_blocks += 1
 
 
 def aec_window_fields() -> dict:
     """Rolling residual echo in dB for the blocks since the last read, then reset.
 
     Negative means the echo got smaller. A canceller that only adapts still
-    reports the honest tail, not the best block.
+    reports the honest tail, not the best block. `aec_guard_blocks` separates the
+    blocks the guard returned raw from the blocks the filter actually processed.
     """
-    global _aec_mic_energy, _aec_clean_energy, _aec_blocks
+    global _aec_mic_energy, _aec_clean_energy, _aec_blocks, _aec_guard_blocks
     fields = {}
     if _aec_blocks and _aec_mic_energy > 0:
         ratio = math.sqrt(_aec_clean_energy / _aec_mic_energy)
         fields["aec_echo_db"] = round(20 * math.log10(ratio), 1) if ratio > 0 else -120.0
         fields["aec_blocks"] = _aec_blocks
+        fields["aec_guard_blocks"] = _aec_guard_blocks
     _aec_mic_energy = _aec_clean_energy = 0.0
     _aec_blocks = 0
+    _aec_guard_blocks = 0
     return fields
 
 
@@ -860,7 +876,7 @@ def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) ->
         # A fit that crushed the block removed energy the render reference
         # cannot explain: that is the person, not the echo. Keep the raw
         # block so the barge gate can still hear the interruption.
-        _aec_observe(mic, mic, reverse)
+        _aec_observe(mic, mic, reverse, guarded=True)
         return mic
     _aec_observe(mic, cleaned, reverse)
     return cleaned
@@ -884,6 +900,7 @@ _render_pcm = b""
 _render_samples: np.ndarray | None = None
 _render_fields = {"render_connected": False}
 _render_file_key: tuple | None = None
+_render_parsed: dict | None = None
 _render_hold_until = 0.0
 _render_paused_at: float | None = None
 _render_paused_seconds = 0.0
@@ -2948,10 +2965,15 @@ class MicState:
 
         Live partials are kicked only while speech frames are still arriving.
         The last word often lands in the silence that starts the flush, so
-        the field would otherwise keep the older prefix.
+        the field would otherwise keep the older prefix. This runs on the
+        frame-consumer thread: it never blocks on a Whisper job that is
+        already in flight, and the wait for a free worker is bounded.
         """
         spoken = len(self.dict_speech_frames)
         if spoken < 6 or spoken - self.partial_sent_frames < 4:
+            return
+        if self.whisper_pending is not None:
+            log("whisper busy; skipped closing partial")
             return
         window = self.dict_speech_frames[-75:]
         try:
@@ -2960,8 +2982,8 @@ class MicState:
                 return
             audio_f32 = clip_for_whisper(audio_i16.astype(np.float32) / 32768.0, 5.0)
             slot: queue.Queue = queue.Queue(maxsize=1)
-            jobs.put({"audio": audio_f32, "prompt": "A person dictating a sentence.", "slot": slot}, timeout=8)
-            heard = str(slot.get(timeout=8))
+            jobs.put_nowait({"audio": audio_f32, "prompt": "A person dictating a sentence.", "slot": slot})
+            heard = str(slot.get(timeout=CLOSING_PARTIAL_WAIT_SECONDS))
         except Exception:
             return
         if not heard.strip():
@@ -2997,18 +3019,26 @@ class MicState:
         return kind, text
 
     def transcribe_local_fallback(self, jobs: queue.Queue, frames_list: list[np.ndarray]) -> str:
-        """If Handy failed to persist a row (e.g. Escape/fn interference), transcribe our buffered PCM directly."""
+        """If Handy failed to persist a row (e.g. Escape/fn interference), transcribe our buffered PCM directly.
+
+        The frame-consumer thread must not stall unbounded: if a Whisper job
+        is in flight we skip the fallback rather than queue behind it.
+        """
         if len(frames_list) < 6:
+            return ""
+        if self.whisper_pending is not None:
+            log("whisper busy; local fallback skipped")
             return ""
         try:
             audio_i16 = np.concatenate(frames_list)
             if float(np.max(np.abs(audio_i16))) < 350.0:
                 return ""
             audio_f32 = clip_for_whisper(audio_i16.astype(np.float32) / 32768.0, 5.0)
-            # The worker owns the model. Wait here only; the mic loop never blocks on whisper.
+            # The worker owns the model. The wait is bounded so a slow worker
+            # cannot stall the mic consumer past the queue buffer.
             slot: queue.Queue = queue.Queue(maxsize=1)
-            jobs.put({"audio": audio_f32, "prompt": "send prompt, prompt this, send that, submit prompt, scratch that, undo that, clear draft, pause listening.", "slot": slot})
-            return str(slot.get(timeout=30))
+            jobs.put_nowait({"audio": audio_f32, "prompt": "send prompt, prompt this, send that, submit prompt, scratch that, undo that, clear draft, pause listening.", "slot": slot})
+            return str(slot.get(timeout=LOCAL_FALLBACK_WAIT_SECONDS))
         except Exception:
             return ""
 
@@ -3725,6 +3755,11 @@ class MicState:
 
 MIC_RATE = 16000
 MIC_CHUNK = 1280
+# 128 blocks = 10.24 s of audio (about 328 KB). The frame consumer stalls
+# during flush (Handy ASR wait up to 2.2 s, the 0.26 s paste settle, dispatch,
+# and one bounded Whisper round-trip). A 32-block buffer (2.56 s) overflowed
+# during the VA-SOAK-006 run-3 dictation and dropped 5 frames.
+MIC_QUEUE_BLOCKS = 128
 
 
 class SoundDeviceAudioSource:
@@ -3735,7 +3770,7 @@ class SoundDeviceAudioSource:
     def __init__(self, sample_rate: int = MIC_RATE, chunk_samples: int = MIC_CHUNK) -> None:
         self.sample_rate = sample_rate
         self.chunk_samples = chunk_samples
-        self.frames: queue.Queue = queue.Queue(maxsize=32)
+        self.frames: queue.Queue = queue.Queue(maxsize=MIC_QUEUE_BLOCKS)
         self._stream = None
 
     def __enter__(self) -> "SoundDeviceAudioSource":

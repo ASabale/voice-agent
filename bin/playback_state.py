@@ -12,6 +12,23 @@ Keeping the decision rules here is what makes the vectors in
 from __future__ import annotations
 
 PLAYBACK_LEASE_SECONDS = 60.0
+# An orphan afplay (writer dead, player alive) is trusted while its clip is
+# still running: started_at plus the reference clip's real-time duration, plus
+# slack for spawn lag. Without a reference, the flat 60 s cap still applies.
+ORPHAN_LEASE_SLACK_SECONDS = 5.0
+
+
+def orphan_lease_expiry(slot: dict) -> float:
+    """When an orphaned afplay's echo can be considered finished."""
+    try:
+        started = float(slot.get("started_at") or 0)
+    except (TypeError, ValueError):
+        started = 0.0
+    ref = slot_reference(slot)
+    if ref is None:
+        return started + PLAYBACK_LEASE_SECONDS
+    duration = ref["frames"] / ref["sample_rate"] / playback_rate_of(slot)
+    return started + duration + ORPHAN_LEASE_SLACK_SECONDS
 
 
 def slot_reference(slot: dict) -> dict | None:
@@ -114,11 +131,7 @@ def slot_is_speaking(slot: dict, now: float, pid_alive_fn, tail: float) -> bool:
         if not pid_alive_fn(afplay):
             return False
         if writer is not None and not pid_alive_fn(writer):
-            try:
-                started = float(slot.get("started_at") or 0)
-            except (TypeError, ValueError):
-                started = 0.0
-            return now < started + PLAYBACK_LEASE_SECONDS
+            return now < orphan_lease_expiry(slot)
         return True
     if writer is None or not pid_alive_fn(writer):
         return False

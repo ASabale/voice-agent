@@ -28,6 +28,6 @@ A projection `{"playing": true, "started_at": 1000.0, "pid": <pid of a reaped `t
 
 ## Limitations
 
-- The running guardian instance (pid 40203, started 06:08 UTC) predates this edit; the check is not live until the guardian is restarted — a human decision, since the watchdog is the safety net.
+- Live now: watcher pids 38389/38402 started 2026-11-14 16:16:29 local, after the guardian file's last edit (mtime 14:04 local) — the running instances carry the tested code. Note: **two** watchers run concurrently (Python 3.14 and Python 3.9 launches), each with its own strike counter and 60 s unload rate limit; a duplicate unload POST is harmless (`freedBytes: 0`), but the pair is worth consolidating. Root cause found 2026-11-15: 38389 was started manually, 38402 by launchd's KeepAlive unit. `_claim_watcher_slot()` now refuses a second instance at start (see `VA-MEM-007-single-watcher.md`); the running pair predates the guard and is only consolidated when 38389 is retired.
 - Cross-uid processes can return EPERM for `kill(pid, 0)`; afplay is always uid-matched, so this is not a practical miss here.
-- End-to-end unload relief in GiB is still unmeasured (VoiceBox 17493 refused).
+- End-to-end unload relief measured once: 11 MB of 5,656 MB (2026-11-14 21:30 UTC, VA-MEM-001) — effectively nil; 17493 has had no listener since the 21:37 SIGABRT.

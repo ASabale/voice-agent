@@ -27,7 +27,7 @@
 16. **Cleanup:** None.
 17. **Known failure modes:** The retry timer is a single `setTimeout`; tests call `stopDeferredRetry()` to keep the process from lingering. Real TTS after a 5 s deferral may arrive after the user has moved on; the epoch guard drops it then.
 18. **Automation status:** LEVEL 1.
-19. **Known limitations:** No real `/generate/stream` call and no real playback are exercised. Live unload relief from VoiceBox is still unmeasured (see VA-MEM-001).
+19. **Known limitations:** No real `/generate/stream` call and no real playback are exercised. Live unload relief was measured once at 11 MB of 5,656 MB (2026-11-14 21:30 UTC, see VA-MEM-001); the sidecar has been down since the 21:37 SIGABRT.
 20. **Last verified:** 2026-11-14 10:42 UTC, 13 passed.
 
 ## History

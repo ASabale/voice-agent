@@ -3,6 +3,25 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 export const PLAYBACK_LEASE_SECONDS = 60;
+export const ORPHAN_LEASE_SLACK_SECONDS = 5;
+
+/** When an orphan afplay's (writer dead, player alive) echo can be considered
+finished: the reference clip's real-time duration plus spawn slack. Without a
+reference the flat 60 s cap still applies. */
+export function orphanLeaseExpiry(slot: object | null | undefined): number {
+  if (!slot || typeof slot !== "object") return 0;
+  const row = slot as Record<string, unknown>;
+  const started = typeof row.started_at === "number" && Number.isFinite(row.started_at) ? row.started_at : 0;
+  const ref = row.reference as WavReference | undefined;
+  if (!ref || typeof ref.frames !== "number" || ref.frames <= 0 || typeof ref.sample_rate !== "number" || ref.sample_rate < 8000) {
+    return started + PLAYBACK_LEASE_SECONDS;
+  }
+  let rate = 1;
+  if (typeof row.playback_rate === "number" && Number.isFinite(row.playback_rate) && row.playback_rate >= 0.7 && row.playback_rate <= 2) {
+    rate = row.playback_rate;
+  }
+  return started + ref.frames / ref.sample_rate / rate + ORPHAN_LEASE_SLACK_SECONDS;
+}
 
 export type PlaybackReason = "begin" | "end";
 
@@ -134,8 +153,7 @@ export function slotIsSpeaking(
   if (afplay !== null) {
     if (!alive(afplay)) return false;
     if (writer !== null && !alive(writer)) {
-      const started = typeof row.started_at === "number" ? row.started_at : 0;
-      return now < started + PLAYBACK_LEASE_SECONDS;
+      return now < orphanLeaseExpiry(slot);
     }
     return true;
   }

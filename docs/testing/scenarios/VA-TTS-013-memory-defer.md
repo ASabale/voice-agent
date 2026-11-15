@@ -21,7 +21,7 @@
 16. **Cleanup:** None. The temp directory is removed by the test.
 17. **Known failure modes:** When headroom does not return within the 8 s wait, `generate` returns `{deferred: true}` and the sentence is held in `session.deferred` for a retry every 5 s while the reply is open; it is dropped only when a new reply bumps the speech epoch or the 120 s expiry passes (see VA-TTS-014). The deferral adds up to 8 s of delay before the first held utterance.
 18. **Automation status:** LEVEL 1.
-19. **Known limitations:** No live VoiceBox unload was observed: port 17493 had no listener at verification time, so `shed_voice` returns `voice relief unavailable` and the unload itself is unmeasured.
+19. **Known limitations:** The readings in this test are synthetic. The live unload was measured once on 2026-11-14 21:30 UTC (listener pid 38531): `POST /models/unload` freed 11 MB of a 5,656 MB footprint — the MLX arena stays allocated (see VA-MEM-001). Since the 21:37 SIGABRT there is no listener, so the deferral gate's value against a real crash window is not yet demonstrated.
 20. **Last verified:** 2026-11-14 06:15 UTC. `node --test tests/` passed 68.
 
 ## History

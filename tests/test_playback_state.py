@@ -588,6 +588,49 @@ def test_a_live_session_slot_is_never_pruned(tmp_path: Path, monkeypatch) -> Non
     assert (slot_dir / "11.json").exists()
 
 
+def test_an_orphaned_afplay_is_kept_then_pruned_when_it_exits(tmp_path: Path, monkeypatch) -> None:
+    """The VA-PLAY-002 live shape: the session dies mid-clip, its afplay keeps
+    playing. Echo is real while the orphan runs, so the slot stays; once the
+    afplay exits, the dead session's slot is pruned and the projection re-derives."""
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "TTS_STATE_FILE", tmp_path / "tts-playing.json")
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: pid == 5)
+    slot_dir = tmp_path / "tts-playing"
+    slot_dir.mkdir()
+    (slot_dir / "11.json").write_text(
+        json.dumps(
+            {"playing": True, "afplay_pid": 5, "writer_pid": 11, "started_at": time.time() - 3.0}
+        ),
+        encoding="utf-8",
+    )
+    assert len(controller._read_playback_slots()) == 1
+    assert (slot_dir / "11.json").exists()
+    assert controller.is_voicebox_speaking() is True
+    monkeypatch.setattr(controller, "pid_alive", lambda pid: False)
+    assert controller._read_playback_slots() == []
+    assert not (slot_dir / "11.json").exists()
+    projection = json.loads((tmp_path / "tts-playing.json").read_text(encoding="utf-8"))
+    assert projection == {"playing": False}
+
+
+def test_orphan_lease_tracks_the_clip_length_not_the_flat_cap() -> None:
+    """VA-SOAK-004: a session that died mid-clip must not lose its render
+    reference while the orphan afplay is physically still playing a clip
+    longer than the 60 s flat cap."""
+    now = 1000.0
+    ref = {"sample_rate": 24000, "channels": 1, "frames": 24000 * 120, "wav": "/tmp/long.wav"}
+    alive = lambda pid: pid == 5
+    mid = {"playing": True, "afplay_pid": 5, "writer_pid": 11, "started_at": now - 70, "reference": ref}
+    assert controller.slot_is_speaking(mid, now, alive, 0.0) is True  # 70 s into a 120 s clip
+    after = dict(mid, started_at=now - 126)  # clip ended 1 s ago, slack is 5 s
+    assert controller.slot_is_speaking(after, now, alive, 0.0) is False
+    fast = dict(mid, started_at=now - 70, playback_rate=2.0)  # 120 s clip at 2x is 60 s real time
+    assert controller.slot_is_speaking(fast, now, alive, 0.0) is False
+    bare = {"playing": True, "afplay_pid": 5, "writer_pid": 11, "started_at": now - 70}
+    assert controller.slot_is_speaking(bare, now, alive, 0.0) is False  # no reference: the 60 s cap
+    assert controller.slot_is_speaking(dict(bare, started_at=now - 30), now, alive, 0.0) is True
+
+
 def test_project_aggregate_matches_the_legacy_projection_shape() -> None:
     live = {"playing": True, "started_at": 10.0, "afplay_pid": 7}
     ended = {"playing": False, "ended_at": 5.0}
