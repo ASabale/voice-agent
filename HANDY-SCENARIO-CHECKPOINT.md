@@ -49,6 +49,21 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
 
+## Iteration log — 2026-11-16 05:12 UTC (RALF-3 iter 8: wake-over-echo physical probe — PASS after root-causing a design mismatch — VA-PHYS-002)
+
+- Scenario: Level 4 physical probe `scripts/run_wake_over_echo_probe.py`: isolated omp session replies (8.8–11.6 s clips), wake fixture `hey-jarvis-say.wav` played through the speakers mid-reply, then the same fixture the instant afplay exits.
+- First experiment FAILed with zero wake lines *during* playback. Root cause was not AEC: `handle_idle_frame` line 3471 deliberately `oww.reset()`s the wake spotter while `tts_active` ("While VoiceBox is playing, ignore the wake word"). The probe asserted behavior the product design forbids.
+- Rewritten as a two-phase contract. Result PASS (controller 251): phase A — zero wake lines despite a real "hey jarvis" recording through the speakers during playback (design suppression + echo hold); phase B — `[2026-11-16 00:03:40] Wake triggered (whisper heard 'Jarvis.') -> entering DICTATING` immediately after playback drained: the AEC tail does not eat a genuine wake. Controller survived, returned to IDLE via its own 15 s timeout. Evidence `.local/voice-agent/runs/VA-PHYS-002-WAKE-OVER-ECHO.json`.
+- Doc: `docs/testing/scenarios/VA-PHYS-002-wake-over-echo.md` + INDEX row.
+- next: clean soak PASS (run 8) with the new warmup gate; §5 conversation-quality matrix.
+
+## Iteration log — 2026-11-16 04:47 UTC (RALF-3 iter 7b: soak run 7 CONTAMINATED again; probe gains a warmup window — VA-SOAK-006)
+
+- Scenario: six conversations on the restarted controller (pid 251). Result CONTAMINATED, exit 3: every controller invariant PASS — 24/24 turns played and attributed, wake 0, speech_failed 0, mic deltas 0/0, slot dir 1, IDLE final, RSS medians 162.2 → 150.4 MB (trend clear), VoiceBox steady 3046–3103 MB after a cycle-1 8853 MB load spike. Trigger: 6 foreign `generated` lines — the root loop session's own voiced replies landed inside the measurement window.
+- Side evidence captured live: VA-AUD-004 confirmed (0 mic drops across 24 flush-heavy turns on the restarted daemon) and VA-LOG-003 rotation live (controller.log 1600 → 4774 B).
+- Fix (no gate weakened): the probe now sleeps `SOAK_WARMUP_S` (default 90 s) before the baseline snapshot and the contamination scan start, so the launching session's spawn reply plays before the window opens; the launching agent must send no further replies until the verdict. Run 8 will use this.
+- next: run 8 in a silent-agent window; then §5 matrix.
+
 ## Iteration log — 2026-11-16 04:45 UTC (RALF-3 iter 7a: CI red root-caused — dictating handler mixed two clocks — VA-CI-002)
 
 - Scenario: CI run 43804755039 on `f954713` failed 6 `test_handy_control.py` tests with `AssertionError: handy_cancel` while the identical local suite passed 314/314.

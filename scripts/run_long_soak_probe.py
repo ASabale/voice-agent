@@ -31,6 +31,7 @@ footprint stays within VOICEBOX_GROWTH_LIMIT_MB of its baseline.
 
 from __future__ import annotations
 import json
+import os
 import re
 import subprocess
 import sys
@@ -261,6 +262,12 @@ def main() -> int:
     if not pipe.voicebox_healthy():
         print("VoiceBox is not healthy. Not launching a server.")
         return 2
+    # The launching agent session speaks its spawn reply within the first minute
+    # (runs 6/7 were contaminated by exactly those lines). Measure only after
+    # that reply has played so the window is a genuinely quiet one.
+    warmup = int(os.environ.get("SOAK_WARMUP_S", "90"))
+    print(f"warmup: waiting {warmup}s for the launching session's reply to finish", flush=True)
+    time.sleep(warmup)
     before = soak.live_status()
     controller_pid = before.get("pid")
     if not isinstance(controller_pid, int) or not soak.pid_alive(controller_pid):
