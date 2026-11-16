@@ -5,6 +5,7 @@ import importlib.util
 import queue
 import sys
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -434,6 +435,66 @@ def test_an_older_history_read_does_not_replace_the_consumed_flush_row(monkeypat
     mic.handle_dictating_frame(frame, now + 0.1, 0.0, 0.0, False, _Reset(), _Reset(), 5.0, 15.0, queue.Queue())
     assert posted == ["Thanks."]
     assert mic.last_history_id == 8
+    assert mic.state == "DICTATING"
+
+
+def test_chunk_restart_timing_follows_the_frame_clock_not_wall_monotonic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VA-CI-002: on a fresh CI runner `time.monotonic()` is ~85 s of uptime, far
+    from the synthetic frame timeline. If a flush restart resets chunk timing
+    against a clock the caller cannot control, the next frame trips the 15 s idle
+    timeout and cancels a dictation that just succeeded."""
+    _install(monkeypatch, running=True)
+    posted: list[str] = []
+    latest = {"id": 0, "text": ""}
+
+    def dispatch(text: str) -> dict[str, str]:
+        posted.append(text)
+        return {"action": "appended", "draft": text}
+
+    monkeypatch.setattr(
+        controller,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: 85.0, sleep=lambda _s: None, strftime=time.strftime),
+    )
+    monkeypatch.setattr(controller.sqlite3, "connect", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("history.db")))
+    monkeypatch.setattr(controller, "dispatch_transcript", dispatch)
+    monkeypatch.setattr(controller, "wait_for_new_history_row", lambda _prev, timeout_sec=2.2: (8, "Thanks."))
+    monkeypatch.setattr(controller, "latest_history_row", lambda: (latest["id"], latest["text"]))
+    monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
+    monkeypatch.setattr(controller, "write_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    monkeypatch.setattr(controller, "handy_start_recording", lambda *_a, **_k: True)
+    for name in (
+        "silence_speech",
+        "stop_playback",
+        "handy_cancel",
+        "pause_tts_clips",
+        "kill_tts_clips",
+        "bridge_request",
+        "fallback_macos_inject",
+    ):
+        monkeypatch.setattr(
+            controller,
+            name,
+            lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)),
+        )
+
+    mic = controller.MicState()
+    mic.state = "DICTATING"
+    mic.last_history_id = 3
+    mic.speech_seen_in_chunk = True
+    now = 100.0
+    mic.chunk_started_at = now
+    mic.last_handy_ui_check = now
+    mic.last_speech_at = now - 10
+    mic.dict_speech_frames = [np.zeros(1280, dtype=np.int16)]
+    frame = np.zeros(1280, dtype=np.int16)
+    mic.handle_dictating_frame(frame, now, 0.0, 0.0, False, _Reset(), _Reset(), 5.0, 15.0, queue.Queue())
+    assert posted == ["Thanks."]
+    assert mic.chunk_started_at == now
+    latest["id"] = 8
+    latest["text"] = "Thanks."
+    mic.handle_dictating_frame(frame, now + 0.1, 0.0, 0.0, False, _Reset(), _Reset(), 5.0, 15.0, queue.Queue())
     assert mic.state == "DICTATING"
 
 

@@ -3742,7 +3742,7 @@ class MicState:
                 self.forget_handy_window()
                 if not handy_file_mode():
                     handy_start_recording()
-                self.chunk_started_at = time.monotonic()
+                self.chunk_started_at = now
                 self.last_speech_at = self.chunk_started_at
                 self.cooldown_until = self.chunk_started_at + 0.25
                 write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
@@ -3853,7 +3853,7 @@ class MicState:
                         self.dict_tail_frames.clear()
                         self.checked_fast_cmd = False
                         self.speech_seen_in_chunk = False
-                        self.chunk_started_at = time.monotonic()
+                        self.chunk_started_at = now
                         self.last_speech_at = self.chunk_started_at
                         self.cooldown_until = self.chunk_started_at + 0.25
                         write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
@@ -3875,7 +3875,7 @@ class MicState:
                         self.dict_tail_frames.clear()
                         self.checked_fast_cmd = False
                         self.speech_seen_in_chunk = False
-                        self.chunk_started_at = time.monotonic()
+                        self.chunk_started_at = now
                         self.last_speech_at = self.chunk_started_at
                         self.cooldown_until = self.chunk_started_at + 0.25
                         write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
