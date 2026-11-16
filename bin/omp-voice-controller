@@ -135,7 +135,15 @@ UNMUTE_SECOND_DELAY_SECONDS = 0.65
 # Duck the machine's output volume while a barge hold is open so the held clip
 # is mostly the person, not the speaker. Off unless OMP_VOICE_DUCK_VOLUME is
 # set (the launchd plist sets 20); the pre-hold gates are calibrated without it.
-DUCK_VOLUME_SET_SECONDS = 1.2
+# Ducking waits for a burst that is both sustained and clearly loud: a cough,
+# a keyboard clatter, or a distant conversation opens the hold but must not
+# flicker the speaker volume. The duck itself ramps in steps instead of one
+# hard jump.
+DUCK_MIN_HOT_FRAMES = 5        # 80 ms frames: ~0.4 s of continuous hot audio
+DUCK_MIN_RMS_FACTOR = 1.5      # duck only above 1.5x the hold gate, not just at it
+DUCK_RAMP_STEPS = 4            # smooth 70 -> 20 over four volume writes
+DUCK_RAMP_STEP_DELAY_SECONDS = 0.05
+DUCK_MAX_STUCK_SECONDS = 8.0   # watchdog: a stuck hold never leaves the speaker ducked
 PASTE_KEY_SETTLE_SECONDS = 0.12
 # Chrome handles the Cmd+V paste asynchronously: restoring the clipboard too
 # soon makes the browser paste the pre-injection clipboard instead. Measured
@@ -1756,6 +1764,17 @@ def output_volume() -> int | None:
         return None
 
 
+def _ramp_output_volume(start_pct: int, target_pct: int) -> None:
+    """Move the output volume in DUCK_RAMP_STEPS writes instead of one jump."""
+    if start_pct == target_pct:
+        return
+    for i in range(1, DUCK_RAMP_STEPS + 1):
+        step_pct = start_pct + (target_pct - start_pct) * i // DUCK_RAMP_STEPS
+        _run_osascript(f"set volume output volume {step_pct}")
+        if i < DUCK_RAMP_STEPS:
+            time.sleep(DUCK_RAMP_STEP_DELAY_SECONDS)
+
+
 def duck_output_volume(state: "MicState") -> None:
     """Lower the system output volume while a barge hold is open.
 
@@ -1766,6 +1785,11 @@ def duck_output_volume(state: "MicState") -> None:
     target = os.environ.get("OMP_VOICE_DUCK_VOLUME", "")
     if not target or state.tts_duck_restore is not None:
         return
+    # A synthetic burst is speaker audio too, so ducking would mute it along
+    # with the reply. Harnesses that interrupt through the speakers write this
+    # marker to keep the burst audible; human barges still duck.
+    if (STATE_DIR / "duck-off").exists():
+        return
     try:
         target_pct = max(0, min(100, int(target)))
     except ValueError:
@@ -1773,8 +1797,9 @@ def duck_output_volume(state: "MicState") -> None:
     current = output_volume()
     if current is None or current <= target_pct:
         return
-    _run_osascript(f"set volume output volume {target_pct}")
+    _ramp_output_volume(current, target_pct)
     state.tts_duck_restore = current
+    state.tts_duck_at = time.monotonic()
     log(f"ducked output volume {current} -> {target_pct}")
     barge_note(state, "duck", from_volume=current, to_volume=target_pct)
 
@@ -1785,7 +1810,12 @@ def restore_output_volume(state: "MicState") -> None:
         return
     previous = state.tts_duck_restore
     state.tts_duck_restore = None
-    _run_osascript(f"set volume output volume {previous}")
+    state.tts_duck_at = None
+    current = output_volume()
+    if current is None or current == previous:
+        _run_osascript(f"set volume output volume {previous}")
+    else:
+        _ramp_output_volume(current, previous)
     log(f"restored output volume {previous}")
     barge_note(state, "duck_restore", to_volume=previous)
 
@@ -3083,6 +3113,7 @@ class MicState:
     tts_barge_quiet: int = 0
     # System output volume captured when a barge hold ducks the speaker.
     tts_duck_restore: int | None = None
+    tts_duck_at: float | None = None
     tts_barge_skip: int = 0
     tts_barge_loud: int = 0
     tts_barge_next: tuple | None = None
@@ -3588,6 +3619,15 @@ class MicState:
                 self.tts_pre_roll.clear()
             just_held = False
             if self.tts_barge_waiting:
+                # Watchdog: a hold stuck on a busy Whisper queue must never
+                # leave the speaker ducked indefinitely. Restoring here lets a
+                # still-loud burst duck again on its next hot frames.
+                if (
+                    self.tts_duck_restore is not None
+                    and self.tts_duck_at is not None
+                    and time.monotonic() - self.tts_duck_at > DUCK_MAX_STUCK_SECONDS
+                ):
+                    restore_output_volume(self)
                 return True
             if user_voice and not self.tts_stop_frames and not self.tts_barge_held:
                 # Do not SIGSTOP the clip here. The words are not known yet, and
@@ -3619,6 +3659,13 @@ class MicState:
                     hot=self.tts_loud_run,
                     frames=len(self.tts_stop_frames),
                 )
+            # Duck only once the burst is sustained and clearly louder than the
+            # bleed gate: a brief environmental sound opens the hold but never
+            # touches the volume.
+            if (
+                self.tts_loud_run >= DUCK_MIN_HOT_FRAMES
+                and rms >= gate * DUCK_MIN_RMS_FACTOR
+            ):
                 duck_output_volume(self)
             keep = False
             if self.tts_barge_held and not just_held:

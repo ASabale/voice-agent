@@ -9,7 +9,13 @@ afplay death, whether the cut text resumes, and whether a follow-up turn
 still plays. The pass verdict is Akshay's, recorded verbatim; the probe only
 supplies the measurements.
 
+With --auto, the wait is replaced by a speaker-played "Hey Jarvis. Stop."
+utterance (say-generated, gain-boosted) so the chain can be measured without
+a human in the room. An auto run NEVER writes a pass verdict: it reports the
+measurements and leaves the verdict field null.
+
 Run: ~/.local/share/omp-voice/venv/bin/python scripts/run_human_barge_probe.py
+     ~/.local/share/omp-voice/venv/bin/python scripts/run_human_barge_probe.py --auto
 """
 
 from __future__ import annotations
@@ -37,6 +43,41 @@ EXPLAIN_PROMPT = (
     "Explain how echo cancellation works in this voice stack, about 250 "
     "words, sentence by sentence."
 )
+# The physical calibration (scripts/barge_whisper_calibration_probe.py) showed
+# a one-word "stop" burst flushes a 3-frame clip tiny.en mishears, while the
+# continuous hold-on phrase tiles into a Whisper-readable clip. The auto proxy
+# uses that phrase because tiny.en must hear it for the stop chain.
+AUTO_UTTERANCE = "Hold on a second. Hold on a second. Hold on a second."
+AUTO_CLIP = ROOT / ".local/voice-agent/runs/human-barge-proxy.wav"
+AUTO_GAIN = 1.47
+DUCK_OFF = Path.home() / ".local/state/omp-voice/duck-off"
+
+
+def make_auto_utterance() -> Path:
+    """Record the proxy interruption so the auto mode has a stable clip.
+
+    `say` --data-format=LEI16@16000 writes AIFF, not WAV: afplay plays it, but
+    the gain pass would corrupt the header. Read it through soundfile.
+    """
+    AUTO_CLIP.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["say", "-o", str(AUTO_CLIP), "--data-format=LEI16@16000", AUTO_UTTERANCE],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        frames, rate = sf.read(str(AUTO_CLIP))
+        frames = frames * AUTO_GAIN
+        peak = float(np.max(np.abs(frames))) or 1.0
+        if peak > 0.999:
+            frames *= 0.999 / peak
+        sf.write(str(AUTO_CLIP), frames, rate)
+    except ImportError:
+        pass
+    return AUTO_CLIP
 
 
 def controller_pid() -> int | None:
@@ -74,11 +115,12 @@ def controller_state() -> str | None:
 
 
 def main() -> int:
+    auto = "--auto" in sys.argv
     if not voicebox_healthy():
         print("VoiceBox not healthy; stop the run.", file=sys.stderr)
         return 1
     proc = record = master = None
-    result: dict = {"started_at": datetime.now(timezone.utc).isoformat()}
+    result: dict = {"started_at": datetime.now(timezone.utc).isoformat(), "mode": "auto" if auto else "human"}
     try:
         proc, record, master = start_omp()
         pid = proc.pid
@@ -100,19 +142,33 @@ def main() -> int:
             return 1
         onset = time.time()
         result["reply_start_epoch"] = onset
-        # Audible go-cue: one marimba hit the instant the reply is live, so the
-        # human knows exactly when to barge without watching a terminal.
-        subprocess.run(
-            ["afplay", "/Applications/Handy.app/Contents/Resources/resources/marimba_start.wav"],
-            capture_output=True, check=False,
-        )
-        print("Reply is playing. Say 'hey jarvis stop' out loud now.", flush=True)
+        if auto:
+            # Keep the burst audible: ducking is the system master volume, so
+            # it would mute the speaker-played proxy along with the reply.
+            DUCK_OFF.write_text("auto-probe\n", encoding="utf-8")
+            result["duck_off"] = True
+            clip = make_auto_utterance()
+            print("Reply is playing. Playing the synthetic hold-on burst now.", flush=True)
+            burst = subprocess.Popen(["afplay", str(clip)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            result["burst_pid"] = burst.pid
+        else:
+            # Audible go-cue: one marimba hit the instant the reply is live, so the
+            # human knows exactly when to barge without watching a terminal.
+            subprocess.run(
+                ["afplay", "/Applications/Handy.app/Contents/Resources/resources/marimba_start.wav"],
+                capture_output=True, check=False,
+            )
+            print("Reply is playing. Say 'hey jarvis stop' out loud now.", flush=True)
         # Wait up to 45 s for a hold+stop chain triggered by the human voice.
         stop_evt = None
         hold_evt = None
         for _ in range(225):
             events = trace_events(onset)
-            stops = [e for e in events if e.get("stage") == "stop_playback" and "stop" in (e.get("text") or "").lower()]
+            stops = [
+                e for e in events
+                if e.get("stage") == "stop_playback"
+                and ("stop" in (e.get("text") or "").lower() or "hold on" in (e.get("text") or "").lower())
+            ]
             if stops:
                 stop_evt = stops[0]
                 holds = [e for e in events if e.get("stage") == "hold" and e["t"] <= stop_evt["t"]]
@@ -146,12 +202,14 @@ def main() -> int:
         result["trace_tail"] = trace_events(onset)
         result["final_state"] = controller_state()
     finally:
+        if DUCK_OFF.exists():
+            DUCK_OFF.unlink()
         if proc is not None:
             try:
                 proc.terminate()
                 proc.wait(timeout=10)
             except Exception:
-                pass
+                proc.kill()
         result["ended_at"] = datetime.now(timezone.utc).isoformat()
         RUN_FILE.write_text(json.dumps(result, indent=2), encoding="utf-8")
         if master is not None:
