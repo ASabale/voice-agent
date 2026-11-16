@@ -23,6 +23,8 @@
   <dict>
     <key>OMP_VOICE_BARGE_TRACE</key>
     <string>1</string>
+    <key>OMP_VOICE_DUCK_VOLUME</key>
+    <string>20</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
