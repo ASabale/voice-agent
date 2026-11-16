@@ -19,6 +19,11 @@
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OMP_VOICE_BARGE_TRACE</key>
+    <string>1</string>
+  </dict>
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>

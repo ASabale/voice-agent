@@ -81,3 +81,14 @@ def test_stop_and_hold_cut_playback_pause_and_resume_do_not(monkeypatch) -> None
     apply("idle_verify", "resume")
     assert len(stops) == 2
     assert resumes == 0
+
+
+def test_barge_phrase_survives_hallucinated_flanking_words() -> None:
+    # Live mic clips mix the burst with reply bleed; Whisper adds filler words
+    # before the phrase. The phrase must still appear verbatim, with nothing
+    # trailing it.
+    assert _barge("Let's get the hold on a second.") is True
+    assert _barge("Okay hold on a sec") is True
+    assert _barge("please hold on") is True
+    assert _barge("hold on then") is False
+    assert _barge("hold on to the reference") is False
