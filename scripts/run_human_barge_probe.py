@@ -100,6 +100,12 @@ def main() -> int:
             return 1
         onset = time.time()
         result["reply_start_epoch"] = onset
+        # Audible go-cue: one marimba hit the instant the reply is live, so the
+        # human knows exactly when to barge without watching a terminal.
+        subprocess.run(
+            ["afplay", "/Applications/Handy.app/Contents/Resources/resources/marimba_start.wav"],
+            capture_output=True, check=False,
+        )
         print("Reply is playing. Say 'hey jarvis stop' out loud now.", flush=True)
         # Wait up to 45 s for a hold+stop chain triggered by the human voice.
         stop_evt = None
