@@ -75,9 +75,13 @@ def test_rotation_keeps_one_backup_and_rotates_again(tmp_path, monkeypatch) -> N
     _run_with_stdout_as(fd, body)
 
 
-def test_foreign_stdout_is_never_rotated(tmp_path, monkeypatch) -> None:
+def test_stdout_redirected_to_another_file_rotates_that_file(tmp_path, monkeypatch) -> None:
+    """The live daemon (PID 90992) has stdout redirected to
+    controller-restart.log, not controller.log. Under the old LOG_FILE-only
+    guard that file grew unrotated past the limit. Rotation must follow the
+    file fd 1 actually writes to, and leave the never-opened LOG_FILE alone."""
     log_file = tmp_path / "controller.log"
-    other = tmp_path / "other.log"
+    other = tmp_path / "controller-restart.log"
     monkeypatch.setattr(controller, "LOG_FILE", log_file)
     monkeypatch.setattr(controller, "LOG_ROTATE_BYTES", 200)
     log_file.write_text("target untouched\n", encoding="utf-8")
@@ -86,11 +90,48 @@ def test_foreign_stdout_is_never_rotated(tmp_path, monkeypatch) -> None:
     fd = os.open(str(other), os.O_WRONLY | os.O_APPEND)
 
     def body() -> None:
-        assert controller._rotate_stdout_log() is False
+        assert controller._rotate_stdout_log() is True
         assert log_file.read_text(encoding="utf-8") == "target untouched\n"
-        assert other.exists()
+        assert (tmp_path / "controller-restart.log.1").read_bytes().startswith(b"y" * 300)
+        assert other.stat().st_size == 0
+        os.write(1, b"fresh line\n")
+        assert other.read_text(encoding="utf-8") == "fresh line\n"
+        assert os.fstat(1).st_size == len("fresh line\n")
 
     _run_with_stdout_as(fd, body)
+
+
+def test_deleted_stdout_file_is_never_rotated(tmp_path, monkeypatch) -> None:
+    """An operator can rm the redirect file while the daemon holds it open.
+    The fd stays a regular file over the limit, but there is no path to
+    rotate; the guard must refuse rather than recreate a file at the old
+    name. macOS lsof still reports the original path for the unlinked fd,
+    so the `path.exists()` check is what refuses the rotation."""
+    monkeypatch.setattr(controller, "LOG_ROTATE_BYTES", 200)
+    gone = tmp_path / "gone.log"
+    fd = os.open(str(gone), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    os.write(fd, b"z" * 300)
+    gone.unlink()
+
+    def body() -> None:
+        assert controller._rotate_stdout_log() is False
+        assert not gone.exists()
+        assert not (tmp_path / "gone.log.1").exists()
+        assert not (tmp_path / "gone.log (deleted)").exists()
+
+    _run_with_stdout_as(fd, body)
+
+
+def test_pipe_stdout_is_never_rotated(tmp_path, monkeypatch) -> None:
+    """A daemon piped through tee must not have its pipe fd rotated."""
+    monkeypatch.setattr(controller, "LOG_ROTATE_BYTES", 200)
+    read_fd, write_fd = os.pipe()
+
+    def body() -> None:
+        assert controller._rotate_stdout_log() is False
+
+    _run_with_stdout_as(write_fd, body)
+    os.close(read_fd)
 
 
 def test_under_limit_stdout_is_not_rotated(tmp_path, monkeypatch) -> None:

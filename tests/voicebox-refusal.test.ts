@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import "./voicebox-refusal-env.ts";
@@ -320,6 +322,142 @@ test("a watchdog abort on a hung generation holds the sentence and replays on re
     delete process.env.OMP_VOICE_TTS_TIMEOUT_MS;
     server.closeAllConnections();
     server.close();
+  }
+});
+
+test("a player hung until the watchdog kills it is never counted as spoken", async () => {
+  resetSpeechSession();
+  // The real `play()` runs: a fake `afplay` on PATH spawns and busy-loops
+  // forever, so only the playback watchdog ends it. No generation is needed
+  // — the failure is purely on the player side.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-hung-player-"));
+  const wav = path.join(dir, "clip.wav");
+  fs.writeFileSync(wav, validWav(4410));
+  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nwhile :; do :; done\n");
+  fs.chmodSync(path.join(dir, "afplay"), 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}:${savedPath}`;
+  process.env.OMP_PLAY_WATCHDOG_MS = "300";
+  const gen: ClipGenerator = () =>
+    Promise.resolve({ clip: { wav, sentence: "the player hung and the watchdog killed it", clip: 1, reference: null } });
+  try {
+    enqueue("the player hung and the watchdog killed it", gen);
+    await speechSettled();
+    const status = currentSpeechStatus();
+    assert.equal(status.speaking, false);
+    // A killed, never-played clip must stay recoverable, not silently spoken.
+    assert.equal(currentSpokenText(), "");
+  } finally {
+    stopDeferredRetry();
+    process.env.PATH = savedPath;
+    delete process.env.OMP_PLAY_WATCHDOG_MS;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a watchdog-killed hung player defers the sentence into the retry chain", async () => {
+  resetSpeechSession();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-hung-player-defer-"));
+  const wav = path.join(dir, "clip.wav");
+  fs.writeFileSync(wav, validWav(4410));
+  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nwhile :; do :; done\n");
+  fs.chmodSync(path.join(dir, "afplay"), 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}:${savedPath}`;
+  process.env.OMP_PLAY_WATCHDOG_MS = "300";
+  const sentence = "the player hung and the sentence must be retried";
+  const gen: ClipGenerator = () =>
+    Promise.resolve({ clip: { wav, sentence, clip: 1, reference: null } });
+  try {
+    enqueue(sentence, gen);
+    await speechSettled();
+    // A released-but-never-spoken sentence must be held for retry, like a
+    // hung generation — otherwise nothing in the pipeline ever speaks it again.
+    assert.equal(currentDeferred().length, 1);
+    assert.equal(currentDeferred()[0].text, sentence);
+    assert.equal(currentSpeechStatus().deferred, 1);
+    // Recovery: a working player replays it exactly once, oldest first.
+    const played: string[] = [];
+    const retried = await retryDeferredSpeech(gen, stubPlayer(played), Date.now());
+    assert.equal(retried, 1);
+    await speechSettled();
+    assert.deepEqual(played, [sentence]);
+    assert.equal(currentDeferred().length, 0);
+    assert.equal(currentSpokenText(), sentence);
+  } finally {
+    stopDeferredRetry();
+    process.env.PATH = savedPath;
+    delete process.env.OMP_PLAY_WATCHDOG_MS;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a player process that exits with a failure code defers the sentence", async () => {
+  resetSpeechSession();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-player-fail-"));
+  const wav = path.join(dir, "clip.wav");
+  fs.writeFileSync(wav, validWav(4410));
+  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nexit 1\n");
+  fs.chmodSync(path.join(dir, "afplay"), 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}:${savedPath}`;
+  const sentence = "the player failed and the sentence must be retried";
+  const gen: ClipGenerator = () =>
+    Promise.resolve({ clip: { wav, sentence, clip: 1, reference: null } });
+  try {
+    enqueue(sentence, gen);
+    await speechSettled();
+    // Exit code 1 means nothing was heard: the sentence must be held for
+    // retry, not released into nothing.
+    assert.equal(currentSpokenText(), "");
+    assert.equal(currentDeferred().length, 1);
+    const played: string[] = [];
+    const retried = await retryDeferredSpeech(gen, stubPlayer(played), Date.now());
+    await speechSettled();
+    assert.equal(retried, 1);
+    assert.deepEqual(played, [sentence]);
+    assert.equal(currentSpokenText(), sentence);
+  } finally {
+    stopDeferredRetry();
+    process.env.PATH = savedPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("re-enqueueing a watchdog-held sentence does not duplicate its deferral", async () => {
+  resetSpeechSession();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-hung-player-recovery-"));
+  const wav = path.join(dir, "clip.wav");
+  fs.writeFileSync(wav, validWav(4410));
+  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nwhile :; do :; done\n");
+  fs.chmodSync(path.join(dir, "afplay"), 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}:${savedPath}`;
+  process.env.OMP_PLAY_WATCHDOG_MS = "300";
+  const sentence = "the player hung but the sentence is not lost";
+  const gen: ClipGenerator = () =>
+    Promise.resolve({ clip: { wav, sentence, clip: 1, reference: null } });
+  try {
+    // Turn 1: the real player hangs, the watchdog releases the sentence into
+    // the retry chain.
+    enqueue(sentence, gen);
+    await speechSettled();
+    assert.equal(currentSpokenText(), "");
+    assert.equal(currentDeferred().length, 1);
+    // A repeated enqueue of the same held sentence must not create a second
+    // deferral entry: it is replayed exactly once when the chain runs.
+    enqueue(sentence, gen, stubPlayer([]));
+    assert.equal(currentDeferred().length, 1);
+    const played: string[] = [];
+    await retryDeferredSpeech(gen, stubPlayer(played), Date.now());
+    await speechSettled();
+    assert.deepEqual(played, [sentence]);
+    assert.equal(currentSpokenText(), sentence);
+  } finally {
+    stopDeferredRetry();
+    process.env.PATH = savedPath;
+    delete process.env.OMP_PLAY_WATCHDOG_MS;
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

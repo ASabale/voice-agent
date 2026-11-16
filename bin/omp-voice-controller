@@ -133,6 +133,10 @@ DEVICE_CHECK_SECONDS = 2.0
 UNMUTE_FIRST_DELAY_SECONDS = 0.15
 UNMUTE_SECOND_DELAY_SECONDS = 0.65
 PASTE_KEY_SETTLE_SECONDS = 0.12
+# Chrome handles the Cmd+V paste asynchronously: restoring the clipboard too
+# soon makes the browser paste the pre-injection clipboard instead. Measured
+# on this machine: no settle pastes the old clipboard; 0.2 s lands the text.
+CLIPBOARD_RESTORE_SETTLE_SECONDS = 0.25
 KILL_RETRY_SECONDS = 0.25
 KILL_RETRY_COUNT = 8
 OSASKA_PROBE_TIMEOUT_SECONDS = 1.0
@@ -1087,33 +1091,67 @@ def rotate_log(path: Path, limit_bytes: int) -> bool:
     return True
 
 
-def _rotate_stdout_log() -> bool:
-    """Rotate controller.log while it is this process's stdout.
+def _stdout_log_path() -> Path | None:
+    """Path of the regular file behind fd 1, or None for a terminal, pipe,
+    or deleted file. Daemon stdout is not always controller.log: the live
+    restart (PID 90992) redirects it to controller-restart.log, which grew
+    unrotated past the limit under the old LOG_FILE-only guard.
 
-    Rotating only at start lets a long-running daemon grow past the limit
-    (29.6 MB was observed after one day of PID 64238). When fd 1 is the log
-    file itself, move it to .1 and re-point fd 1 at a fresh file. No-op when
-    stdout is a terminal, a pipe, or a different file.
-    """
+    macOS `fcntl(F_GETPATH)` returns EFAULT on this machine (verified live),
+    so the path comes from the fd's device+inode via lsof. lsof runs only
+    when stdout is a regular file already over the rotation limit — at most
+    once per rotation — never on the hot path."""
     try:
         st = os.fstat(1)
     except OSError:
-        return False
-    if not stat.S_ISREG(st.st_mode) or st.st_size <= LOG_ROTATE_BYTES:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_size <= LOG_ROTATE_BYTES:
+        return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-p", str(os.getpid()), "-a", "-d", "1", "-F", "n"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        path = Path(line[1:])
+        try:
+            probe = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            if os.path.sameopenfile(1, probe):
+                return path
+        finally:
+            os.close(probe)
+    return None
+
+
+def _rotate_stdout_log() -> bool:
+    """Rotate whichever regular file this process's stdout writes to.
+
+    Rotating only at start lets a long-running daemon grow past the limit
+    (29.6 MB was observed after one day of PID 64238). When fd 1 is a log
+    file over the limit, move it to .1 and re-point fd 1 at a fresh file of
+    the same name. No-op when stdout is a terminal, a pipe, or a deleted file.
+    """
+    path = _stdout_log_path()
+    if path is None:
         return False
     try:
-        probe = os.open(str(LOG_FILE), os.O_RDONLY)
+        if os.fstat(1).st_size <= LOG_ROTATE_BYTES:
+            return False
     except OSError:
         return False
-    try:
-        if not os.path.sameopenfile(1, probe):
-            return False
-    finally:
-        os.close(probe)
     sys.stdout.flush()
-    if not rotate_log(LOG_FILE, LOG_ROTATE_BYTES):
+    if not rotate_log(path, LOG_ROTATE_BYTES):
         return False
-    new_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    new_fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
     os.dup2(new_fd, 1)
     os.close(new_fd)
     return True
@@ -1518,10 +1556,15 @@ tell application "System Events"
         if roleName is in textRoles or subName is in {"AXSecureTextField", "AXSearchField"} then
           set editable to "yes"
         else
-          try
-            set selRange to value of attribute "AXSelectedTextRange" of focusedElem
-            set editable to "yes"
-          end try
+          -- A page body (AXWebArea/AXGroup) exposes AXSelectedTextRange for
+          -- text selection, but Cmd+V has nowhere to land there. Only trust
+          -- the range fallback on roles that can actually accept a paste.
+          if roleName is not in {"AXWebArea", "AXGroup", "AXStaticText", "AXUnknown", "AXDocument", "AXImage"} then
+            try
+              set selRange to value of attribute "AXSelectedTextRange" of focusedElem
+              set editable to "yes"
+            end try
+          end if
           if editable is "no" then
             try
               set anc to value of attribute "AXHighestEditableAncestor" of focusedElem
@@ -2003,11 +2046,63 @@ def _run_osascript(script: str) -> None:
     )
 
 
-def fallback_macos_inject(text: str, action: str) -> None:
+_FOCUSED_VALUE_SCRIPT = """
+tell application "System Events"
+  set frontApp to first application process whose frontmost is true
+  try
+    set value of attribute "AXEnhancedUserInterface" of frontApp to true
+  end try
+  set focusedElem to value of attribute "AXFocusedUIElement" of frontApp
+  if focusedElem is missing value then return ""
+  try
+    return value of focusedElem
+  catch
+    return ""
+  end try
+end tell
+"""
+
+
+def _focused_element_value() -> str | None:
+    """Value of the focused UI element, or None when it cannot be read."""
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", _FOCUSED_VALUE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _paste_landed(text: str) -> bool | None:
+    """Did the pasted text reach the focused element?
+
+    True: the element's value contains it. False: the value reads cleanly but
+    the text is missing (VA-PASTE-001's silent-loss signature). None: the
+    value is unreadable or empty, so the landing cannot be confirmed either way.
+    """
+    probe = text.strip()
+    if not probe:
+        return None
+    value = _focused_element_value()
+    if value is None or not value.strip():
+        return None
+    return probe in value
+
+
+def fallback_macos_inject(text: str, action: str) -> bool | None:
     """Fallback if OMP bridge (:17494) is unreachable (e.g. OMP not yet restarted).
 
     The paste injection overwrites the pasteboard, so the user's original
-    clipboard bytes are saved first and restored afterwards.
+    clipboard bytes are saved first and restored afterwards. After the paste
+    settle, the focused element's value is read to confirm the text landed;
+    the result is logged and returned so a silent no-op never reports success.
     """
     saved: bytes | None = None
     try:
@@ -2017,19 +2112,31 @@ def fallback_macos_inject(text: str, action: str) -> None:
     except Exception as exc:
         log_once("pbpaste", f"clipboard save failed, paste will overwrite it: {exc}")
 
+    landed: bool | None = None
     if action in ("appended", "paused") and text:
         subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=False)
         _run_osascript('tell application "System Events" to keystroke "v" using command down')
+        # Let the target app read the injected clipboard before putting the
+        # old contents back, or a slow paste (Chrome) grabs the old value.
+        time.sleep(CLIPBOARD_RESTORE_SETTLE_SECONDS)
+        landed = _paste_landed(text)
     elif action == "sent":
         if text:
             subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=False)
             _run_osascript('tell application "System Events" to keystroke "v" using command down')
             time.sleep(PASTE_KEY_SETTLE_SECONDS)
+            landed = _paste_landed(text)
         _run_osascript('tell application "System Events" to key code 36')
+
+    if landed is False:
+        log(f"Paste verification FAILED: focused value does not contain {text!r}")
+    elif landed is True:
+        log(f"Paste verified landed: {len(text)} chars")
 
     if saved is not None:
         # Restore what was on the clipboard before the injection, not the injected text.
         subprocess.run(["/usr/bin/pbcopy"], input=saved, check=False)
+    return landed
 
 
 _GRAMMAR: dict | None = None
@@ -2420,12 +2527,15 @@ def paste_into_focus(original: str, preserved: str = "") -> dict:
     if plan["action"] == "sent":
         text = with_preserved_draft(plan["text"], preserved)
         log(f"Submitted draft: {text!r}")
-        fallback_macos_inject(text, "sent")
+        landed = fallback_macos_inject(text, "sent")
+        if landed is False:
+            log(f"Send into focus UNVERIFIED: keystroke sent but draft not seen in the field")
         return {
             "action": "sent",
             "draft": text,
             "strippedCommand": plan["phrase"],
             "via": "focus",
+            "verified": landed,
         }
     if plan["action"] != "appended":
         return {
@@ -2435,8 +2545,10 @@ def paste_into_focus(original: str, preserved: str = "") -> dict:
             "via": "focus",
         }
     typed = plan["text"] + (" " if plan["text"] else "")
-    fallback_macos_inject(typed, "appended")
-    return {"action": "appended", "draft": plan["text"], "via": "focus"}
+    landed = fallback_macos_inject(typed, "appended")
+    if landed is False:
+        log(f"Paste into focus UNVERIFIED: {typed!r} never reached the field")
+    return {"action": "appended", "draft": plan["text"], "via": "focus", "verified": landed}
 
 
 _undelivered_transcript = ""
@@ -2695,7 +2807,9 @@ def dispatch_transcript(text: str) -> dict:
     if matched and matched["action"] == "cancelled":
         return {"action": "cancelled", "strippedCommand": matched["phrase"]}
     if matched and matched["action"] == "paused":
-        fallback_macos_inject(matched["prefix"] + (" " if matched["prefix"] else ""), "paused")
+        landed = fallback_macos_inject(matched["prefix"] + (" " if matched["prefix"] else ""), "paused")
+        if landed is False:
+            log("Pause prefix UNVERIFIED: keystroke did not reach the focused field")
         return {"action": "paused", "strippedCommand": matched["phrase"]}
     if matched and matched["action"] == "sent":
         if _pending_send_prefix:
@@ -2703,10 +2817,14 @@ def dispatch_transcript(text: str) -> dict:
                 _remember_send_prefix(matched["prefix"])
             log("Send status failed; keeping the held prefix")
             return {"action": "held", "draft": _visible_hold()}
-        fallback_macos_inject(matched["prefix"], "sent")
+        landed = fallback_macos_inject(matched["prefix"], "sent")
+        if landed is False:
+            log("Send keystroke UNVERIFIED: draft not seen in the focused field before Enter")
         return {"action": "sent", "strippedCommand": matched["phrase"]}
 
-    fallback_macos_inject(cleaned + " ", "appended")
+    landed = fallback_macos_inject(cleaned + " ", "appended")
+    if landed is False:
+        log(f"Dispatch UNVERIFIED: {cleaned!r} did not reach the focused field")
     return {"action": "appended", "draft": cleaned}
 
 
@@ -2776,6 +2894,20 @@ def _open_pid_lock(block: bool) -> object | None:
         handle.close()
         return None
     return handle
+
+
+def _claim_run_lock() -> object | None:
+    """Take the single-instance lock for `run` without blocking.
+
+    A supervisor (launchd KeepAlive) must REFUSE to start while another
+    instance holds the lock rather than hang waiting for it; blocking on the
+    flock makes a supervised restart silently pile up processes. Returns the
+    held handle, or None when the lock is already claimed.
+    """
+    inherited = os.environ.get("OMP_VOICE_PID_LOCK_FD")
+    if inherited:
+        return os.fdopen(int(inherited), "a+")
+    return _open_pid_lock(block=False)
 
 
 def barge_note(mic: "MicState", stage: str, **fields) -> None:
@@ -3280,7 +3412,9 @@ class MicState:
                 log(f"Manual Handy transcription #{manual_id}: {manual_txt!r}")
                 manual_outcome = dispatch_transcript(manual_txt)
                 manual_action = manual_outcome.get("action", "appended")
-                log(f"Manual chunk outcome: {manual_action}")
+                verified = manual_outcome.get("verified")
+                suffix = "" if verified is None else f" (verified={verified})"
+                log(f"Manual chunk outcome: {manual_action}{suffix}")
                 if manual_action == "sent":
                     play_cue(SOUND_SEND, wait=False)
                 elif manual_action in ("paused", "cancelled", "scratched", "cleared"):
@@ -3586,7 +3720,9 @@ class MicState:
             self.retract_partial()
             outcome = dispatch_transcript(live_txt)
             action = outcome.get("action", "appended")
-            log(f"Manual chunk outcome: {action}")
+            verified = outcome.get("verified")
+            suffix = "" if verified is None else f" (verified={verified})"
+            log(f"Manual chunk outcome: {action}{suffix}")
             if outcome.get("draft"):
                 log(f"Transcript draft: {outcome.get('draft')!r}")
             self.dict_tail_frames.clear()
@@ -3984,14 +4120,19 @@ def run_daemon(
     pause_seconds: float = 5.0,
     idle_timeout_seconds: float = 15.0,
     vad_threshold: float = 0.40,
-) -> None:
+) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    global _pid_lock_handle
+    _pid_lock_handle = _claim_run_lock()
+    if _pid_lock_handle is None:
+        log("OMP Voice Controller already running (pid lock held); refusing to start a second instance.")
+        return 1
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     import sounddevice as sd
     from faster_whisper import WhisperModel
     from openwakeword.model import Model
     from openwakeword.vad import VAD
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     configure_handy_settings()
     # Ensure macOS microphone input gain is at least 80% so across-the-room voice isn't attenuated
     subprocess.run(
@@ -4038,13 +4179,8 @@ def run_daemon(
     mic.last_history_id, _ = latest_history_row()
     mic.fn_was_down = fn_held()
 
-    global _handy_on_light, _pid_lock_handle
+    global _handy_on_light
     _daemon_running.set()
-    inherited = os.environ.get("OMP_VOICE_PID_LOCK_FD")
-    if inherited:
-        _pid_lock_handle = os.fdopen(int(inherited), "a+")
-    elif _pid_lock_handle is None:
-        _pid_lock_handle = _open_pid_lock(block=True)
     _set_strata_loaded(strata_loaded())
     threading.Thread(target=_watch_strata, daemon=True).start()
     threading.Thread(target=watch_submitted_messages, daemon=True).start()
@@ -4141,6 +4277,7 @@ def run_daemon(
         pass
     _daemon_running.clear()
     log("OMP Voice Controller stopped.")
+    return 0
 
 
 def cmd_status() -> int:
@@ -4283,13 +4420,12 @@ def main() -> int:
             dispatch_transcript(text)
         return 0
     if args.subcommand == "run":
-        run_daemon(
+        return run_daemon(
             wake_word=args.wake_word,
             wake_threshold=args.wake_threshold,
             pause_seconds=args.pause_seconds,
             idle_timeout_seconds=args.idle_timeout,
         )
-        return 0
     if args.subcommand == "start":
         return cmd_start_bg(args)
     if args.subcommand == "stop":

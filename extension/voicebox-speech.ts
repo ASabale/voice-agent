@@ -131,7 +131,7 @@ export type SpeechClip = {
 };
 export type GenResult = { clip: SpeechClip } | { deferred: true } | undefined;
 export type ClipGenerator = (text: string, epoch: number) => Promise<GenResult>;
-export type ClipPlayer = (clip: SpeechClip, epoch: number) => Promise<void>;
+export type ClipPlayer = (clip: SpeechClip, epoch: number) => Promise<{ heard?: boolean } | void>;
 
 export const DEFER_RETRY_MS = 5000;
 export const DEFER_EXPIRY_MS = 120000;
@@ -141,6 +141,13 @@ export const DEFER_EXPIRY_MS = 120000;
 export function ttsTimeoutMs(): number {
   const raw = Number(process.env.OMP_VOICE_TTS_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 90000;
+}
+
+// Watchdog for a hung player process: afplay spawned but never exits.
+// Configurable so tests can exercise the path without waiting 45 s.
+export function playWatchdogMs(): number {
+  const raw = Number(process.env.OMP_PLAY_WATCHDOG_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 45000;
 }
 
 export class VoiceSession {
@@ -512,7 +519,12 @@ function commitSpoken(sentence: string): void {
 }
 
 function voiceStateDir(): string {
-  return path.join(os.homedir(), ".local", "state", "omp-voice");
+  // OMP_VOICE_STATE_DIR mirrors the controller's Python STATE_DIR. Test suites
+  // set it to a temp directory so mock generate/deferral traffic never lands in
+  // the production speech.log or playback-slot directory (VA-LOG-004).
+  return process.env.OMP_VOICE_STATE_DIR
+    ? path.resolve(process.env.OMP_VOICE_STATE_DIR)
+    : path.join(os.homedir(), ".local", "state", "omp-voice");
 }
 
 export function stopPlayback(): boolean {
@@ -757,7 +769,7 @@ export function speechLogRecord(
 
 function logSpeech(event: string, text: string, extra: Record<string, unknown> = {}): void {
   try {
-    const dir = path.join(os.homedir(), ".local", "state", "omp-voice");
+    const dir = voiceStateDir();
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, "speech.log");
     rotateLogFile(file, SPEECH_LOG_LIMIT);
@@ -896,7 +908,7 @@ export async function generate(
 async function play(
   clip: { wav: string; sentence: string; clip: number; reference?: { sample_rate: number; channels: number; frames: number; wav: string } | null },
   epoch: number,
-): Promise<void> {
+): Promise<{ heard: boolean } | undefined> {
   if (epoch !== session.speechEpoch) {
     try {
       fs.unlinkSync(clip.wav);
@@ -954,6 +966,7 @@ async function play(
   }
   let settled = false;
   let spawnError = false;
+  let watchdogFired = false;
   let exitCode: number | null = null;
   let exitSignal: string | null = null;
   const finish = (code?: number | null, signal?: NodeJS.Signals | null) => {
@@ -964,13 +977,14 @@ async function play(
     resolve();
   };
   const watchdog = setTimeout(() => {
+    watchdogFired = true;
     try {
       child.kill("SIGKILL");
     } catch {
       // ignore
     }
     finish(null, "SIGKILL");
-  }, 45000);
+  }, playWatchdogMs());
   child.on("exit", (code, signal) => finish(code, signal));
   child.on("close", (code, signal) => finish(code, signal));
   child.on("error", () => {
@@ -978,8 +992,13 @@ async function play(
     finish();
   });
   await promise;
+  let heard = false;
   if (epoch === session.speechEpoch) {
-    if (playbackHeard(exitCode, exitSignal, spawnError)) commitSpoken(clip.sentence);
+    // A watchdog kill means the player hung: the sentence was never heard and
+    // must stay recoverable, exactly like a failed spawn. A barge-in kill
+    // (signal without the watchdog) still counts as heard.
+    heard = playbackHeard(exitCode, exitSignal, spawnError) && !watchdogFired;
+    if (heard) commitSpoken(clip.sentence);
     else releaseUnspoken(clip.sentence);
   }
   clearTimeout(watchdog);
@@ -1001,6 +1020,7 @@ async function play(
   } catch {
     // ignore
   }
+  return { heard };
 }
 
 function speakChunk(
@@ -1018,7 +1038,17 @@ function speakChunk(
   const done = session.playTail.then(async () => {
     const result = await ready;
     if (result?.clip) {
-      await player(result.clip, epoch);
+      const played = await player(result.clip, epoch);
+      if (played && played.heard === false && epoch === session.speechEpoch) {
+        // Nothing came out of the player (it hung, exited with an error, or
+        // failed to spawn): hold the sentence in the retry chain exactly like
+        // a hung generation, keeping the FIRST deferral time so the 120 s
+        // expiry bounds retries against a permanently broken player.
+        session.deferred.push({ text: speak, epoch, at });
+        startDeferredRetry();
+        logSpeech("deferred", speak, { reason: "player-failure", timeoutMs: playWatchdogMs() });
+        return true;
+      }
       return false;
     }
     if (epoch === session.speechEpoch) {

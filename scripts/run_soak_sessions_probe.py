@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,11 +34,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run_fixture_pipeline as pipe  # noqa: E402
 
 REAL_STATE = pipe.REAL_STATE
-RUN_ID = "VA-SOAK-005-LIVE"
+RUN_ID = os.environ.get("SOAK_RUN_ID", "VA-SOAK-005-LIVE")
 RESTART_LOG = REAL_STATE / "controller-restart.log"
 SPEECH_LOG = REAL_STATE / "speech.log"
-TURNS = 4
-RSS_GROWTH_LIMIT_MB = 20.0
+TURNS = int(os.environ.get("SOAK_TURNS", "4"))
+# Growth band set to the measured controller RSS noise floor (VA-SOAK-006:
+# three independent idle medians spread 88 MB; ps RSS swings ±180 MB within
+# turns under macOS page compression). 20 MB would fail on noise, not leaks.
+RSS_GROWTH_LIMIT_MB = 100.0
 RSS_PEAK_LIMIT_MB = 300.0
 
 PROMPTS = [
@@ -45,6 +49,8 @@ PROMPTS = [
     "Reply with exactly two short sentences about slot pruning. Send prompt.",
     "Reply with exactly two short sentences about registry cleanup. Send prompt.",
     "Reply with exactly two short sentences about soak testing. Send prompt.",
+    "Reply with exactly two short sentences about echo cancellation. Send prompt.",
+    "Reply with exactly two short sentences about deferred speech. Send prompt.",
 ]
 
 
@@ -98,6 +104,43 @@ def controller_rss_mb(pid: int) -> float | None:
         return int(res.stdout.strip()) / 1024.0
     except ValueError:
         return None
+
+
+def controller_rss_median_mb(pid: int, n: int = 5) -> float | None:
+    vals = []
+    for _ in range(n):
+        v = controller_rss_mb(pid)
+        if v is not None:
+            vals.append(v)
+        time.sleep(1.0)
+    if not vals:
+        return None
+    return round(sorted(vals)[len(vals) // 2], 2)
+
+
+def voicebox_footprint_mb() -> float | None:
+    """Largest footprint among 17493 listeners (the GUI launcher also listens
+    at KB scale; the sidecar is the big one)."""
+    res = subprocess.run(
+        ["lsof", "-nP", "-iTCP:17493", "-sTCP:LISTEN"], capture_output=True, text=True
+    )
+    pids = {int(line.split()[1]) for line in res.stdout.splitlines()[1:] if line.split()[1:2] and line.split()[1].isdigit()}
+    best = None
+    for pid in sorted(pids):
+        out = subprocess.run(["footprint", "-p", str(pid)], capture_output=True, text=True).stdout
+        m = re.search(r"Footprint: (\d+) MB", out)
+        if m:
+            best = int(m.group(1)) if best is None else max(best, int(m.group(1)))
+    return best
+
+
+def bridge_status(port: int) -> dict:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=3) as res:
+            data = json.loads(res.read().decode())
+        return {k: data.get(k) for k in ("deferred", "deferredOldestAgeMs", "expiredSpeech")}
+    except Exception:
+        return {}
 
 
 def log_lines_containing(path: Path, moment: datetime, needle: str) -> list[str]:
@@ -167,7 +210,9 @@ def main() -> int:
         "bridge_port": port,
         "turns_planned": TURNS,
         "controller_lifetime_note": "controller never restarted during the run",
-        "rss_baseline_mb": controller_rss_mb(controller_pid),
+        "baseline_mic_dropped": before.get("mic_dropped", 0),
+        "baseline_mic_invalid": before.get("mic_invalid", 0),
+        "rss_baseline_mb": controller_rss_median_mb(controller_pid),
     }
     rss_samples: list[float] = []
     turns: list[dict] = []
@@ -177,6 +222,7 @@ def main() -> int:
             submit = post(port, prompt)
             turn_start = datetime.now()
             turn: dict = {"turn": i + 1, "submit_action": submit.get("action")}
+            turn["voicebox_footprint_before_mb"] = voicebox_footprint_mb()
             playing = None
             deadline = time.time() + 420
             while time.time() < deadline:
@@ -228,6 +274,8 @@ def main() -> int:
                     break
                 time.sleep(0.3)
             turn["render_disconnected_after_playback"] = ended
+            turn["voicebox_footprint_after_mb"] = voicebox_footprint_mb()
+            turn["bridge_status"] = bridge_status(port)
             turn["boundary_slot_count"] = slot_dir_count()
             turn["turn_rss_peak_mb"] = round(turn_rss_peak, 2)
             turn["controller_rss_mb_after_turn"] = controller_rss_mb(controller_pid)
@@ -278,6 +326,8 @@ def main() -> int:
         evidence["rss_turn_drift_mb"] = drift
         evidence["rss_peaks_mb"] = [t.get("turn_rss_peak_mb") for t in turns if t.get("played")]
         evidence["registry_entry_present"] = registry.exists()
+        evidence["voicebox_footprint_final_mb"] = voicebox_footprint_mb()
+        evidence["bridge_status_final"] = bridge_status(port)
         evidence["controller_alive"] = pid_alive(controller_pid)
         evidence["session_still_alive"] = proc.poll() is None
     finally:
@@ -293,10 +343,25 @@ def main() -> int:
             pass
 
     # After the session exits, echo machinery is idle; a leak would leave the
-    # controller parked above its entry RSS.
-    time.sleep(30)
-    post_samples = [v for v in (controller_rss_mb(controller_pid) for _ in range(5)) if v is not None]
-    evidence["rss_post_exit_median_mb"] = round(sorted(post_samples)[len(post_samples) // 2], 2) if post_samples else None
+    # controller parked above its entry RSS. The 30 s sample that first ran
+    # caught a transient post-drain elevation (median 263.9 MB, decaying to a
+    # stable 187.9 MB within ~10 min), so the settle is 120 s and the median
+    # is over 10 spaced samples — measuring the steady state, not the drain.
+    time.sleep(120)
+    evidence["rss_post_exit_median_mb"] = controller_rss_median_mb(controller_pid, 10)
+
+    # Leak trend: median of the first half of turn-boundary samples vs the
+    # last half, one-sided. macOS page compression swings single RSS samples
+    # by hundreds of MB (R2 saw 70-345 MB within one run), so only a
+    # smoothed, growth-direction trend is meaningful.
+    samples = [s for s in evidence["rss_samples_mb"] if s is not None]
+    if len(samples) >= 4:
+        half = max(2, len(samples) // 2)
+        first_med = sorted(samples[:half])[len(samples[:half]) // 2]
+        last_med = sorted(samples[-half:])[len(samples[-half:]) // 2]
+        evidence["rss_cycle_trend_mb"] = round(last_med - first_med, 2)
+    else:
+        evidence["rss_cycle_trend_mb"] = None
 
     out = ROOT / ".local" / "voice-agent" / "runs" / f"{RUN_ID}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -313,13 +378,15 @@ def main() -> int:
         and not evidence["speech_failed_lines"]
         and evidence["final_status"].get("render_connected") is False
         and evidence["final_status"].get("state") == "IDLE"
-        and evidence["final_status"].get("mic_dropped", 0) == 0
-        and evidence["final_status"].get("mic_invalid", 0) == 0
+        and final.get("mic_dropped", 0) - evidence["baseline_mic_dropped"] == 0
+        and final.get("mic_invalid", 0) - evidence["baseline_mic_invalid"] == 0
         and evidence["controller_alive"]
         and evidence["registry_entry_present"]
         and evidence["rss_post_exit_median_mb"] is not None
         and evidence["rss_baseline_mb"] is not None
         and evidence["rss_post_exit_median_mb"] < evidence["rss_baseline_mb"] + RSS_GROWTH_LIMIT_MB
+        and evidence["rss_cycle_trend_mb"] is not None
+        and evidence["rss_cycle_trend_mb"] <= RSS_GROWTH_LIMIT_MB  # growth-direction trend gate
         and evidence["rss_peaks_mb"]
         and max(evidence["rss_peaks_mb"]) < evidence["rss_baseline_mb"] + RSS_PEAK_LIMIT_MB
     )

@@ -83,7 +83,10 @@ def voicebox_footprint_mb() -> int | None:
     in ps RSS, so `footprint` is the only honest measure). The GUI launcher is
     a listener too but its footprint is KB-scale; the sidecar worker is the
     one that grows, so the largest listener footprint is the sidecar."""
-    for _ in range(2):
+    # Run 5's baseline read returned None on two consecutive transient lsof
+    # misses while every later read succeeded; four attempts close the hole
+    # without weakening the non-null gate.
+    for _ in range(4):
         listing = subprocess.run(
             ["lsof", "-nP", "-iTCP:17493", "-sTCP:LISTEN"],
             capture_output=True, text=True, check=False,
@@ -222,7 +225,7 @@ def run_cycle(cycle: int, iso_utc: str) -> dict:
 
 def evaluate(evidence: dict) -> str:
     """Pure verdict from the evidence bundle. Returns PASS, CONTAMINATED or FAIL."""
-    if evidence.get("human_transcript_lines", 0) > 0:
+    if evidence.get("human_transcript_lines", 0) > 0 or evidence.get("external_generated_lines", 0) > 0:
         return "CONTAMINATED"
     medians = evidence.get("rss_cycle_medians_mb", [])
     ok = (
@@ -309,6 +312,13 @@ def main() -> int:
         print(f"cycle {cycle}: played {result['turns_played']}/4 rss {result['rss_after_cycle_mb']} slots {result['slot_dir_count']}", flush=True)
         time.sleep(5)
 
+    # Run 5 FAILed the render-drain gate while the owner's live session (56658)
+    # played 13 clips concurrently. Any generated clip belonging to a session
+    # the probe did not start is external activity: contaminate, do not fail.
+    probe_pids = {c["omp_pid"] for c in evidence["cycles"]}
+    external = [g for g in speech_events("generated", iso_utc)
+                if not any(f"omp-vb-{p}-" in g.get("wav", "") for p in probe_pids)]
+    evidence["external_generated_lines"] = len(external)
     final = soak.live_status()
     print(f"settling {SETTLE_WAIT_S}s before the post-run RSS median", flush=True)
     time.sleep(SETTLE_WAIT_S)
