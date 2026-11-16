@@ -65,22 +65,23 @@ def post(port: int, text: str) -> dict:
 def spoken_lines(pid: int, start_iso: str, end_iso: str) -> list[dict]:
     """Generated speech lines for this probe session within [start, end]."""
     out = []
-    try:
-        text = SPEECH.read_text(encoding="utf-8")
-    except OSError:
-        return out
-    for raw in text.splitlines():
+    for name in (SPEECH, REAL_STATE / "speech.log.1"):
         try:
-            rec = json.loads(raw)
-        except ValueError:
+            text = name.read_text(encoding="utf-8")
+        except OSError:
             continue
-        if rec.get("event") != "generated":
-            continue
-        if f"omp-vb-{pid}-" not in rec.get("wav", ""):
-            continue
-        if rec.get("t", "") < start_iso or rec.get("t", "") > end_iso:
-            continue
-        out.append(rec)
+        for raw in text.splitlines():
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if rec.get("event") != "generated":
+                continue
+            if f"omp-vb-{pid}-" not in rec.get("wav", ""):
+                continue
+            if rec.get("t", "") < start_iso or rec.get("t", "") > end_iso:
+                continue
+            out.append(rec)
     return out
 
 
@@ -116,24 +117,9 @@ def main() -> int:
         print("VoiceBox is not healthy. Not launching the probe.")
         return 2
 
-    env = dict(os.environ)
-    env["OMP_VOICE_LOG_TEXT"] = "1"
-    master, slave = __import__("pty").openpty()
-    proc = subprocess.Popen(
-        ["omp"], stdin=slave, stdout=slave, stderr=slave,
-        start_new_session=True, cwd="/Users/akshay/Development", env=env,
-    )
-    os.close(slave)
-    begun = time.time()
-    record = None
-    while time.time() - begun < 25:
-        record = pipe.newest_session(begun)
-        if record and record.get("pid") == proc.pid:
-            break
-    if not record:
-        proc.terminate()
-        print("isolated omp session did not register")
-        return 2
+    # start_omp inherits os.environ; set the log-text flag before launching.
+    os.environ["OMP_VOICE_LOG_TEXT"] = "1"
+    proc, record, master = pipe.start_omp()
     pid, port = int(record["pid"]), int(record["port"])
     if pid in pipe.PROTECTED_PIDS or port == 62283:
         proc.terminate()
@@ -144,6 +130,9 @@ def main() -> int:
     def run_turn(scenario: str, prompt: str, wait: float = 180.0) -> list[dict]:
         start = now_iso()
         post(port, prompt)
+        post(port, "send prompt")
+        # wait for the reply to start playing, then let it drain
+        pipe.wait_playing(pid, 120)
         wait_drain(pid, wait)
         end = now_iso()
         lines = spoken_lines(pid, start, end)
@@ -227,6 +216,10 @@ def main() -> int:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        try:
+            os.close(master)
+        except OSError:
+            pass
 
     out = ROOT / ".local/voice-agent/runs" / f"{RUN_ID}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
