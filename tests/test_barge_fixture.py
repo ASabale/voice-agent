@@ -109,6 +109,60 @@ def test_stop_fixture_is_whispered_before_playback_can_resume(monkeypatch) -> No
     assert quiet.tts_barge_held is False
 
 
+def test_holds_duck_the_speaker_and_release_restores_it(monkeypatch) -> None:
+    """VA-PHYS-003 follow-up: a hold ducks system volume, every release restores it.
+
+    The held clip is the Whisper evidence; with the reply loud, tiny.en heard
+    garbage. Ducking the speaker during the hold makes the clip mostly the
+    person. Duck is off unless OMP_VOICE_DUCK_VOLUME is set.
+    """
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    osascript: list[str] = []
+    current = {"volume": 70}
+
+    class _Res:
+        stdout = "70"
+        returncode = 0
+
+    def fake_run(_cmd: list[str], **_kw: object) -> object:
+        script = _cmd[2]
+        osascript.append(script)
+        if "output volume of" in script:
+            return _Res()
+        current["volume"] = int(script.rsplit(" ", 1)[1])
+        return _Res()
+
+    monkeypatch.setattr(controller.subprocess, "run", fake_run)
+    monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "stop_playback", lambda _reason: 0.0)
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    mic = controller.MicState()
+    mic.last_manual_check = 1e12
+    mic.enter_dictating = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("enter"))  # type: ignore[method-assign]
+    _feed(mic, _wav("stop-say.wav"), jobs, VAD())
+    assert any("set volume output volume 20" in s for s in osascript)
+    assert mic.tts_duck_restore == 70
+    mic.apply_whisper("tts_barge", "Stop.", None, VAD(), jobs)
+    assert any("set volume output volume 70" in s for s in osascript)
+    assert mic.tts_duck_restore is None
+
+    # A hold stays ducked while Whisper decides, then restores on release.
+    jobs2: queue.Queue = queue.Queue(maxsize=1)
+    mic2 = controller.MicState()
+    mic2.last_manual_check = 1e12
+    mic2.enter_dictating = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("enter"))  # type: ignore[method-assign]
+    _feed(mic2, _wav("hold-on-say.wav"), jobs2, VAD())
+    assert mic2.tts_duck_restore == 70
+    mic2.apply_whisper("tts_barge", "Hold on a second.", None, VAD(), jobs2)
+    assert mic2.tts_duck_restore is None
+    assert any("set volume output volume 70" in s for s in osascript)
+
+
 def test_a_squashing_canceller_cannot_erase_the_stop(monkeypatch) -> None:
     """VA-INT-AUTO-040: the warm-up fit ate the interruption before the gate saw it.
 
