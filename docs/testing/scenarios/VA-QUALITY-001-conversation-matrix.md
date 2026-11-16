@@ -11,7 +11,14 @@
    - D — after "remember 150" then a filler turn, "what number did I ask you to remember?" yields a clip containing "150"; same for 100.
    - F — an unknowable date request admits uncertainty and invents no date.
    - Slop scan counts hedge/filler phrases ("I'd be happy to", "great question", "absolutely!", etc.); count is reported, not gated.
-6. **Actual behavior:** NOT_RUN — probe committed (`833d1fa988`), executed after the clean soak PASS. Evidence will land in `.local/voice-agent/runs/VA-QUALITY-001-CONVERSATION-MATRIX.json`.
+6. **Actual behavior:** RUN 1 — **PASS (automated rows)**, 2026-11-16 06:46–06:59 UTC, probe pid 81823 (controller pid 251, VoiceBox 0.6B). Evidence: `.local/voice-agent/runs/VA-QUALITY-001-CONVERSATION-MATRIX.json`.
+   - A — PASS: 2 clips, 14 words, max 9 ("All three succeeded, nothing failed:"). Progress beats, no raw output.
+   - B — PASS: 12 clips, 284 words; failure ("the path doesn't exist"), cause ("no such file was ever created"), action ("swapped the disallowed command for the allowed one"), outcome ("No — and in this case it can't.").
+   - C — PASS: 6 clips, 135 words with same-sentence definitions ("that returning sound is echo", "a similarity score that slides the stored copy...").
+   - D — PASS: D2 clip states 150; D3 recalls the original 100 and even the 20 → 100 → 150 lineage.
+   - F — PASS: "I don't know — and there's no evidence a 'VoiceBox 2.0' exists or has a date." No invented date.
+   - H — slop hits: `{}` across the whole run.
+   - Probe iteration history: run 1 (25 s hand-rolled launch, 0-clip false FAILs — unconsumed pty stalled the child); fixed via `pipe.start_omp` + `send prompt` submission + play-first drain (`9a83720`). Run 2 FAIL on attribution: 6 s drain quiet ended turns mid-reply (chunk gaps 10–20 s); fixed with 25 s drain quiet and a release-date-scoped honesty regex (`quality-probe-9`, the PASS above).
 7. **Human-gated rows (NEEDS_HUMAN_APPROVAL, never automated):**
    - **E — human barge during an explanation.** Procedure: start a long explanation, Akshay says "hey jarvis stop" mid-sentence. Pass criteria: audible stop within 1.2 s, no restart of the cut text, next turn still plays. Owner verdict recorded verbatim.
    - **G — eyes-off ten-minute task.** Procedure: Akshay runs a real task (dictation + a command + a follow-up) with the screen unattended for 10 minutes. Pass criteria: owner says the interaction was usable without looking. Owner verdict recorded verbatim.
