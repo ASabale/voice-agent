@@ -308,6 +308,215 @@ def test_duck_off_marker_keeps_speaker_bursts_audible(monkeypatch, tmp_path) -> 
     assert not osascript
 
 
+def _volume_res(cmd: list[str], volume: dict) -> object:
+    class _Res:
+        pass
+    script = cmd[2]
+    res = _Res()
+    if "output volume of" in script:
+        res.stdout = str(volume["volume"])
+    else:
+        res.stdout = ""
+        volume["volume"] = int(script.rsplit(" ", 1)[1])
+    res.returncode = 0
+    return res
+
+
+def test_duck_scales_the_echo_reference(monkeypatch, tmp_path) -> None:
+    """VA-BARGE-AEC: the canceller reference must match the ducked speaker.
+
+    Measured control (real aec_audio_processing, this machine): clean speech
+    against a full-gain reply reference dropped 42% rms and tiny.en heard
+    "Hey Joe, you're going to jump"; the gain-matched reference kept the
+    transcript perfect. duck_output_volume now records the ratio, and
+    cancel_playback_echo scales the reverse stream by it.
+    """
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    volume = {"volume": 70}
+
+    class _Res:
+        def __init__(self, out: str) -> None:
+            self.stdout = out
+            self.returncode = 0
+
+    def fake_run(cmd: list[str], **_kw: object) -> object:
+        script = cmd[2]
+        if "output volume of" in script:
+            return _Res(str(volume["volume"]))
+        volume["volume"] = int(script.rsplit(" ", 1)[1])
+        return _Res("")
+
+    monkeypatch.setattr(controller.subprocess, "run", fake_run)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+
+    mic = controller.MicState()
+    controller.duck_output_volume(mic)
+    assert mic.tts_duck_restore == 70
+    assert abs(controller._duck_ratio - 20 / 70) < 1e-9
+
+    samples = np.full(16000, 20000, dtype=np.int16)
+    monkeypatch.setattr(controller, "_render_samples", samples)
+    monkeypatch.setattr(
+        controller,
+        "_render_parsed",
+        {"aligned": True, "started_at": controller.time.time() - 0.5, "playback_rate": 1.0},
+    )
+    monkeypatch.setattr(controller, "playback_echo_canceller", lambda _key: object())
+    reverses: list[np.ndarray] = []
+
+    def spy(_proc: object, frame: np.ndarray, reverse: np.ndarray) -> np.ndarray:
+        reverses.append(reverse.copy())
+        return frame
+
+    monkeypatch.setattr(controller, "process_echo_block", spy)
+    frame = np.full(1280, 5000, dtype=np.int16)
+    when = controller.time.time()
+    block = controller.render_block_at(
+        samples,
+        controller._render_parsed["started_at"],
+        when,
+        len(frame),
+        controller._render_parsed["playback_rate"],
+        controller.paused_playback_seconds(when),
+    )
+    assert block.any()
+    controller.cancel_playback_echo(frame, when)  # ducked: reference scaled to the speaker
+    assert np.array_equal(reverses[-1], np.rint(block * (20 / 70)).astype(np.int16))
+
+    controller.restore_output_volume(mic)
+    assert controller._duck_ratio == 1.0
+    controller.cancel_playback_echo(frame, when)
+    assert np.array_equal(reverses[-1], block)
+    assert volume["volume"] == 70
+
+
+def test_floor_freezes_while_ducked(monkeypatch, tmp_path) -> None:
+    """The floor that sets the hold gate must not collapse from duck-quiet bleed.
+
+    Floor collapse was measured live: 12 of 131 holds opened with floor 0.0,
+    pinning the gate at its 320 minimum and inviting hold flicker when the
+    volume came back. Quiet frames during a duck episode never enter the floor.
+    """
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "stop_playback", lambda _reason: 0.0)
+    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    volume = {"volume": 70}
+
+    class _Res:
+        def __init__(self, out: str) -> None:
+            self.stdout = out
+            self.returncode = 0
+
+    def fake_run(cmd: list[str], **_kw: object) -> object:
+        script = cmd[2]
+        if "output volume of" in script:
+            return _Res(str(volume["volume"]))
+        volume["volume"] = int(script.rsplit(" ", 1)[1])
+        return _Res("")
+
+    monkeypatch.setattr(controller.subprocess, "run", fake_run)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    vad = VAD()
+    mic = controller.MicState()
+    mic.last_manual_check = 1e12
+    quiet = np.zeros(1280, dtype=np.int16)
+    for _ in range(5):
+        controller.handle_captured_frame(
+            mic, quiet, controller.time.time(), "fixture", _OwwStub(), vad,
+            0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+        )
+    assert len(mic.tts_rms_floor) == 5
+    before = list(mic.tts_rms_floor)
+    controller.duck_output_volume(mic)
+    assert mic.tts_duck_restore == 70
+    for _ in range(5):
+        controller.handle_captured_frame(
+            mic, quiet, controller.time.time(), "fixture", _OwwStub(), vad,
+            0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+        )
+    assert list(mic.tts_rms_floor) == before  # frozen during the duck
+    controller.restore_output_volume(mic)
+    controller.handle_captured_frame(
+        mic, quiet, controller.time.time(), "fixture", _OwwStub(), vad,
+        0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+    )
+    assert len(mic.tts_rms_floor) == len(before) + 1  # learning resumes after restore
+
+
+def test_cooldown_blocks_ducking_never_detection(monkeypatch, tmp_path) -> None:
+    """A repeated "stop" inside the duck cooldown is still detected; only the volume change waits."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    volume = {"volume": 70}
+    monkeypatch.setattr(controller.subprocess, "run", lambda cmd, **_kw: _volume_res(cmd, volume))
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(controller.time, "monotonic", lambda: clock["t"])
+
+    def _burst() -> np.ndarray:
+        return np.full(1280, 20000, dtype=np.int16)
+
+    class _HotVad:
+        def predict(self, _frame: object) -> float:
+            return 0.9
+
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    mic = controller.MicState()
+    mic.last_manual_check = 1e12
+    for _ in range(6):
+        controller.handle_captured_frame(
+            mic, _burst(), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
+            0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+        )
+    assert mic.tts_duck_restore == 70
+    for _ in range(4):
+        controller.handle_captured_frame(
+            mic, np.zeros(1280, dtype=np.int16), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
+            0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+        )
+    mic.apply_whisper("tts_barge", "The weather is nice.", None, _HotVad(), jobs)
+    assert mic.tts_duck_restore is None
+    assert clock["t"] < mic.tts_duck_cooldown_until  # 1.5 s duck cooldown is armed
+    for _ in range(5):  # person says "stop" again immediately: detected, not re-ducked
+        controller.handle_captured_frame(
+            mic, _burst(), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
+            0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+        )
+    assert mic.tts_barge_held
+    assert mic.tts_duck_restore is None
+    clock["t"] += 2.0
+    controller.handle_captured_frame(
+        mic, _burst(), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
+        0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+    )
+    assert mic.tts_duck_restore == 70
+
+
+def _volume_res(cmd: list[str], volume: dict) -> object:
+    class _Res:
+        pass
+    script = cmd[2]
+    res = _Res()
+    if "output volume of" in script:
+        res.stdout = str(volume["volume"])
+    else:
+        res.stdout = ""
+        volume["volume"] = int(script.rsplit(" ", 1)[1])
+    res.returncode = 0
+    return res
+
+
 def test_a_squashing_canceller_cannot_erase_the_stop(monkeypatch) -> None:
     """VA-INT-AUTO-040: the warm-up fit ate the interruption before the gate saw it.
 

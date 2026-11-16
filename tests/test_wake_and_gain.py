@@ -3359,7 +3359,7 @@ def test_ending_playback_drops_a_barge_hold_and_resumes_the_clip(monkeypatch: py
     assert held.tts_barge_voice is False
     assert held.tts_stop_frames == []
     assert held.tts_floor_holdoff == 6
-    assert held.tts_barge_cool_until >= before + 1.5
+    assert held.tts_duck_cooldown_until >= before + 1.5
     assert held.whisper_pending is None
     assert held_jobs.empty()
     assert held.state == "IDLE"
@@ -3369,7 +3369,7 @@ def test_ending_playback_drops_a_barge_hold_and_resumes_the_clip(monkeypatch: py
     loose_jobs = tick(loose)
     assert resumes == 1
     assert loose.tts_stop_frames == []
-    assert loose.tts_barge_cool_until == 0.0
+    assert loose.tts_duck_cooldown_until == 0.0
     assert loose_jobs.empty()
 
 
