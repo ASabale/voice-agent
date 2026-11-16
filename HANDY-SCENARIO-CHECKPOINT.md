@@ -49,6 +49,14 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
 
+## Iteration log — 2026-11-16 05:56 UTC (RALF-3 iter 10: first clean soak PASS — VA-SOAK-006 CLOSED)
+
+- Scenario: run 9 in a quiet window (warmup 120 s, controller 251, VoiceBox baseline 3021 MB). **PASS, exit 0** — the first clean soak verdict ever: 24/24 turns strictly attributed, wake 0, speech_failed 0, mic deltas 0/0, slot dir 1, final IDLE with `render_connected: false`, external_generated 0, human_transcript 0.
+- Memory numbers: RSS baseline median 145.39 MB → post-run 79.39 MB (settled *below* baseline); cycle medians 69.3/49.6/73.6/231.0/80.4/78.6 MB, cycle max 231.48 MB (inside baseline+300); VoiceBox sidecar steady 3021–3034 MB — no load spike, no growth across 24 generations. Turn latencies 0.01–33.81 s; the 33.8 s outlier is cycle-1 turn-1 model contention, every subsequent turn ≤ ~15 s.
+- Contamination model fully validated: run 7 (6 root-session lines) → run 8 (1 owner line) → run 9 (0). The warmup gate plus a quiet owner window is the operational recipe; no gate was weakened.
+- A4 opened with a decision doc: `docs/ops/controller-supervision.md` (launchd KeepAlive recommended; owner must approve install).
+- next: execute `scripts/run_conversation_quality_probe.py` (VA-QUALITY-001), then iteration 12 consolidated assessment.
+
 ## Iteration log — 2026-11-16 05:32 UTC (RALF-3 iter 9: soak run 8 CONTAMINATED by owner session 85492; §5 quality probe landed; guardians consolidated to one — VA-SOAK-006)
 
 - Scenario: soak run 8 on controller 251 with the 120 s warmup gate. Every invariant PASS: 24/24 turns played and attributed across six cycles, wake 0, failed 0, mic deltas 0/0, slot dir 1, IDLE final, RSS baseline median 79.25 MB → post 79.73 MB, cycle medians [76.44, 75.08, 56.72, 169.44, 78.06, 48.72] (trend inside band), cycle max 257.33 MB (257.3 ≤ 79.25+300), VoiceBox steady 2991–3054 MB, controller.log 9574 B. Verdict CONTAMINATED (exit 3) on exactly **one** external `generated` line: `omp-vb-85492-49.wav` (116 chars) at 05:27:25.
