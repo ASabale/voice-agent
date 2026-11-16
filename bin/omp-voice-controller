@@ -2197,13 +2197,31 @@ def _command_tokens(text: str) -> list[str]:
     return [token for token in re.sub(r"[\s.,!?;:]+", " ", text.lower()).strip().split(" ") if token]
 
 
+_BARGE_TAILS = (
+    [],
+    ["a", "second"],
+    ["a", "sec"],
+    ["one", "second"],
+    ["one", "sec"],
+    ["second"],
+    ["sec"],
+)
+
+
 def _is_playback_barge(tokens: list[str]) -> bool:
-    """A short barge over our own TTS. Not a sentence that merely ends in stop."""
+    """A short barge over our own TTS. Not a sentence that merely ends in stop.
+
+    The Whisper clip mixes the burst with reply bleed, so the interrupt phrase
+    can be flanked by a word or two of hallucinated transcript. The phrase
+    itself still has to appear verbatim: "hold on" plus an optional
+    a/one second/sec, and nothing else after it.
+    """
     if tokens and all(token == "stop" for token in tokens):
         return True
-    if len(tokens) < 2 or tokens[0] != "hold" or tokens[1] != "on":
-        return False
-    return tokens[2:] in ([], ["a", "second"], ["a", "sec"], ["one", "second"], ["one", "sec"])
+    for i in range(len(tokens) - 1):
+        if tokens[i] == "hold" and tokens[i + 1] == "on" and tokens[i + 2:] in _BARGE_TAILS:
+            return True
+    return False
 
 
 def _slots_match(words: list[str], slots: list[list[str]]) -> bool:
