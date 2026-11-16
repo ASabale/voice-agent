@@ -887,6 +887,11 @@ def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) ->
         float(rate),
         paused_playback_seconds(when),
     )
+    if _duck_ratio != 1.0:
+        # The speaker is physically at duck volume; feeding the full-amplitude
+        # file to the filter makes it chase an echo that is not there and
+        # cancel the person instead. Scale the reference to what comes out.
+        reverse = np.rint(reverse * _duck_ratio).astype(np.int16)
     cleaned = process_echo_block(processor, mic, reverse)
     if echo_over_cancels(mic, cleaned, _guard_reference(samples, started, when, len(mic), float(rate))):
         # A fit that crushed the block removed energy the render reference
@@ -920,6 +925,10 @@ _render_parsed: dict | None = None
 _render_hold_until = 0.0
 _render_paused_at: float | None = None
 _render_paused_seconds = 0.0
+# Fraction of the render volume the speaker is actually emitting while a duck
+# is open. The canceller reference must match the physical echo amplitude, or
+# the adaptive filter diverges and eats near-end speech (VA-BARGE-AEC).
+_duck_ratio = 1.0
 
 
 def refresh_render_reference(now: float | None = None) -> dict:
@@ -1800,6 +1809,8 @@ def duck_output_volume(state: "MicState") -> None:
     _ramp_output_volume(current, target_pct)
     state.tts_duck_restore = current
     state.tts_duck_at = time.monotonic()
+    global _duck_ratio
+    _duck_ratio = target_pct / current if current > 0 else 1.0
     log(f"ducked output volume {current} -> {target_pct}")
     barge_note(state, "duck", from_volume=current, to_volume=target_pct)
 
@@ -1811,6 +1822,8 @@ def restore_output_volume(state: "MicState") -> None:
     previous = state.tts_duck_restore
     state.tts_duck_restore = None
     state.tts_duck_at = None
+    global _duck_ratio
+    _duck_ratio = 1.0
     current = output_volume()
     if current is None or current == previous:
         _run_osascript(f"set volume output volume {previous}")
@@ -3117,7 +3130,7 @@ class MicState:
     tts_barge_skip: int = 0
     tts_barge_loud: int = 0
     tts_barge_next: tuple | None = None
-    tts_barge_cool_until: float = 0.0
+    tts_duck_cooldown_until: float = 0.0
     tts_floor_holdoff: int = 0
     tts_pre_roll: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=8))
     tts_barge_waiting: bool = False
@@ -3326,11 +3339,12 @@ class MicState:
         write_status(self.state, {"chunk_started_at": time.time(), "trigger": reason, "turn": self.turn_metrics()})
 
     def note_barge_release(self) -> None:
-        """A hold that was not a stop. Do not treat the resume attack as a new voice."""
+        """A hold that was not a stop. Restores volume and starts the duck
+        cooldown; detection itself stays open so a repeated "stop" is heard."""
         restore_output_volume(self)
         self.tts_loud_run = 0
         self.tts_floor_holdoff = 6
-        self.tts_barge_cool_until = time.monotonic() + 1.50
+        self.tts_duck_cooldown_until = time.monotonic() + 1.50
 
     def forget_handy_window(self) -> None:
         """Our own stop/start hides the overlay. That hide is not the user closing it."""
@@ -3599,11 +3613,10 @@ class MicState:
                 # and starts it again, which is the echo. A pause now needs
                 # three frames well above that bleed. Those frames are the
                 # person, so they must not become the next floor.
-                hot = (
-                    vad_score >= 0.55
-                    and rms >= gate
-                    and time.monotonic() >= self.tts_barge_cool_until
-                )
+                # No cooldown here: a person saying "stop" again right after a
+                # rejected hold must be heard. Bleed sits below the gate, so
+                # the resume attack cannot open a hold on its own.
+                hot = vad_score >= 0.55 and rms >= gate
                 self.tts_loud_run = self.tts_loud_run + 1 if hot else 0
                 user_voice = self.tts_loud_run >= 3
                 clip_limit = 16
@@ -3613,7 +3626,7 @@ class MicState:
             # only at the third hot frame. Keep the whole current burst above
             # the gate so the clip holds the onset, not just the tail. Bleed
             # sits below the gate and never enters the burst.
-            if rms >= gate and time.monotonic() >= self.tts_barge_cool_until:
+            if rms >= gate:
                 self.tts_pre_roll.append(frame.copy())
             else:
                 self.tts_pre_roll.clear()
@@ -3661,10 +3674,12 @@ class MicState:
                 )
             # Duck only once the burst is sustained and clearly louder than the
             # bleed gate: a brief environmental sound opens the hold but never
-            # touches the volume.
+            # touches the volume. The cooldown limits repeated volume changes;
+            # it never gates detection or classification.
             if (
                 self.tts_loud_run >= DUCK_MIN_HOT_FRAMES
                 and rms >= gate * DUCK_MIN_RMS_FACTOR
+                and time.monotonic() >= self.tts_duck_cooldown_until
             ):
                 duck_output_volume(self)
             keep = False
@@ -3761,7 +3776,15 @@ class MicState:
                         barge_note(self, "resume", reason="clip rejected")
             if self.tts_floor_holdoff > 0:
                 self.tts_floor_holdoff -= 1
-            elif not self.tts_barge_held and not hot and rms < gate:
+            elif (
+                not self.tts_barge_held
+                and not hot
+                and rms < gate
+                # While ducked the bleed is artificially quiet; letting those
+                # frames set the floor collapses the gate and invites hold
+                # flicker as soon as the volume comes back.
+                and self.tts_duck_restore is None
+            ):
                 self.tts_rms_floor.append(rms)
             return True
         if self.tts_barge_held:
