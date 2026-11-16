@@ -49,6 +49,14 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
 
+## Iteration log — 2026-11-16 04:45 UTC (RALF-3 iter 7a: CI red root-caused — dictating handler mixed two clocks — VA-CI-002)
+
+- Scenario: CI run 43804755039 on `f954713` failed 6 `test_handy_control.py` tests with `AssertionError: handy_cancel` while the identical local suite passed 314/314.
+- Experiment: extracted the CI traceback (`bin/omp-voice-controller:3888`, the DICTATING idle-timeout branch) and reproduced the runner environment locally with a pytest plugin pinning `time.monotonic` to 85.0 s (fresh-VM uptime).
+- Result: pre-fix controller + pinned clock → 6 failed, 21 passed — the exact CI failure set. Cause: the "continue dictating" resets (`chunk_started_at = time.monotonic()` at lines 3745/3856/3878) mixed the wall clock with the synthetic frame timeline; on CI 100.1 − 85 ≥ 15 fired the idle timeout, on a long-uptime host the difference is hugely negative and the tests only passed by clock luck.
+- Fix: the three resets now use the frame's `now` (production passes `now = time.monotonic()` per frame, so live behavior is identical). New regression test `test_chunk_restart_timing_follows_the_frame_clock_not_wall_monotonic` pins the clock to 85.0: red on the pre-fix binary (`assert 85.0 == 100.0`), green after. Suites: 28/28 handy, 315 total Python, Node 114.
+- Commit `c13e1d2`, pushed; CI re-run on this HEAD to be observed. Controller 251 runs the pre-fix binary but `now` is `time.monotonic()` in production, so live behavior is unchanged — no restart needed for this fix.
+
 ## Iteration log — 2026-11-16 04:35 UTC (RALF-3 iter 4: soak run 6 — CONTAMINATED, all controller invariants PASS)
 
 - Scenario: VA-SOAK-006 long soak, first run with VoiceBox healthy since the gate recalibration.
