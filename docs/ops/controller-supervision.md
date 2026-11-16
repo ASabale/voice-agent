@@ -1,6 +1,8 @@
 # A4 — Who supervises the controller?
 
-**Current state (measured 2026-11-16 05:47 UTC):** the live controller (pid 251, up ~1 h 25 m) has parent pid 1 — it was started detached and nothing restarts it if it dies. The memory guardian is already a launchd unit (`com.akshay.strata-memory-ceiling`), which is the model to follow.
+**RESOLVED (2026-11-16 07:16 UTC): Option 1 installed.** Owner approved; the unit `~/Library/LaunchAgents/com.akshay.omp-voice-controller.plist` (copy kept at `docs/ops/com.akshay.omp-voice-controller.plist`) runs `run --wake-word hey_jarvis --wake-threshold 0.5 --pause-seconds 5.0 --idle-timeout 15.0` with `KeepAlive: true`, `ThrottleInterval: 10`, stdout/stderr → `~/.local/state/omp-voice/controller-restart.log`. Verified: SIGINT to pid 4085 → launchd respawned pid 4387 in ~14 s, `status` IDLE holding the mic. The old unsupervised pid 251 was stopped cleanly (`stop` exit 0).
+
+**Previous state (measured 2026-11-16 05:47 UTC):** the live controller (pid 251, up ~1 h 25 m) had parent pid 1 — nothing restarted it if it died.
 
 ## Option 1 — launchd unit (recommended)
 - `~/Library/LaunchAgents/com.akshay.omp-voice-controller.plist` with `KeepAlive: true`, the exact production argv (`run --wake-word hey_jarvis --wake-threshold 0.5 --pause-seconds 5.0 --idle-timeout 15.0`), stdout redirected to the rotating `controller-restart.log` path.
