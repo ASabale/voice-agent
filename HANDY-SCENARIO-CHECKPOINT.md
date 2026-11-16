@@ -49,6 +49,30 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
 
+## Iteration log — 2026-11-16 07:15 UTC (RALF-3 iter 12: consolidated assessment — stop new implementation; remaining rows are human-gated)
+
+**Production-proven (automated, live evidence, current tree `0c5b240`):**
+- Level 5 soak: VA-SOAK-006 run 9 PASS (exit 0, first clean verdict ever) — 24/24 attributed, wake 0, failed 0, mic deltas 0/0, RSS settled *below* baseline, VoiceBox steady 3021–3034 MB.
+- Level 4 physical: echo-only acceptance PASS; wake-over-echo PASS (VA-PHYS-002); AEC fields published live (`aec_echo_db`, `aec_blocks`, `aec_guard_blocks`).
+- Level 3 conversation quality: VA-QUALITY-001 automated rows A/B/C/D/F PASS, slop `{}`.
+- Level 1/2: Python 315 + Node 114 green; CI green on every push since the clock-mixing fix (`c13e1d2`, `3051fcc`); three consecutive CI successes at this writing.
+- Ops: single launchd-owned guardian (25180) with `watcher.lock`; `local-llm policy keep`; controller 251 running the current tree; probe infrastructure (pty-drained launch, `send prompt` submission, 25 s drain attribution) hardened.
+
+**Open and not automatable:**
+- **E (human barge ≤ 1.2 s with natural recovery)** and **G (10-minute eyes-off task)** — permanently owner-judged; procedures are in `docs/testing/scenarios/VA-QUALITY-001-conversation-matrix.md` §7. No further probe can substitute for Akshay's verdict.
+- **A4 controller supervision** — decision doc written (`docs/ops/controller-supervision.md`, launchd KeepAlive recommended); owner must approve the install. Controller 251 is currently unsupervised (parent 1).
+- Verbatim double-talk transcription (A6) also needs Akshay's voice.
+
+**Loop economics:** every remaining automated row I can run is already PASS; the remaining rows need an owner action (E, G, A4, double-talk). Continuing iterations would burn budget re-verifying closed rows or gaming the same probes. Recommendation: Akshay supplies the E and G verdicts (five minutes each), decides on the launchd unit, and either issues a fresh RALF budget scoped to those rows or closes RALF-3 with this assessment as the acceptance record.
+
+## Iteration log — 2026-11-16 07:05 UTC (RALF-3 iter 11: VA-QUALITY-001 conversation matrix PASSes all automated rows — §5 closed except E/G)
+
+- Scenario: one isolated omp session driven through the §5 matrix (A progress beats, B failure explanation, C concise explanation, D1/D2/D3 context retention, F honesty, H slop scan) via the bridge, with `OMP_VOICE_LOG_TEXT=1`. **auto_verdict PASS**, exit 0, evidence `.local/voice-agent/runs/VA-QUALITY-001-CONVERSATION-MATRIX.json`.
+- Observed: A 2 clips/14 words (max 9); B 12 clips/284 words with failure+cause+action+outcome all present; C 6 clips/135 words with same-sentence definitions; D2 clip states 150, D3 recalls 100 (and the 20→100→150 lineage); F admits "I don't know — no evidence a VoiceBox 2.0 exists"; slop hits `{}`.
+- Two probe bugs found and fixed before the PASS: (1) the hand-rolled `Popen` launch stalled because nobody drained the pty master — `pipe.start_omp()` handles it (`9a83720`); prompts needed an explicit `send prompt` command or the transcript only appended to the draft. (2) The 6 s drain-quiet threshold ended turns mid-reply (chunk generation gaps are 10–20 s), bleeding clips into the next turn's windows and producing false 0-clip FAILs; drain quiet raised to 25 s and the honesty regex narrowed to release-date claims (`0c5b240`).
+- Gate discipline: no acceptance criterion was weakened; the fixes are measurement-infrastructure bugs, not intent changes.
+- next: E/G owner procedures presented to Akshay; iteration 12 consolidated assessment; A4 launchd install still owner-gated.
+
 ## Iteration log — 2026-11-16 05:56 UTC (RALF-3 iter 10: first clean soak PASS — VA-SOAK-006 CLOSED)
 
 - Scenario: run 9 in a quiet window (warmup 120 s, controller 251, VoiceBox baseline 3021 MB). **PASS, exit 0** — the first clean soak verdict ever: 24/24 turns strictly attributed, wake 0, speech_failed 0, mic deltas 0/0, slot dir 1, final IDLE with `render_connected: false`, external_generated 0, human_transcript 0.
