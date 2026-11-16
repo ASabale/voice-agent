@@ -4313,6 +4313,27 @@ def cmd_status() -> int:
     return 0
 
 
+def _process_exited(pid: int) -> bool:
+    """True when `pid` is gone.
+
+    `kill(pid, 0)` succeeds on a zombie, so a stop issued from the process that
+    spawned the daemon (a supervisor, a test harness, `start_bg`'s caller) would
+    call an exited child still alive. Reap own-child zombies first; probe
+    liveness for everyone else.
+    """
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return True
+    except OSError:
+        pass  # ECHILD: the daemon is not our child; use the liveness probe
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return False
+
+
 def cmd_stop() -> int:
     if not PID_FILE.exists():
         print("OMP Voice Controller is not running.")
@@ -4321,17 +4342,19 @@ def cmd_stop() -> int:
         pid = int(PID_FILE.read_text(encoding="utf-8").strip())
         os.kill(pid, signal.SIGTERM)
         for _ in range(30):
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.05)
-            except OSError:
+            if _process_exited(pid):
                 break
-        PID_FILE.unlink(missing_ok=True)
-        print(f"Stopped OMP Voice Controller (pid {pid}).")
+            time.sleep(0.05)
+        if _process_exited(pid):
+            PID_FILE.unlink(missing_ok=True)
+            print(f"Stopped OMP Voice Controller (pid {pid}).")
+            return 0
+        print(f"Controller pid {pid} is still alive 1.5s after SIGTERM; stop failed, pid file kept.")
+        return 1
     except Exception as exc:
         print(f"Controller not running ({exc}).")
         PID_FILE.unlink(missing_ok=True)
-    return 0
+        return 0
 
 
 def cmd_start_bg(args: argparse.Namespace) -> int:
