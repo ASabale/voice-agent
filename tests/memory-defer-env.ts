@@ -5,3 +5,5 @@
 // mock port (distinct from voicebox-refusal.test.ts's ports).
 process.env.OMP_VOICEBOX_PROFILE = "test-voice";
 process.env.OMP_VOICE_PRESSURE_FILE = "/nonexistent-guardian-state.json";
+// VA-LOG-004: keep mock speech traffic out of the production state directory.
+process.env.OMP_VOICE_STATE_DIR = `${process.env.TMPDIR ?? "/tmp"}/omp-voice-defer-test-state`;

@@ -57,6 +57,18 @@ def test_human_speech_contaminates_rather_than_fails():
     assert probe.evaluate(ev) == "FAIL"
 
 
+def test_concurrent_foreign_session_playback_contaminates():
+    """Run 5: the owner's live session played clips during the soak, so the
+    drain gate saw render_connected true. That is external activity, not a
+    controller failure."""
+    ev = healthy_evidence()
+    ev["external_generated_lines"] = 13
+    ev["final_status"]["render_connected"] = True
+    assert probe.evaluate(ev) == "CONTAMINATED"
+    ev["external_generated_lines"] = 0
+    assert probe.evaluate(ev) == "FAIL"
+
+
 def test_rss_gate_compares_medians_within_settle_limit():
     ev = healthy_evidence()
     ev["rss_post_run_median_mb"] = 180.0 + probe.RSS_SETTLE_LIMIT_MB

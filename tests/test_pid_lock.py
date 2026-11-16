@@ -169,6 +169,52 @@ def test_the_spawned_daemon_inherits_the_lock_so_starts_stay_serialized(tmp_path
                 child.wait()
 
 
+def test_run_refuses_when_the_lock_is_held(tmp_path, capsys):
+    """VA-OPS-002 precondition: a supervised (launchd) `run` must refuse, not
+    hang, while another instance holds the lock. Reproduced first: the old
+    blocking claim made a second `run` load the models and then wait forever
+    on the flock (see .local/voice-agent/runs/VA-OPS-001b-repro.json)."""
+    with _PointedState(tmp_path) as state:
+        holder = _hold_lock(state / "controller.pid")
+        try:
+            assert controller.run_daemon() == 1, "run must exit non-zero while the lock is held"
+            out = capsys.readouterr().out
+            assert "already running" in out.lower()
+            assert controller._open_pid_lock(block=False) is None, "refused run must not steal the lock"
+        finally:
+            holder.kill()
+            holder.wait()
+
+
+def test_cli_run_exits_nonzero_when_supervised_against_a_held_lock(tmp_path):
+    """End-to-end CLI form of the same guard: launchd execs `run` directly, so
+    the process exit code is what the supervisor sees."""
+    with _PointedState(tmp_path) as state:
+        holder = _hold_lock(state / "controller.pid")
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(_PATH), "run"],
+                env={**os.environ, "OMP_VOICE_STATE_DIR": str(state)},
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            assert proc.returncode == 1, f"expected refusal exit 1, got {proc.returncode}"
+            assert "already running" in (proc.stdout + proc.stderr).lower()
+        finally:
+            holder.kill()
+            holder.wait()
+
+
+def test_run_claim_acquires_and_holds_when_free(tmp_path):
+    with _PointedState(tmp_path) as state:
+        handle = controller._claim_run_lock()
+        assert handle is not None, "a free lock must be claimable for a supervised start"
+        assert controller._open_pid_lock(block=False) is None, "the claim must be held, not a transient probe"
+        handle.close()
+        assert controller._open_pid_lock(block=False) is not None, "closing the handle releases the lock"
+
+
 def test_stop_on_a_dead_pid_file_leaves_no_stale_state(tmp_path, capsys):
     with _PointedState(tmp_path) as state:
         pid_file = state / "controller.pid"

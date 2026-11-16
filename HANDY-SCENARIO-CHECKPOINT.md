@@ -2,11 +2,18 @@
 
 This file is the only source of truth for the Handy / Hey Jarvis test pass. Each turn, read this file fresh. Skip every row whose result is `pass`. Take the next `pending` or `fail` row, test it, and write the log result back into that row. If it fails, fix the controller in that same turn and retest until that row passes. Then mark it `pass` and move to the next open row. Do not retest a `pass`. Do not carry the plan from chat memory.
 
-## Current engineering status (authoritative — 2026-11-14 16:53 UTC)
+## Current engineering status (authoritative — 2026-11-16 00:50 UTC live re-derivation)
 
 This section is the only current status. Everything below it is dated historical evidence and must never be read as live state. Pids, ports, and model sizes in any other section are snapshots; re-derive them from `omp-voice-controller status`, `~/.local/state/omp-voice/sessions/<pid>.json`, and `curl -fsS -m 2 http://127.0.0.1:17493/health` before acting.
 
-Verified live at 04:05 UTC this run: controller pid 38298 (restarted 21:16 UTC 2026-11-14, carries the current tree); OMP bridge ok for session 2734; nothing listening on 17493 — the VoiceBox sidecar SIGABRT'd at 21:37 UTC 2026-11-14 (MLX Metal `check_error` signature, see VA-CRASH-001), and only the owner reopening Voicebox.app recovers it. Guardian artifacts are live: `~/.local/state/strata/pressure.json` rewritten every poll (59.94 GiB used, `shedVoice: false`), watchers 38389/38402 running. VoiceBox unload relief was measured once before the crash (21:30 UTC): **11 MB of a 5,656 MB footprint freed** — the MLX arena persists; the extension-side deferral is the real memory lever.
+Verified live at 23:25 UTC this run:
+- **Repo/CI:** branch `main`, HEAD `16ee1732` == origin/main; CI green only on that HEAD (Actions run 43737276711, 16:45 UTC). Working tree: 11 tracked files modified (checkpoint, INDEX, `bin/omp-voice-controller` incl. VA-PASTE-001 settle + `_claim_run_lock`, `extension/voicebox-speech.ts`, soak probes, 4 test files) plus untracked `docs/architecture/` and `docs/testing/scenarios/VA-SOAK-005/007` docs. **None committed → none CI-verified.** Local suites on the working tree: 308 Python + 114 Node passed (re-run 2026-11-16 03:15 UTC after the VA-LOOP-015 player-failure deferral fix; earlier raw: `.local/voice-agent/runs/VA-LOOP-015-suite.txt`, `VA-LOOP-004-suite-current-tree.txt`).
+- **Controller (A2 effectively DONE, owner-approved restart):** pid 90992, started 2026-11-15 23:19 UTC from the **working tree** — the pid lock, VA-AUD-004 flush buffer, turn-latency fields, and the clipboard-settle fix are loaded. `status.json`: `state IDLE`, `pid 90992`, `turn` key present (`turn_seq 1`); `aec_echo_db`/`aec_blocks` not yet published because no render reference has connected since restart. Mic owned by 90992 only; Handy pid 4625. Restart stdout → `controller-restart.log`.
+- **VoiceBox: DOWN — A1 OPEN.** No listener on 17493 (connection refused), no `voicebox-server` process, 12 voicebox crash reports in `~/Library/Logs/DiagnosticReports`. The 17:19 UTC "A1 CLOSED" entry is superseded: the sidecar died after the soak window. Owner must reopen VoiceBox.app before any Priority B/E/F run (runbook: agents must not restart the GUI).
+- **Bridge (re-derived 01:50 UTC):** only session 56658 (`:61545`) remains registered and alive; session 22430 has exited and its registry file is gone. `/health` 404s on these bridges; `/status` is the endpoint.
+- **Guardian (A3 open):** manual 38389 + launchd 38402 (`com.akshay.strata-memory-ceiling`) both running, both started 2026-11-14 21:16 UTC — predating the VA-MEM-007 lock, so neither holds it. `~/.local/state/strata/watcher.lock` contains pid 50063 (re-derived 02:40 UTC: dead — the lock keeps being claimed by short-lived control instances and then orphaned; the dead-owner replace logic itself is verified, VA-LOOP-007/VA-MEM-007b). The two long-running watchers 38389/38402 predate the lock and never claimed it, so nothing is currently guarding the engine. Two unlocked watchers still share kill decisions. `pressure.json` live.
+- **Idle-unload conflict (A5, analyzed 01:25 UTC, VA-OPS-003):** the `local-llm` watchdog (live pid 4616, `policy=idle`, `idle_timeout_sec=300`) stops the engine on any 300 s request gap regardless of memory pressure, while guardian Rule 4 deliberately keeps the model resident below the 62 GiB arm. Predicate reproduction on one snapshot (idle 400 s, Used 59.2 GiB): watchdog stop=True, guardian stop=False. Latent only — agent traffic currently keeps `last_activity` under 300 s. Owner decision: `local-llm policy keep` or raise `idle_timeout_sec`; engine reload costs ~871 s, so a false unload is the expensive side.
+- **Level 4 (physical acoustic): untouched.** No physical double-talk, ERLE, or interruption test has ever run; VA-INT-001 remains the open gate.
 
 **CI baseline fixed (2026-11-14).** Eight consecutive failed Actions runs (43530350727 → 43542615491) had two causes: (1) the openWakeWord wheel ships no model files, so four wake tests failed on the runner — fixed by `ensure_wake_models()` in `bin/omp-voice-controller` (downloads the two ONNX models when missing) plus an autouse fixture in `tests/conftest.py` that calls it before any test needing wake files; (2) `aec-audio-processing` was a bare line in `requirements-dev.txt` — moved to `requirements-aec.txt` and made best-effort in `bin/install`. Reproduced with the exact CI commands in a fresh Python 3.12 venv: `python -m py_compile bin/omp-voice-controller` and `python -m pytest tests/` pass; the three Node files pass on the local node. GitHub still shows the old failing runs until the fix is pushed.
 
@@ -14,11 +21,11 @@ Results by validation level (levels defined in `HANDY-RALPH-VOICE-LOOP-PROMPT.md
 
 | Level | Closed | Open |
 |---|---|---|
-| 1 — unit | Full suite 256 passed; Node files 104 passed (2026-11-14 21:37 UTC). Grammar, playback ownership, playback-slot pruning of dead sessions on both sides plus projection re-derivation after a prune (VA-PLAY-002), speech queue, log rotation including runtime rotation of the daemon's own log (VA-LOG-003), mic-capture accounting, delivery holds, Handy control, dynamic bridge-port discovery (VA-OMP-001/002/003), synthetic AEC (VA-AEC-001–004, VA-AEC-009, VA-AEC-011, VA-OBS-001), turn-latency field semantics (VA-LAT-001 unit tests), guardian tier policy on synthetic traces including the unload race re-check and the bounded `freed=0` unload grace (VA-MEM-001, 13 tests), deferred-sentence retry/expiry/epoch discipline (VA-TTS-014, VA-TTS-017, VA-TTS-018), mid-request socket death held as refusal (VA-TTS-021), crash→recover→crash cycles replay every sentence exactly once in order (VA-SOAK-002) | none blocking |
+| 1 — unit | Full suite 306 passed; Node 110 passed (re-run 2026-11-15 23:45 UTC on the working tree). Grammar, playback ownership, playback-slot pruning of dead sessions on both sides plus projection re-derivation after a prune (VA-PLAY-002), speech queue, log rotation including runtime rotation of the daemon's own log (VA-LOG-003), mic-capture accounting, delivery holds, Handy control, dynamic bridge-port discovery (VA-OMP-001/002/003), synthetic AEC (VA-AEC-001–004, VA-AEC-009, VA-AEC-011, VA-OBS-001), turn-latency field semantics (VA-LAT-001 unit tests), guardian tier policy on synthetic traces including the unload race re-check and the bounded `freed=0` unload grace (VA-MEM-001, 13 tests), deferred-sentence retry/expiry/epoch discipline (VA-TTS-014, VA-TTS-017, VA-TTS-018), mid-request socket death held as refusal (VA-TTS-021), crash→recover→crash cycles replay every sentence exactly once in order (VA-SOAK-002) | none blocking |
 | 2 — fixture-fed controller integration | VA-TTS-007/008/010, VA-AEC-005–008, VA-INT-AUTO-040 (closed 2026-11-14 13:35 UTC: wake, Handy file ASR, two submits, playback, and the stop fixture now cuts a stubbed `afplay` after the AEC correlation guard + pre-roll fix), VA-LAT-001 (turn latency `turn_seq`/`wake_to_flush_s`/`asr_s`/`dispatch_s` published through a full fixture turn; `stop_latency_s` only unit-tested — the Level 2 stop run is blocked on VoiceBox `/generate/stream` 500) | none blocking — VA-AEC-005–008 were re-run against the current uncommitted tree on 2026-11-14 11:19–11:33 UTC and all pass |
-| 3 — local service integration | VA-INT-AUTO-001/003/004/036/037/041 (isolated `omp -p`, real Handy `--transcribe-file`, real VoiceBox, real `afplay`; VA-INT-AUTO-041 cut afplay 0.589 s after the barge hold), VA-SOAK-002 (real 5 s timer chain against a mock restart cycle, natural process exit), VoiceBox unload relief measured: 11 MB of a 5,656 MB footprint freed — MLX arenas persist | end-to-end turn latency (`turn_seq`…`stop_latency_s`) from the running controller: pid 38298 (restarted 21:16 UTC with the current tree) now carries the new code; the interrupt probe rerun is the next iteration |
-| 4 — physical acoustic | none | VA-INT-001 and the five AEC acceptance criteria (room ERLE, no echo wake, verbatim double-talk transcription, stop/wake barge latency, render alignment under `-r` and pause). Mic ownership: pid 38298 (restarted 21:16 UTC from the current tree, so the AEC code path is loaded); VoiceBox is up on 17493, so echo-only criteria (no wake from playback alone, render alignment) can be attempted without human speech. Verbatim double-talk transcription still needs Akshay's voice |
-| 5 — extended reliability | queue saturation at Level 1 (VA-SOAK-001: 300 held sentences replay exactly once on recovery); repeated service restart/recovery cycles at Level 1+3 (VA-SOAK-002: two outages, a 500-on-first-attempt service, all 11 sentences spoken once in order, queue drained, no tmp files, RSS −8.4 MB, natural process exit) | long runs, repeated interruptions, memory growth under a live controller; stale slot/registry cleanup is unit-covered (VA-PLAY-002, dead-pid sweep in `load_session_registry`) but never observed over a long live run |
+| 3 — local service integration | VA-INT-AUTO-001/003/004/036/037/041 (isolated `omp -p`, real Handy `--transcribe-file`, real VoiceBox, real `afplay`; VA-INT-AUTO-041 revalidated 2026-11-15 18:50 UTC: `stop_latency_s` 0.771 s ≤ 1.076 acceptance, real afplay killed, no resume, second turn played), VA-SOAK-002 (real 5 s timer chain against a mock restart cycle, natural process exit), VoiceBox unload relief measured: 11 MB of a 5,656 MB footprint freed — MLX arenas persist | Live-controller turn latency now partially demonstrated: pid 90992 (restarted 23:19 UTC from the working tree) publishes `turn_seq 1`, `wake_to_flush_s 18.09`, `asr_s 0.182`, `dispatch_s 0.573` in its real `status.json`. `stop_latency_s` remains null until a real playback turn occurs — blocked on A1 (VoiceBox down). Full end-to-end revalidation reruns after A1. |
+| 4 — physical acoustic | none | VA-INT-001 and the five AEC acceptance criteria (room ERLE, no echo wake, verbatim double-talk transcription, stop/wake barge latency, render alignment under `-r` and pause). Mic ownership: pid 90992 (restarted 23:19 UTC from the working tree, so the AEC path is loaded); VoiceBox is DOWN on 17493 (A1 open), so no echo can be generated — even the echo-only criteria (no wake from playback alone, render alignment) are blocked until the owner reopens VoiceBox. Verbatim double-talk transcription additionally needs Akshay's voice and mic handover |
+| 5 — extended reliability | queue saturation at Level 1 (VA-SOAK-001: 300 held sentences replay exactly once on recovery); repeated service restart/recovery cycles at Level 1+3 (VA-SOAK-002: two outages, a 500-on-first-attempt service, all 11 sentences spoken once in order, queue drained, no tmp files, RSS −8.4 MB, natural process exit); **four consecutive conversations in one live controller life at Level 5 (VA-SOAK-005, PASS 2026-11-15 18:02 UTC: 4/4 played, render connect/disconnect per turn, zero wake lines, zero failed speech, mic deltas 0/0, RSS median 350.3 → 353.0 MB, peak 179.6 MB, controller IDLE)**; **six consecutive conversations with per-turn VoiceBox footprint and bridge deferred/expired recording at Level 5 (VA-SOAK-007, PASS 2026-11-15 18:42 UTC run 4: 6/6 played, 6 distinct afplay pids, render connect/disconnect every turn, zero wake, zero failed speech, mic deltas 0/0, deferred 0/expired 0 every turn, VoiceBox footprint 3265→7139 peak→5653 MB released on idle, controller IDLE — after runs 1–3 FAIL/FAIL/NOT RUN on gate instrumentation, see iteration log)** | VoiceBox outage/recovery and controller shutdown/restart at Level 5; stale slot/registry cleanup unit-covered (VA-PLAY-002) but never observed over a long live run |
 
 ## Level 4 physical AEC acceptance — BLOCKED (2026-11-14 10:48 UTC)
 
@@ -30,14 +37,443 @@ The five acceptance criteria in `HANDY-RALPH-VOICE-LOOP-PROMPT.md` (ERLE through
 
 What Akshay must do before Level 4 can run: reopen VoiceBox, then restart the controller (`omp-voice-controller stop` then the usual `run --wake-word hey_jarvis --wake-threshold 0.5`). The loop stays non-idle until these rows have live evidence.
 
-## Tested but not loaded into running processes
+## Running-process deployment state (re-derived 2026-11-16 01:05 UTC)
 
-A unit or fixture pass is not live behavior until the process loads it. As of 2026-11-14 03:43 UTC:
+A unit or fixture pass is not live behavior until the process loads it.
 
-- Running controller pid 64238 was never restarted, so it still runs the pre-VA-* code: the old single `tts-playing.json` projection path, the old per-frame VoiceBox health check, the old drop-on-full mic callback, and no `aec_echo_db` / `aec_blocks` / turn-latency fields in `status.json`.
-- Running OMP sessions never reloaded `extension/voicebox-speech.ts`, so the speech-queue fixes (VA-TTS-001–012) are not in effect in them.
-- Uncommitted at the working tree: `bin/omp-voice-controller` publishes turn-latency fields (`turn_seq`, `wake_to_flush_s`, `asr_s`, `dispatch_s`, `stop_latency_s`) in `status.json` under a `turn` key — validated at Level 2 by VA-LAT-001 (2026-11-14), never loaded into the running controller. Plus the adjusted `tests/test_handy_control.py` assertions and `tests/test_echo_control.py` offset tests. `bin/omp-voice-controller` now rotates `controller.log` while running (`_rotate_stdout_log`, VA-LOG-003); pid 64238 started before the change, so its 31 MB log stays unrotated until a restart. `extension/voicebox-speech.ts` now defers sentences when headroom is tight and retries them (VA-TTS-013/014); no running OMP session has reloaded it.
-- Consequence: every VA-* "the live controller still ... until restart" limitation in `docs/testing/INDEX.md` is still true. Before any row is called live, restart the controller or reload the extension and re-observe.
+- **Controller 90992** (started 2026-11-15 23:19 UTC from the working tree) loads: pid lock, VA-AUD-004 flush buffering, turn-latency fields, clipboard-settle fix, the AEC path, and the DELIV hold logic. It does NOT load paste verification (landed 23:35–23:45 UTC) or any edit after 23:19 UTC — including the 01:45 UTC stdout-rotation fix, so `controller-restart.log` keeps growing unrotated until then (`bin/omp-voice-controller` last modified 2026-11-16 01:45 UTC). Restart is owner-gated (A2').
+- **Extension**: live OMP sessions 22430 (started 14:24 UTC) and 56658 (15:51 UTC) loaded the TTS queue, refusal-classifier, and deferral code at session start — VA-SOAK-007's live `deferred`/`expired` counters are the evidence. Extension edits after their start (`voicebox-speech.ts` last modified 2026-11-15 17:10 UTC, the VA-LOG-004 isolation fix) are not in those sessions; a fresh OMP session picks them up.
+- **Guardians 38389/38402** predate the VA-MEM-007 lock and own nothing; `watcher.lock` records dead pid 17998 (A3 open).
+- **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
+- All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
+
+## Iteration log — 2026-11-16 03:15 UTC (VA-LOOP-015: every un-heard player outcome defers, not just watchdog kills)
+
+- Scenario: VA-PLAY-003 extension, Priority E — the 03:00 UTC fix defers only `watchdogFired` hangs. A player that **exits non-zero** or fails to spawn hits `releaseUnspoken` and is never retried: still a silent drop under "no sentence is silently dropped".
+- Hypothesis: any player outcome where `playbackHeard` is false (exit code ≠ 0, spawn error, watchdog kill) should enter the deferred retry chain, while a barge kill (signal without watchdog) stays "heard".
+- Baseline: live re-derived 03:10 UTC — VoiceBox still refused on 17493 (A1 open); controller 90992; registry now 54314 + 56658; watchers 38389/38402, lock owner dead 50063; HEAD `16ee1732`, uncommitted tree.
+- Experiment: new test — fake `afplay` = `#!/bin/sh; exit 1`; enqueue with real `play()`; assert `currentSpokenText()==""` and `currentDeferred().length===1`; then `retryDeferredSpeech` replays exactly once and commits.
+- Actual (red): FAIL `0 !== 1` — released, never retried. Green after fix: 26 tests in the refusal file.
+- Fix (`extension/voicebox-speech.ts`): `play()` now returns `{ heard }` (generalized from `{ hung }`); `speakChunk` defers when `played && played.heard === false && epoch === session.speechEpoch`, `logSpeech(..., reason: "player-failure")`. First deferral timestamp preserved via `speakChunk`'s `at` (VA-TTS-019 rule) so a permanently broken player is bounded by the 120 s expiry. Barge semantics untouched.
+- Regression: full Node suite **114 passed** (was 113); `tests/speech-queue.test.ts` vectors including `playbackHeard(null,"SIGKILL",false)===true` unchanged. Raw: `.local/voice-agent/runs/VA-LOOP-015-suite.txt`.
+- Validation level: 1.
+- Limitations: fake player only; real `afplay` failure modes not reproduced. Not loaded in running OMP sessions until reload; live proof needs VoiceBox (A1).
+- Next action: Priority E closed at Level 1; remainder is owner-gated.
+
+## Iteration log — 2026-11-16 03:00 UTC (VA-LOOP-014: a watchdog-killed hung player defers into the retry chain)
+
+- Scenario: VA-PLAY-003 extension, Priority E — "no sentence is silently dropped" was still violated in practice: the 02:30 UTC fix released watchdog-killed sentences but nothing re-spoke them; the reply's `enqueue` fires once per sentence, so a player hang was still a silent drop. Hung *generations* ride the deferred retry chain; hung *players* did not.
+- Hypothesis: routing a watchdog kill into `session.deferred` makes the existing 5 s cadence / 120 s expiry chain re-speak it automatically, preserving order (the chain stops at the first held sentence).
+- Baseline: live state re-derived 02:55 UTC — VoiceBox still refused on 17493 (no sidecar, 12 crash reports unchanged); controller 90992 IDLE; bridge only 56658 `:61545`; `watcher.lock` owner dead pid 50063; watchdog 4616 alive; Strata engine 4588 resident. HEAD `16ee1732`, uncommitted tree.
+- Experiment: new test in `tests/voicebox-refusal.test.ts` — fake busy-loop `afplay` on PATH, `OMP_PLAY_WATCHDOG_MS=300`, stub generator; after `speechSettled()` assert `currentDeferred().length === 1` and `currentSpeechStatus().deferred === 1`; then `retryDeferredSpeech(stubGen, stubPlayer, now)` must replay it exactly once and commit.
+- Expected: deferral present, retry returns 1, `played=[sentence]`.
+- Actual (red): FAIL — `0 !== 1` at the deferral assertion (raw: first run, captured in-session). Sentence was released but nowhere in the pipeline.
+- Fix (`extension/voicebox-speech.ts`, smallest surface): `play()` now returns `{ hung: watchdogFired }` (type `ClipPlayer` widened to `Promise<{ hung?: boolean } | void>` — stub players returning `void` unaffected); in `speakChunk`, `played?.hung && epoch === session.speechEpoch` → push `{ text: speak, epoch, at }` onto `session.deferred`, `startDeferredRetry()`, `logSpeech("deferred", ..., { reason: "player-hang", timeoutMs: playWatchdogMs() })`, return true so order discipline holds. The deferral timestamp is `speakChunk`'s `at` parameter, so a re-hang keeps the FIRST deferral time (VA-TTS-019 clock rule) — retries against a permanently broken player are bounded by the 120 s expiry instead of looping forever.
+- First fix attempt misplacement: the `return { hung }` landed before `clearTimeout(watchdog)`/slot cleanup, skipping cleanup; caught by reading the tail and moved to the function end. No behavioral effect reached the tests.
+- Contract alignment: the VA-LOOP-013 test simulated pre-fix behavior (manual turn-2 `enqueue` playing immediately). With deferral, a re-enqueue now correctly queues behind the held sentence; the test was rewritten to assert the real contract: re-enqueue does not duplicate the deferral entry (still 1), and the retry chain replays it exactly once.
+- Regression: refusal file 25 passed; full Node suite **113 passed** (was 112); barge contract file `tests/speech-queue.test.ts` 14 passed — `playbackHeard(null,"SIGKILL",false)===true` intact. Raw: `.local/voice-agent/runs/VA-LOOP-014-suite.txt`. Python suite untouched by this TS-only change (308 unchanged).
+- Validation level: 1.
+- Limitations: fake player only, no real `afplay` wedge observed; a legitimately >45 s sentence would be watchdog-killed mid-play and re-deferred (bounded by expiry, at most 2–3 replay attempts) — a clip-duration-aware watchdog (WAV frames/rate + slack, pattern from the VA-PLAY-002 orphan lease) remains a future option, deliberately not implemented. Not loaded in running OMP sessions until reload; retry-chain replay against real `afplay` needs a live VoiceBox (A1).
+- Next action: Priority E is now closed at Level 1 for player hangs. Everything remaining is owner-gated (A1 VoiceBox, A2' controller restart, A3 watcher consolidation, A4 supervision, A5 watchdog policy, Level 4 physical).
+
+## Iteration log — 2026-11-16 02:45 UTC (VA-LOOP-013: the watchdog-released sentence is proven re-speakable)
+
+- Scenario: VA-PLAY-003 follow-up, Priority E — the unproven half of the 02:30 UTC fix: "released, not consumed" had no evidence that the sentence could actually be spoken again.
+- Hypothesis: `releaseUnspoken` with `forget=true` removes the chunk from `session.spoken`, so a later `enqueue` of the same sentence passes dedupe and plays.
+- Baseline: live state re-derived 02:40 UTC — VoiceBox still refused on 17493 (no sidecar process, 12 crash reports unchanged); controller 90992 IDLE, `turn_seq 1`, `stop_latency_s: null`, `render_connected: false`; only bridge session 56658 `:61545`; `watcher.lock` owner is now dead pid 50063 (drift from 41973 — no live watcher, A3 still open); watchdog 4616 alive; Strata engine 4588 resident since Nov 15 19:01; `pressure.json` 59.83 GiB used, headroom 4.17 GiB, `shedVoice: false`.
+- Experiment: two-turn test in `tests/voicebox-refusal.test.ts` — turn 1 enqueues with the real `play()` against the fake busy-loop `afplay` (watchdog 300 ms), turn 2 re-enqueues the identical sentence with a stub player.
+- Expected: turn 1 `spokenText=""`; turn 2 the stub player receives the sentence and it commits.
+- Actual: PASS first run — `played=[sentence]`, `currentSpokenText()=sentence`. No code change needed; the contract held. Raw: `.local/voice-agent/runs/VA-LOOP-013-suite.txt`.
+- Regression: refusal file 24 passed; full Node suite **112 passed** (was 111). Python unaffected (308, unchanged since 02:30 UTC — no Python touched).
+- Validation level: 1.
+- Remaining limitations: re-speaking is caller-driven (the controller must re-enqueue on the next turn); the release is not pushed into the deferred retry chain, so a watchdog-killed sentence is not auto-retried mid-reply. No real `afplay` wedge observed (fake player only).
+- Next action: stop. All remaining rows gate on A1/A2'/A3/A4/A5.
+
+## Iteration log — 2026-11-16 02:30 UTC (VA-LOOP-012: a watchdog-killed hung player no longer counts as spoken)
+
+- Scenario: VA-PLAY-003, Priority E — the silent-drop asymmetry between hung *generation* (defers, retries) and hung *player* (watchdog SIGKILL counted as heard, sentence permanently consumed).
+- Hypothesis: `playbackHeard(null,"SIGKILL",false)===true` (written for barge-in kills) makes the 45 s playback-watchdog kill indistinguishable from a barge, so a never-played clip is `commitSpoken`.
+- Baseline: no test drove the real `play()` with a hung player; the watchdog timeout was hard-coded 45000.
+- Experiment: red first. New test in `tests/voicebox-refusal.test.ts`: stub generator writes a real 4410-frame WAV, player is the real `play()`, PATH prepended with a temp dir containing a fake `afplay` (`#!/bin/sh` busy loop), `OMP_PLAY_WATCHDOG_MS=300`. Pre-fix result: FAIL — `currentSpokenText()` returned the sentence after a 305 ms watchdog kill. Raw: `.local/voice-agent/runs/VA-LOOP-012-hung-player.txt`.
+- Preserved contamination lesson: the first attempt used the default `generate` (dead VoiceBox → deferred → `play` never ran) and passed vacuously in 5 ms; discarded and rewired to a stub generator.
+- Code change: `playWatchdogMs()` env knob (`OMP_PLAY_WATCHDOG_MS`, default 45000 — production threshold unchanged); `watchdogFired` flag set by the watchdog; `commitSpoken` only when `playbackHeard(...) && !watchdogFired`. Barge-in semantics preserved: `speech-queue.test.ts:133` vector `playbackHeard(null,"SIGKILL",false)===true` untouched.
+- Regression: refusal file 23 passed; full Node suite **111 passed** (was 110); Python suite 308 passed unchanged (02:30 UTC).
+- Validation level: 1.
+- Remaining limitations: fake player only — no real `afplay` wedge observed; a watchdog-killed sentence is released/recoverable but not auto-retried in-turn; extension fix not loaded in live OMP sessions until reload.
+- Next action: stop. Everything else gates on A1/A2'/A3/A4/A5.
+
+## Iteration log — 2026-11-16 02:05 UTC (VA-LOOP-011: rotation guard hardened against a deleted stdout file)
+
+- Scenario: VA-LOG-003, Level 1 completion — an untested branch of `_stdout_log_path()`: fd 1 is an over-limit regular file whose path no longer exists (operator `rm` on the redirect file while the daemon holds it open).
+- Hypothesis: the `path.exists()` check refuses rotation instead of recreating a file at the dead name.
+- Baseline: no test covered this; live state unchanged since 01:50 UTC (VoiceBox down, 90992 pre-fix, watchers unlocked — all Priority B–F rows still owner-gated).
+- Experiment: repro outside pytest first — fd opened with `O_CREAT`, written 300 B over a 200-byte limit, unlinked, dup2'd to fd 1. macOS lsof reports the *original* path (no `(deleted)` suffix); `_rotate_stdout_log()` returned `False` and created nothing. This also corrected a wrong assumption in the test's first draft (it claimed lsof appends `(deleted)`).
+- Preserved failed attempt: first test draft failed with `FileNotFoundError` because `os.open` lacked `O_CREAT` — harness bug, not product behavior.
+- Code change: one new test `test_deleted_stdout_file_is_never_rotated` in `tests/test_log_rotation_runtime.py`; no production code touched (guard already behaves correctly).
+- Regression: rotation file 6 passed; full Python suite **308 passed** (02:05 UTC), Node 110 unchanged (no TS edits).
+- Validation level: 1.
+- Remaining limitations: unchanged — everything else gates on A1/A2'/A3/A4/A5.
+- Next action: stop. The loop is fully owner-blocked; no independently executable acceptance row remains.
+
+## Iteration log — 2026-11-16 01:46 UTC (VA-LOOP-010: rotation fix exercised by the real binary, not just pytest)
+
+- Scenario: VA-LOG-003, Level-2 extension — the VA-LOOP-008 fix executed by the actual `bin/omp-voice-controller` process.
+- Hypothesis: a real controller invocation with stdout redirected to an over-limit file rotates that file via the new lsof path discovery; a never-opened `LOG_FILE` stays untouched.
+- Baseline: pytest fixtures passed (Level 1/2 in-process) but no real-process evidence; live `controller.log` 31 MB with no `.1`; seed file 1,048,577 B.
+- Experiment: `~/.local/share/omp-voice/venv/bin/python bin/omp-voice-controller run --wake-word hey_jarvis >> /tmp/va-real-rotation/daemon-out.log` (pid lock held by 90992 → refuses and exits 1; no mic touched). Raw evidence: `.local/voice-agent/runs/VA-LOG-003-real-binary-2026-11-16.txt`.
+- Expected: `daemon-out.log.1` = the 1,048,577-byte seed; the refusal line lands in a fresh `daemon-out.log`; `controller.log` untouched.
+- Actual: exactly that. Fresh file 113 B with the refusal line; backup 1,048,577 B all seed bytes; second run appended 113 more bytes with no second rotation (under-limit no-op). First attempt was invalid (shell `>` truncated the seed at open) and was redone with `>>` — the invalid attempt is recorded in the raw file.
+- Failure analysis: none. Bonus regression confirmation: the pid-lock refusal (`run_daemon` line 4128) fired against the real binary, exit 1, controller 90992 unharmed (etime 02:25:38).
+- Code changes: none.
+- Regression: `test_log_rotation_runtime.py` 5 passed 01:45 UTC; full suite 307 passed; no code touched this iteration.
+- Validation level: 2 (production binary as a real process; no services). Not Level 3 — VoiceBox/daemon integration still requires the A2' restart.
+- Remaining limitations: rotation in the long-lived daemon is only proven after the owner restarts 90992; `controller-restart.log` remains unrotated (495,951 B) until then.
+- Next action: stop — all remaining acceptance rows gate on A1/A2'/A3/A4/A5.
+
+## Iteration log — 2026-11-16 01:50 UTC (VA-LOOP-009: read-only state reconciliation; three status drifts found)
+
+- Scenario: initial-state audit (loop §4).
+- Hypothesis: the authoritative status section is accurate except where events since 01:30 UTC changed live state.
+- Baseline: checkpoint as re-derived 00:50–01:30 UTC; HEAD `16ee1732` == origin/main; 13 tracked files modified + 6 untracked docs/tests; CI green only on `16ee1732` (run 43737276711); local suites 307 Python (01:45 UTC) + 110 Node.
+- Experiment: `git status`, `gh run list`, `pgrep` for controller/guardians/watchdog/voicebox, `lsof :17493`, session registry read, `status.json`, log/lock file inspection. `ps`/`lsof` raw output kept in this entry.
+- Expected: controller 90992 (`IDLE`, turn_seq 1, AEC fields null), VoiceBox refused, watchers 38389/38402 unlocked, two live bridges.
+- Actual: controller 90992 confirmed (`IDLE`, `stop_latency_s: null`, AEC null — no render since restart); VoiceBox connection-refused, 12 crash reports — unchanged. Three drifts: (1) bridge session 22430 exited — registry now only 56658 (`:61545`), verified pid alive; (2) `watcher.lock` owner moved 37843 → 41973, also dead — still no live owner, lock protects nothing; (3) `controller-restart.log` is 495,951 bytes with last write 23:48 UTC, not the "~200 KB/h" estimate — the daemon logs only on events, so unbounded growth is slow but still real (no `.1` exists; fix pending A2'). Watchdog 4616 live.
+- Failure analysis: no product failure; drift is staleness plus the log-rotation gap already recorded as VA-LOG-003.
+- Code changes: none (audit iteration). Status bullets updated: suite count, bridge registry, lock owner.
+- Regression: none needed; no code touched.
+- Validation level: 1 (read-only live-state observation).
+- Remaining limitations: A1/A2'/A3/A4/A5 all owner-gated; no independent acceptance row left that does not need VoiceBox, a controller restart, or the owner's voice.
+- Next action: run the VA-LOG-003 fix against the real binary (spawn `bin/omp-voice-controller status`-class invocation with fd 1 redirected to an over-limit temp file — no mic, no daemon), then stop at the owner gates.
+
+## Iteration log — 2026-11-16 01:45 UTC (VA-LOOP-008: daemon stdout rotation follows the real fd 1 file; live restart log never rotated)
+
+- Scenario: VA-LOG-003 extension — runtime rotation of the daemon's *actual* stdout log.
+- Hypothesis: `_rotate_stdout_log` rotates only when fd 1 is `LOG_FILE` (`os.path.sameopenfile` guard); the live daemon 90992 has stdout redirected to `controller-restart.log`, so its real log never rotates and grows unbounded.
+- Baseline: `controller-restart.log` 496 KB at 01:30 UTC, growing ~200 KB/h since 23:19 UTC, no `.1` backup; `controller.log` 31 MB dead since 2026-11-14. `speech.log` already rotates (`speech.log.1` exists), so the gap is controller-specific.
+- Experiment (Level 2 reproduction): loaded the real controller module, pointed fd 1 at an over-limit non-`LOG_FILE` file (`LOG_ROTATE_BYTES` lowered to 200), called `_rotate_stdout_log()`.
+- Expected: `False` (the bug) — the fd-1 file untouched, `LOG_FILE` untouched.
+- Actual: `False`, confirmed. Reproduction matches the live file's state exactly.
+- Failure analysis: the guard conflates "the daemon's log" with "the constant `LOG_FILE`". Path discovery for fd 1: macOS `fcntl(F_GETPATH)` returns EFAULT on this machine (verified live: errno 14 even on a freshly opened fd, both venv and system Python), and `/dev/fd/1` readlink fails (errno 22); `lsof -p <pid> -a -d 1 -F n` resolves the path reliably.
+- Fix: `_stdout_log_path()` resolves fd 1's regular-file path via lsof (only when the file is already over the limit — never on the hot path), validated with `sameopenfile`; `_rotate_stdout_log()` rotates that path to `.1` and re-points fd 1 at a fresh file of the same name. Terminal, pipe, and deleted-file stdout remain no-ops.
+- Code changes: `bin/omp-voice-controller` (`_stdout_log_path` + `_rotate_stdout_log`, lines ~1094–1140).
+- Regression: post-fix reproduction returns `True`, `.1` backup holds the old 1,048,577 bytes, subsequent writes land in the fresh file, `LOG_FILE` untouched. `tests/test_log_rotation_runtime.py` 5 passed (contract test `test_foreign_stdout_is_never_rotated` rewritten to `test_stdout_redirected_to_another_file_rotates_that_file`; new `test_pipe_stdout_is_never_rotated`). Full suite: 307 passed 01:45 UTC (baseline 306 + net +1).
+- Validation level: 2 (fixture against production logic). Explicit limitation: the fix is NOT loaded in live controller 90992 until the A2' restart; `controller-restart.log` will keep growing (~4.8 MB/day) until then, reaching 1 MiB ≈ 05:30 UTC and never rotating under the old code.
+- Remaining limitations: Level 3 live confirmation requires the owner-gated A2' controller restart; after restart, watch `controller-restart.log` (or its new redirect target) cross 1 MiB and produce a `.1`.
+
+## Iteration log — 2026-11-16 01:30 UTC (VA-LOOP-007: live watcher-lock re-verification; A3 gap quantified)
+
+- Scenario: VA-MEM-007b (single-instance lock, live binary).
+- Hypothesis: the lock's claim/refuse/replace-dead-owner logic works end-to-end against the real `watcher.lock`, and the lock currently protects nothing because no running watcher owns it.
+- Baseline: `watcher.lock` = 17998 (dead VA-MEM-007b control instance); manual 38389 + launchd 38402 running the pre-lock code from 2026-11-14, holding nothing.
+- Experiment: start one short-lived real instance (`strata-memory-ceiling watch`, pid 37843), then run a second instance while it was alive; inspect lock and log after.
+- Expected: first instance replaces the dead owner and enters the loop; second logs `duplicate watcher` and exits 0; no kill action while Used ≈ 59.2 GiB.
+- Actual: all three legs confirmed — lock became 37843 (`watch started` 01:29:21 UTC in `memory-ceiling.log`); second instance logged `duplicate watcher pid=37843 ... this instance exits`, exit 0, no second loop; zero STOP/shed lines during the ~20 s run (Used below every arm). Test instance killed by the iteration; 38389/38402 untouched.
+- Raw evidence: `~/.local/state/strata/memory-ceiling.log` lines ending 01:29:42 UTC; `~/.local/state/strata/watcher.lock`.
+- Failure analysis: none — behavior is correct. The residual risk is exactly the one the row already names: the two live watchers predate the lock and never claim it, so double-watcher kill decisions remain possible until the owner retires one and the launchd unit restarts on the current code.
+- Code changes: none.
+- Regression: lock unit tests (7 in `test_pid_lock.py`, 10 in `test_memory_guardian_contract.py`) already passed in the 306-test suite re-run at 01:25 UTC; no code touched.
+- Validation level: 3 (real binary, real lock file, real process liveness).
+- Remaining limitations: cannot demonstrate the guardrail against the actual double-watcher pair without owner action A3.
+- Next action: unchanged — A1 (VoiceBox), A2' (controller restart for paste verify), A3 (retire one watcher).
+
+## Iteration log — 2026-11-16 01:25 UTC (VA-LOOP-006: watchdog vs guardian idle-unload conflict, A5)
+
+- Scenario: VA-OPS-003 (`docs/testing/scenarios/VA-OPS-003-idle-unload-conflict.md`).
+- Hypothesis: the `local-llm` 300 s idle watchdog and guardian Rule 4 make contradictory unload decisions under normal idle conditions, and the watchdog will unload the warm engine without memory pressure.
+- Baseline: watchdog pid 4616 live since 19:01:42 UTC (engine 4588 up since 19:01:38 UTC, uninterrupted); `omp-autostart.json` `policy=idle`, `idle_timeout_sec=300`; guardian log `idle_unload=arm=62GiB grace=180s resident=1`; steady-state Used ≈ 59.2 GiB (never reaches the 62 GiB arm in normal use).
+- Environment/git: HEAD `16ee1732`, uncommitted working tree; processes 4616 (watchdog), 38389/38402 (guardians), 4588 (engine), 90992 (controller).
+- Experiment: evaluate both predicates on one snapshot — idle 400 s, Used 59.2 GiB, `in_flight=false` — using the exact code constants (`DEFAULT_IDLE_SEC=300`, `IDLE_UNLOAD_ARM_BYTES=PRESSURE_KILL_BYTES=62GiB`, `IDLE_UNLOAD_GRACE_SEC=180`).
+- Expected: predicates agree (both unload or both keep).
+- Actual: watchdog stop=True, guardian stop=False. Conflict confirmed at the predicate level.
+- Raw evidence: in-line computation recorded in the scenario doc; guardian log tail lines 235–240 and state file quoted there.
+- Failure analysis: by design, the watchdog predates the guardian's warm-residency policy; it was never reconciled. Not yet a realized failure because every 300 s window this session covered had at least one request (`now−last_act=0 s` at measurement). The cost asymmetry is decisive: an unnecessary unload forces a ~871 s engine reload, while the guardian's pressure-gated unload only fires when freeing RAM is genuinely required.
+- Code changes: none to production code (owner infrastructure, not repo code). Docs only: new scenario doc, new INDEX row VA-OPS-003, status-section bullet.
+- Regression: Python suite 306 passed (re-run this iteration, 7/7 `test_pid_lock.py` within it); Node suite unchanged since VA-LOOP-004 baseline (110 passed 01:25 UTC).
+- Validation level: 1 (predicate) + 3 (live process observation). Not Level 5: no unload/reload cycle was actually run.
+- Remaining limitations: no realized unload event captured; the conflict is latent until a genuine ≥300 s gap occurs.
+- Next action: owner decision A5 — recommend `local-llm policy keep` so guardian Rule 4 is the single idle-unload authority; alternatively raise `idle_timeout_sec` to ≥3600 s. Do not change the state file without owner approval.
+
+## Iteration log — 2026-11-16 01:30 UTC (VA-LOOP-005: scenario-doc ↔ catalogue alignment; two scenario-ID collisions found)
+
+- Scenario: checkpoint integrity (§13 "Keep scenario documentation aligned with the test catalogue").
+- Hypothesis: every scenario document under `docs/testing/scenarios/` is reachable from a catalogue row.
+- Method: script diffing `See docs/testing/scenarios/...` references in INDEX against the 159 files on disk.
+- Actual: 40 files were orphans (no row linked them). 39 now linked (38 in one pass + the VA-TTS-014 deferred-retry row); `VA-AEC-000-decision.md` was already covered. Re-run of the diff: missing = 0, orphan = 0.
+- Defect found: **duplicate scenario IDs** — `VA-SOAK-005` (row 16, memory-drift gate, PASS 11-15 00:40) and `VA-SOAK-005` (row 174, four-conversation acceptance, PASS 11-15 18:02) are two distinct scenarios sharing one ID, each with its own scenario doc; same for `VA-TTS-014` (rows 32 and 181: the headroom-gate test vs the retry/expiry test). Not renumbered — renumbering would rewrite dated historical evidence; instead both rows now carry explicit scenario-doc links so the distinction is unambiguous. Future scenario docs must use unique IDs.
+- Status changes: none. Code changes: none (INDEX links only). Suites unaffected (documentation-only edit; baseline VA-LOOP-004 stands).
+- Live state re-derivation 01:15 UTC: VoiceBox still refused on 17493, no sidecar pid; controller 90992 IDLE; watchers 38389/38402; bridges 22430 `:53839` / 56658 `:61545`.
+- Next action: A1 remains the unblocking owner action; all Priority B/C/D/E/F live rows stay BLOCKED.
+
+## Iteration log — 2026-11-16 01:25 UTC (VA-LOOP-004: suite baseline refreshed after the 00:28 UTC controller edit)
+
+- Scenario: checkpoint integrity — the "306 + 110 passed (23:45 UTC)" claim predates a later edit to `bin/omp-voice-controller` (mtime 2026-11-16 00:28 UTC, 295-line diff vs HEAD incl. paste verify and `_claim_run_lock`), so the working tree had no current test evidence.
+- Hypothesis: the current tree still passes both suites.
+- Environment: repo `main`, HEAD `16ee1732` == origin/main (CI green only on that HEAD, run 43737276711, 16:46 UTC); 11 tracked files modified, 5 untracked paths; live processes unchanged (controller 90992, watchers 38389/38402, VoiceBox refused on 17493, bridges 22430 `:53839` / 56658 `:61545`).
+- Test commands: `~/.local/share/omp-voice/venv/bin/python -m pytest tests/ -q` and `node --experimental-strip-types --test tests/`.
+- Expected: all pass. Actual: **PASS 2026-11-16 01:25 UTC** — 306 Python (10.6 s, 2 warnings), 110 Node (10.2 s), exit 0 each. Raw: `.local/voice-agent/runs/VA-LOOP-004-suite-current-tree.txt`.
+- Status changes: none — confirms existing Level-1 PASS rows hold on the current tree.
+- Code changes: none (checkpoint/INDEX wording only).
+- Remaining limitations: no CI evidence until the owner commits; live behavior of paste verify still A2'-blocked.
+- Next action: A1/A2' owner actions unblock Priority B/E/F; no independent offline experiment remains that isn't a redundant rerun.
+
+## Iteration log — 2026-11-16 01:15 UTC (VA-LOOP-003: deployment-state sweep — 78 stale "until restart" caveats removed from INDEX)
+
+- Scenario: checkpoint integrity. `docs/testing/INDEX.md` carried "the live controller keeps the old path until restart" caveats written against pids 64238/38298; controller 90992 restarted 23:19 UTC from the working tree, making them false for every fix that landed before that restart.
+- Hypothesis: the running controller loads the tree as of 23:19 UTC; OMP sessions load the extension at session start.
+- Method: `ps -o lstart` for 90992 (Nov 15 18:19 local = 23:19 UTC), 22430 (14:24 UTC), 56658 (15:51 UTC); `stat` mtimes: `bin/omp-voice-controller` 2026-11-16 00:28 UTC, `extension/voicebox-speech.ts` 2026-11-15 17:10 UTC; state dir listing (`controller.log` still 31 MB/Nov 14 unrotated; 90992's stdout goes to `controller-restart.log`, 496 KB).
+- Result: 78 rows swept via one regex pass; `grep` for "until restart|until reload|until restarted" now returns 0 in INDEX. Historical pid references inside PASS evidence notes (e.g. "Live prune now observed on controller 38298") were intentionally kept — they date the observation, they do not claim current deployment. The "Tested but not loaded" section was rewritten as "Running-process deployment state (re-derived 2026-11-16 01:05 UTC)". `docs/testing/scenarios/VA-VB-002-crash-signatures.md` is not a duplicate — it is the canonical scenario doc for VA-VB-002 and is now linked from that row (the handoff's delete plan was wrong).
+- Status changes: none — caveats only. No scenario re-run: no code changed since the 23:45 UTC suite baseline (306 Python + 110 Node), so no PASS row is invalidated.
+- Still blocked: A1 (VoiceBox down — no listener on 17493, re-confirmed 01:03 UTC), A2' (paste verify not in 90992), A3 (watcher lock unowned), A4, A5.
+
+## Iteration log — 2026-11-16 01:05 UTC (VA-LOOP-002: crash-signature re-check duplicates an existing PASS; status table reconciled to the live controller)
+
+- Scenario: Priority B step 1 — verify the crash trigger is not being assumed. Hypothesis: the 12 crash reports reduce to a single fault family.
+- Experiment: independent parse of all 12 `voicebox-server-*.ips` reports (`mlx` faulting frames, termination codes). Raw evidence: `.local/voice-agent/runs/VA-VB-002-crash-signatures.json`.
+- Actual result: 6 unique events — 3 SIGSEGV in `mlx::core::eval_impl` (threads 19/41), 3 SIGABRT through `demangling_terminate_handler()` (threads 39/54). Byte-identical conclusion to the already-recorded VA-VB-002 PASS (17:45 UTC, which additionally names `mlx::core::gpu::check_error(MTL::CommandBuffer*)` as the abort site). No new signal; the exception text is not captured in .ips files.
+- Classification: NOT RUN as a new experiment (redundant rerun of a passing row); the crash trigger still remains a hypothesis — "MLX Metal resource exhaustion" is consistent with the footprint data but unproven. The terminate-handler SIGABRTs carry no message in the crash reports: the Priority B footprint sweep must capture sidecar stderr so the next crash records the exception text.
+- Reconciliation fixes (checkpoint integrity, no production code touched): Level-3 open row corrected — live controller 90992 already publishes `turn_seq 1`, `wake_to_flush_s 18.09`, `asr_s 0.182`, `dispatch_s 0.573` (A2 restart already happened; only `stop_latency_s` awaits a real playback turn, blocked on A1). Level-4 open row corrected — mic owner is 90992, VoiceBox DOWN means even echo-only criteria are blocked.
+- Deterministic check (soak probe blocked-path): `timeout 30 ~/.local/share/omp-voice/venv/bin/python scripts/run_long_soak_probe.py` against the live down VoiceBox → prints "VoiceBox is not healthy. Not launching a server.", exit 2, no mic touched, no sidecar spawned, no artifact written. The run-6 BLOCKED classification in INDEX is enforced by the probe itself, not just by convention.
+- Regression: none needed; no code changed.
+- Next: A1. No independently executable acceptance row remains.
+
+## Iteration log — 2026-11-16 00:50 UTC (VA-LOOP-001: live-state re-derivation — every remaining acceptance row is owner-blocked)
+
+- Scenario: Reliability-First RAL Loop V2 opening audit of this session. Hypothesis: the acceptance rows still open all depend on an owner action (VoiceBox reopen, controller reload, watcher retirement, supervision decision), and none is independently executable.
+- Baseline: checkpoint status claimed lock pid 12596 and "run 6 rerun in progress" in INDEX.
+- Experiment: read-only live derivation — `omp-voice-controller status`, `curl 17493/health`, `pgrep` for controller/voicebox/soak/guardians, `watcher.lock`, `pressure.json`, `/status` + `/slots` on the engine, DiagnosticReports count, git status. No process touched.
+- Actual (00:46–00:50 UTC): controller **90992** `IDLE`, `turn_seq 1`, `stop_latency_s null`, `render_connected false`, mic deltas 0/0; **VoiceBox DOWN** — connection refused on 17493, no `voicebox-server` process, still 12 crash reports (latest pair `voicebox-server-2026-11-14-213715/213716.ips`); guardians **38389** + **38402** alive (footprints 19/15 MB), `watcher.lock` now holds dead pid **17998** — the VA-MEM-007b control instance, not 12596; no live watcher owns the lock; engine **4588** up (`/status` busy false, prompt 93353; `/slots` n_prompt 62263), footprint 15 GB, `pressure.json` 00:45:39Z 58.5 GiB used / 5.5 GiB headroom / `shedVoice false`, rewritten every poll; Handy 4625. **Run 6 of VA-SOAK-006 never started**: no probe process, no new artifact (latest is run 5, `VA-SOAK-006-LONG-run5.json`); the INDEX "rerun in progress" claim was stale and is corrected to NOT RUN.
+- Verdict: BLOCKED (row result, not failure). Independently executable rows: none — the hung-generation hold path (Priority E) already has its Level-1 test ("a watchdog abort on a hung generation holds the sentence and replays on recovery", `tests/voicebox-refusal.test.ts`), and every Level-3+ row needs VoiceBox or the owner.
+- Code changes: none. Regression: none run (no code touched).
+- Level achieved: Level 3 (live service/process observation).
+- Owner actions required, in order: **A1** reopen VoiceBox.app → then Priority B steps 6–10, soak run 6, and the stop-path revalidation; **A2** controller restart to load VA-PASTE-002/003/004 → Priority C live evidence; **A3** retire manual watcher 38389 (or restart the launchd unit) so a current-code watcher claims `watcher.lock`; **A4** decide `docs/architecture/CONTROLLER-SUPERVISION-PROPOSAL.md`.
+- next: A1. The loop stays non-idle: Level-4 physical acceptance (VA-INT-001) is still unrun.
+
+## Iteration log — 2026-11-16 00:37 UTC (VA-OPS-001b: the controller pid lock's refusal loop was only ever tested with synthetic locks)
+
+- Scenario: VA-OPS-001b (Priority A2 precondition). Hypothesis: the installed controller binary (`~/.local/bin/omp-voice-controller`, symlink to the working-tree `bin/omp-voice-controller`) refuses a second `run` while the live controller 90992 holds the pid lock, and never reaches microphone opening.
+- Baseline: 90992 running `IDLE`, `controller.pid` = 90992, no other controller process; refusal logic Level-2 tested only (`tests/test_pid_lock.py`).
+- Experiment: `timeout 10 ~/.local/bin/omp-voice-controller run` while 90992 is live.
+- Expected: immediate refusal message, non-zero exit, no mic opened, no state written.
+- Actual: PASS — `[2026-11-15 19:37:05] OMP Voice Controller already running (pid lock held); refusing to start a second instance.`, exit 1 in under a second; `controller.pid` still 90992; `status.json` unchanged; the refusal branch prints before any `sounddevice` stream is created. First Level-3 observation of the guard against the real running controller.
+- Evidence: captured stdout of the run; `~/.local/state/omp-voice/controller.pid` and `status.json` byte-unchanged afterward.
+- Code changes: none. Regression: full Python suite re-run, 306 passed.
+- Level achieved: Level 3 for the lock refusal. Failure analysis: none.
+- Remaining limitation: this proves a supervised restart cannot double-start, but the running process still loads pre-VA-PASTE-002/003/004 code; deployment still needs the owner-approved restart (A2). A4 supervision decision still BLOCKED.
+- Next: owner restarts the controller; then verify paste-verification log lines appear in `controller.log` on the first dictation.
+
+## Iteration log — 2026-11-16 00:32 UTC (VA-MEM-007b: the real guardian binary's duplicate-refusal path has never fired in production)
+
+- Scenario: VA-MEM-007b (Priority A3). Hypothesis: `~/.local/bin/strata-memory-ceiling watch` exits cleanly before entering the kill loop when a live pid owns `watcher.lock`.
+- Baseline: lock held dead pid 12596; watchers 38389 (manual) + 38402 (launchd) both running, neither holding the lock; no `duplicate watcher` line had ever appeared in the 238-line guardian log.
+- Experiment: write a live dummy pid (600 s `sleep`, pid 15610) into the real lock file, run the real binary under a 5 s timeout, then kill the dummy and rerun.
+- Expected: refusal + `duplicate watcher` log line, exit 0, no monitoring loop entered; second run (dead owner) claims and enters the loop.
+- Actual: PASS for the refusal path — log line 239: `duplicate watcher pid=15610 already owns the memory ceiling; this instance exits (launchd will retry in ThrottleInterval)`, exit 0, process gone in <1 s, engine untouched. Control case: with a dead owner the second run claimed the lock (pid 15674) and entered the loop (hit the 5 s timeout as expected); spawned pid terminated immediately afterward, owner's 38389/38402 untouched, lock restored to 12596.
+- Evidence: `~/.local/state/strata/memory-ceiling.log:239`; lock file restored byte-identical to prior state.
+- Code changes: none. Level achieved: Level 3 (real binary against real state file). Failure analysis: none.
+- Remaining limitation: the mechanism is proven, but live enforcement still requires the owner to retire one of the two pre-lock watchers so a real watcher claims the lock. A3 stays BLOCKED on that owner action.
+- Next: owner retires the manual watcher 38389 (or restarts launchd unit `com.akshay.strata-memory-ceiling`); the replacement instance will claim the lock and refuse any further duplicate.
+
+## Iteration log — 2026-11-15 23:45 UTC (VA-PASTE-004: manual-poll dispatch lines still claimed outcomes without the verdict; plus VA-MEM-008 guardian-lock live check)
+
+- Scenario: VA-PASTE-004 (completes VA-PASTE-003 wiring). Hypothesis: the two `Manual chunk outcome: appended` log sites (IDLE poll ~line 3379, DICTATING catch-up ~line 3685) are the last places reporting an outcome without the landing verdict.
+- Baseline: VA-PASTE-002/003 wired `verified` into `paste_into_focus` and the `dispatch_transcript` fallbacks; manual-poll lines unverified.
+- Environment: working tree `16ee1732`+uncommitted; live controller 90992 `IDLE`; VoiceBox down; Handy 4625.
+- Experiment: fixture test that an unreadable focus (`None` verdict) produces no UNVERIFIED line and `verified: None` (unknown is not a claim); both manual-poll log sites now append `(verified=True/False)` when a verdict exists.
+- Actual result: PASS, 8/8 in `tests/test_paste_verify.py`.
+- Code changes: two one-line log-format changes in the daemon loop; verdict only surfaced when non-None (silent for unknown focus).
+- Regression: 306 Python passed (was 305), 110 Node passed. Not loaded into pid 90992.
+- Level: Level 1. Remaining: same owner-gated reload + Level 4 physical run as VA-PASTE-002/003.
+- Sub-observation (VA-MEM-008, read-only): `watcher.lock` was recreated at 19:22 local by transient pid 12596 (dead); neither 38389 nor 38402 holds it. Deterministic claim-path test: live owner → refused; dead owner → replaced; absent lock → claimed. Refusal path has never fired in production (no `duplicate watcher` line in the guardian log). Classification: logic PASS (Level 1), live enforcement BLOCKED until the owner retires the manual watcher and restarts launchd so a watcher actually claims the lock.
+
+## Iteration log — 2026-11-15 23:35 UTC (VA-PASTE-003: dispatch outcome still said "appended" even when the landing check failed)
+
+- Scenario: VA-PASTE-003 (Priority C dictation integrity, follow-up to VA-PASTE-002). Hypothesis: the verdict returned by `fallback_macos_inject` is discarded by callers, so the dispatch result and logs still claim success unqualified.
+- Baseline: working tree with VA-PASTE-002 verification; live controller pid 90992 `IDLE` (started 23:19 UTC, predates both paste changes); VoiceBox down on 17493; Handy pid 4625.
+- Experiment: fixture tests driving `paste_into_focus` with `fallback_macos_inject` stubbed to `False`/`True`, asserting the result carries `verified` and the failure logs `UNVERIFIED`.
+- Expected: `verified: False` + an UNVERIFIED log line on a failed landing; `verified: True` on a landed paste.
+- Actual: PASS, 7/7 in `tests/test_paste_verify.py` (first run 3 failed because the stub matched the old value-script text; fixed to match `AXFocusedUIElement` — the stub bug, not the product).
+- Code changes (smallest surface): `bin/omp-voice-controller` — `paste_into_focus` returns `verified` and logs `Paste into focus UNVERIFIED` / `Send into focus UNVERIFIED` on a failed landing; the `dispatch_transcript` fallback branches (paused/sent/appended) log `... UNVERIFIED` when the read-back says the text never reached the field. No thresholds or tests weakened.
+- Regression: Python 305 passed (+2), Node 110 passed; `py_compile` clean. CI still only validates committed HEAD `16ee1732`.
+- Level achieved: Level 1 (fixture wiring). Live Level 3 logging requires the controller reload; **not loaded into pid 90992**.
+- Remaining limitations: the manual-poll dispatch outcome line now surfaces verification only via the log lines, not the returned dict for the bridge path (bridge posts have no read-back concept); physical FN dictation with the verification log still needs an owner-approved restart plus Level 4 evidence.
+- Next: owner-approved controller restart, then VA-PASTE-002/003 live evidence during a real dictation turn; Priority C full scenario once VoiceBox and mic handover are available.
+
+## Iteration log — 2026-11-15 23:20 UTC (VA-PASTE-002: paste delivery reports success without confirming the text landed)
+
+- Scenario: VA-PASTE-002 (Priority C dictation integrity). Hypothesis: the silent-loss signature of VA-PASTE-001 is invisible because `fallback_macos_inject` never reads back the focused element; adding a read-back makes a failed paste observable.
+- Baseline: working tree `16ee1732` + uncommitted VA-PASTE-001 settle; live controller pid 90992; Chrome open; dispatch logs showed "outcome: appended" with nothing landing (VA-PASTE-001 evidence).
+- Environment: macOS 25.6, branch `main`, HEAD `16ee1732` (uncommitted working tree), Python 3.12 venv, Node strip-types.
+- Experiment: stub the clipboard/keystroke/value reader and run the production `fallback_macos_inject`; then a Level-3 read of a live Chrome textarea via the real `_focused_element_value`.
+- Expected result: landed paste → `True`; focused element readable but missing the text → `False` + a FAILED log line; unreadable focus → `None`, never a false alarm.
+- Actual result: 5/5 fixture tests pass (landed=True, missing=False, unreadable=None, sent-path verifies before the Enter keystroke, restore happens only after the read). Live Chrome textarea holding "verification demo 741 race failure 963": absent probe → `False`, present probe → `True`. The zero-settle race reproduction did not fail this run (timing-dependent, as measured before: 0 s failed in the earlier sweep) — the detector's verdict logic is proven by the negative control on the real element, not by re-triggering the race.
+- Code changes (smallest surface): `bin/omp-voice-controller` — `_FOCUSED_VALUE_SCRIPT` + `_focused_element_value()` + `_paste_landed()`; `fallback_macos_inject` now sleeps the settle, verifies landing, logs `Paste verified landed` / `Paste verification FAILED`, and returns the verdict (`bool | None`). Verification for `sent` runs before the Enter keystroke. No thresholds or tests weakened. `tests/test_paste_verify.py` added.
+- Regression: Python 303 passed (was 298, +5), Node 110 passed. CI unchanged (green only on committed HEAD; this change is uncommitted).
+- Level achieved: Level 1 (fixture) + Level 3 (real Chrome element read-back through the production reader). NOT Level 4: no physical FN press, no real Handy recording.
+- Remaining limitations: the verdict is not yet in the dispatch outcome line (callers still return `appended` regardless); **not loaded into running controller pid 90992** (started 23:19 UTC before this edit) — another owner-approved restart is required before any live dictation run can log it.
+- Next: reload the controller (owner-approved restart), then the Priority C live dictation scenario once VoiceBox/mic handover is available.
+
+- Scenario: Reliability-First RAL Loop V2 §1 opening audit. Hypothesis: the checkpoint's "authoritative status" no longer matches the running processes.
+- Baseline: checkpoint claimed controller 38298 (pre-`16ee173`), VoiceBox healthy on 17493 (A1 closed), Handy 70200, guardians 38389/38402 lock-free.
+- Experiment: `git`/`gh` state, `omp-voice-controller status`, `status.json` keys, `lsof -i :17493`, `curl /health`, `ps` on every claimed pid, `watcher.lock`, DiagnosticReports count, both bridge ports. No production code touched.
+- Actual result (discrepancies found): (1) controller is now **90992**, started 23:19 UTC from the working tree — the pid lock, VA-AUD-004 flush fix, turn-latency fields, and the VA-PASTE-001 settle are deployed, so the "not loaded into running processes" section (lines 39–46) is stale for the controller; (2) **VoiceBox is down again** — no listener on 17493, no sidecar process, 12 crash reports; A1 reopens and every Priority B/E/F row goes BLOCKED; (3) guardian `watcher.lock` holds dead pid 89565; the two running watchers (38389 manual, 38402 launchd) both predate the lock and hold nothing — two kill-decision-makers remain; (4) Handy is pid 4625, not 70200; (5) bridges 53839/61545 answer `/status`, not `/health` (404); `status.json` publishes `turn` but not `aec_echo_db`/`aec_blocks` until a render reference connects.
+- Verdict: PASS (audit objective: reconciliation completed, status section rewritten in place). Level: Level 3 (live process/service observation).
+- Next: highest-priority independently executable task is **VA-PASTE-002: post-paste landing verification in `fallback_macos_inject`** (dispatch currently reports "appended" with zero confirmation — the exact blind spot that hid VA-PASTE-001). A1-dependent rows (VoiceBox footprint re-baseline, stop-path revalidation, soak run 6) stay BLOCKED until the owner reopens VoiceBox.
+
+## Iteration log — 2026-11-15 23:12 UTC (VA-PASTE-001: FN dictation outside OMP silently pastes the old clipboard in Chrome)
+
+- Scenario: VA-PASTE-001 (Priority C dictation delivery). Hypothesis: the FN → Handy → controller paste path fails because the clipboard restore inside `fallback_macos_inject` races slow paste handlers, not because injection is broken.
+- Baseline: live controller pid 38298 (predates HEAD `16ee173`); Handy pid 70200; owner session 56658 active. Log evidence: FN takes #812/#813 dispatched "Delivery paste ... outcome: appended" at 17:17 local while the owner reported nothing landing in Chrome.
+- Experiment: synthetic pbcopy + System Events Cmd+V into controlled targets, then the controller module (`bin/omp-voice-controller` + `bin/playback_state.py` copied as a package) run via `dispatch_transcript` with focus pinned. TextEdit: paste lands with and without restore. Chrome textarea: paste WITHOUT restore lands; paste WITH immediate restore pastes the pre-injection clipboard (the saved value reappears instead of the injected text); settle sweeps — 0 s fails, 0.2/0.4/0.6 s all land.
+- Failure analysis: `_run_osascript` keystroke returns before the browser reads the clipboard; `pbcopy saved` then overwrites it, so Chrome's async paste handler grabs the old contents. The dispatch reports "appended" with zero verification, hiding the loss. Second, separate defect reproduced: the `AXSelectedTextRange` heuristic marks a Chrome page body (`AXWebArea`, empty value) "editable" — dispatch of "into nowhere 123" reported `appended` with nothing landing anywhere.
+- Code changes (smallest surface): `bin/omp-voice-controller` — (1) `CLIPBOARD_RESTORE_SETTLE_SECONDS = 0.25`; restore is delayed by that settle whenever text was injected; (2) `_FOCUSED_TEXT_SCRIPT` now rejects the `AXSelectedTextRange` fallback on container roles (`AXWebArea`, `AXGroup`, `AXStaticText`, `AXUnknown`, `AXDocument`, `AXImage`), so a focus with no paste target returns not-editable and routes to the bridge instead of a silent no-op. No threshold or test weakened.
+- Regression: 298 passed (Python), 110 passed (Node). Post-patch live Chrome verification: "retry test one two three" and "final check 555" landed in the focused textarea; send phrase "please send that" pasted "please" + Enter (`Submitted draft: 'please'`); clipboard restored after each injection; no-input page focus now returns `Focus is not a text box app='Google Chrome' role='AXWebArea'` → bridge routing. Also confirmed correct tty routing: dispatch while Terminal (owner session 56658) is frontmost went to bridge pid 56658 port 61545. Level: Level 3 (real Chrome/TextEdit + production dispatch code) — NOT Level 4 (no physical FN press).
+- Remaining limitations: no post-paste landing verification in `fallback_macos_inject` yet; partial chunks still never render into non-bridge editors ("Partial field skipped").
+- Live reload (owner-approved): controller pid 38298 stopped, patched controller started as pid 90992 (same wake/pause/idle flags). End-to-end through the live IDLE poll: synthetic Handy `history.db` row #816 → controller log "Manual Handy transcription #816 ... Manual chunk outcome: appended" → text landed in the focused Chrome textarea. Probe row deleted afterwards. Level: production pipeline with synthetic Handy row — still NOT Level 4 (no physical FN press, no real Handy recording).
+- Next: physical FN dictation test in Chrome/TextEdit; optionally add post-paste landing verification.
+
+- Scenario: VA-SOAK-006 (Priority F extended soak, 6 cycles × 4 turns). Hypothesis: with VoiceBox healthy and the probe fixed, one full soak passes every acceptance gate.
+- Baseline: VoiceBox pid 63081 healthy (0.6B mlx/cpu, idle footprint ~3.27 GB); controller pid 38298 IDLE, render_connected false, `aec_echo_db` −2.0.
+- Experiment: re-derived run 5's evidence (`VA-SOAK-006-LONG-run5.json`) against `speech.log`/`controller-restart.log`, then reran the probe (service `soak-006-run6`, pid 18779).
+- Actual result (run 5): CONTAMINATED, not FAIL. All controller invariants passed — 24/24 turns attributed to their own clips, 0 wake, 0 failed speech, mic deltas 0/0, slot dir 1, RSS 289.1 → 149.0 MB median (trend −208.3 MB), VoiceBox 3268/4262/3268/4261/3267/3335 MB (inside the 3000 MB gate). Two gates tripped, both instrumentation: (1) the VoiceBox baseline footprint read returned null on transient lsof misses at run start; (2) `render_connected` was true at the final snapshot because the owner's live session 56658 generated 53 clips concurrently (18:56–19:05 UTC) — external playback, not probe drain failure.
+- Code change (smallest surface): `scripts/run_long_soak_probe.py` — footprint baseline read retries 4× (was 2×); new `external_generated_lines` evidence field counts `generated` events from sessions the probe did not start, and `evaluate()` returns CONTAMINATED when > 0. No acceptance threshold changed.
+- Regression: `tests/test_long_soak_verdict.py` 8 passed (new foreign-playback test); full suites 298 passed (Python), 110 passed (Node). CI baseline unchanged (green on `16ee173`, run 43737276711); the uncommitted probe fix is not CI-verified.
+- Level achieved: Level 3 probe instrumentation + Level 5 soak execution for run 5's controller invariants; clean PASS pending run 6.
+- Remaining limitations: run 6 must complete without foreign-session playback; sub-100 MB RSS drift remains unresolvable by a single run (measured 88 MB idle noise band).
+- Next: classify run 6 from `.local/voice-agent/runs/VA-SOAK-006-LONG.json`.
+
+## Iteration log — 2026-11-15 18:41 UTC (VA-SOAK-007: six consecutive conversations through the live controller — Level 5 PASS on run 4)
+
+- Scenario: VA-SOAK-007 (Priority F "six consecutive conversations" + per-cycle record). Hypothesis: six prompts through one isolated session, played by real `afplay` under the live controller, keep echo tracking, speech delivery, deferral queues, and both process memories stable, with zero wake and zero silent loss.
+- Baseline: controller RSS median 260.3 MB (five spaced samples), lifetime `mic_dropped 34`, `mic_invalid 0`; VoiceBox pid 63081 healthy, idle footprint ~3.3 GB.
+- Environment: HEAD `16ee1732` + uncommitted tree; controller pid 38298 (never restarted — the soak ran against the deployed pre-`16ee173` controller, the code the owner actually uses); isolated `omp -p` session pid 96885, bridge port 50409 read from the registry; microphone never opened by the probe; no human voice.
+- Experiment: `SOAK_TURNS=6 ~/.local/share/omp-voice/venv/bin/python scripts/run_soak_sessions_probe.py` — per-turn VoiceBox footprint before/after generation, bridge `/status` deferred/expired every turn, render connect/disconnect windows, echo samples, RSS peak + turn-boundary samples, wake/failed-speech scans, drain + 120 s settle + 10-sample post-exit RSS median, one-sided cycle trend.
+- Expected: exit 0 with all gates: 6 played / 6 distinct afplay / connect+disconnect every turn / 0 wake / 0 failed / mic deltas 0 / final IDLE / post-exit median ≤ baseline+100 / cycle trend ≤ 100 / peaks < baseline+300.
+- Actual (run 4): **PASS, exit 0.** 6/6 played, 6 distinct afplay pids, 6 clips, zero wake, zero failed, mic deltas 0/0, deferred 0 and expired 0 every turn, slot count 2 at every boundary, final IDLE, footprint oscillating 3265→7139 peak → 5653 MB idle (no crash, release on idle), RSS post-exit median 349.4 (+89.1 MB, inside band), cycle trend +98.05 MB (inside band), max peak 266.6 MB.
+- Failure history preserved: **run 1 FAIL** (post-exit median +107 MB at a 30 s settle; direct 12-sample measurement 15 min later showed a steady 187.9 MB — transient post-drain elevation, not a leak). **Run 2 FAIL** on the gate itself: `abs(drift)` on a −258.7 MB single-sample first-to-last drift — a shrinkage cannot be a leak; single boundary samples swing 70–345 MB within one run. **Run 3 NOT RUN**: TypeError in the trend gate (`len(samples[-half])`) after all turns completed, before evidence was written.
+- Code changes (probe only, no production code): 120 s settle with 10 spaced RSS samples; one-sided smoothed trend `median(last half of turn samples) − median(first half) ≤ 100 MB` with the failure rationale in a comment; typo fix. Gate logic dry-run against run 2's real samples before rerun: +0.9 MB.
+- Regression: `py_compile` clean; functional gates unchanged (no threshold was relaxed — the 100 MB band is the measured idle noise floor from VA-SOAK-006, and the trend gate replaces an unmeasurable single-sample delta with a smoothed one-sided test). Python/Node suites not re-run because only `scripts/run_soak_sessions_probe.py` changed.
+- Validation level: 5 for the conversation-soak class (long run, real services, real playback, memory stability). *Not* Level 5 for code deployed in the running processes: the live controller still predates `16ee173` (A2 owner-gated restart).
+- Remaining limitations: both RSS gates passed but sit inside the 100 MB noise band (89.1 and 98.05) — drift under ~100 MB is unresolvable while the 46 GiB model is resident, so a slow sub-band leak would not be detected by one run; one `footprint` read returned null (transient lsof miss, known probe limitation); turn latencies 0.8–59.5 s are dominated by single-slot local model contention, not by the voice path.
+- Next action: remaining Level 5 open rows (VoiceBox outage/recovery and controller shutdown/restart soak legs) are owner-gated (A2/A4); Priority C dictation validation needs the restarted controller and the owner's voice.
+
+## Iteration log — 2026-11-15 18:02 UTC (VA-SOAK-005: four consecutive conversations through the live controller — Level 5 PASS)
+
+- Scenario: VA-SOAK-005 (Priority F "four consecutive conversations"). Hypothesis: four prompts through one isolated session, played by real `afplay` under the live controller, keep echo tracking, speech delivery, and controller memory stable, with zero wake and zero silent loss.
+- Baseline: controller RSS median 350.31 MB (five spaced samples), lifetime `mic_dropped 34`, `mic_invalid 0`; VoiceBox pid 63081 healthy 0.6B `mlx/cpu`.
+- Environment: HEAD `16ee1732` + uncommitted tree; controller pid 38298 (never restarted, so the soak ran against the *deployed* pre-`16ee173` controller — same code the owner uses); isolated `omp -p` session pid 82233, bridge port 59535 read from the registry; microphone never opened by the probe; no human voice.
+- Experiment: `~/.local/share/omp-voice/venv/bin/python scripts/run_soak_sessions_probe.py` (four prompts, per-turn playback latency, render connect/disconnect windows, echo samples, RSS peak/median, wake-line and failed-speech scans, drain + 180 s settle, 30 s post-exit median).
+- Raw evidence: `.local/voice-agent/runs/VA-SOAK-005-LIVE.json`; scenario doc `docs/testing/scenarios/VA-SOAK-005-four-conversations.md`.
+- Actual result: PASS, exit 0. 4/4 turns played, 4 distinct afplay pids, 4 clips generated; render reference connected and disconnected every turn; 0 wake lines; 0 failed speech events; mic deltas 0/0; RSS post-drain median 353.0 MB (+2.7 MB vs baseline), peak 179.6 MB (well under the 300 MB ceiling); final state IDLE, `render_connected: false`, controller alive.
+- Failure analysis (pre-run): the probe had never been executed and its gates were broken — it required lifetime mic counters to be zero (impossible on a 20-hour controller) and a 20 MB RSS band contradicted its own documented ±180 MB noise. Fix: baseline-captured deltas and the VA-SOAK-006 100 MB median band. Probe-side only; no acceptance criterion weakened.
+- Regression: `tests/test_pid_lock.py` re-run (7 passed); no production code touched.
+- Validation level: **Level 5** (live controller, real service, real playback, repeated turns). Not Level 4 — no microphone interaction.
+- Limitations: echo cancellation during the soak measured −0.1 to −5.3 dB, including one +0.5 dB window — the weak live-path cancellation from AEC-REAL-001 persists and remains a Priority D open item; single session, not six turns; VoiceBox survived only ~4 generations here, so the ~24-generation crash threshold is still unbounded.
+- Next action: six-turn rerun after the owner restarts the controller (A2) so the soak exercises the pid-locked, turn-latency-instrumented deployment; then B step 9.
+
+## Iteration log — 2026-11-15 17:45 UTC (VA-VB-002: crash-report forensics — all six events are Metal command-queue faults)
+
+- Scenario: VA-VB-002 (Priority B step 7, crash signature comparison). Hypothesis: the 12 crash reports share one root-cause signature rather than unrelated triggers.
+- Baseline/environment: `~/Library/Logs/DiagnosticReports/voicebox-server-2026-11-{10,13,14}-*.ips` (12 files, HEAD `16ee1732`, read-only analysis). Live sidecar pid 63081, backend `mlx/cpu`.
+- Experiment: parse each `.ips` header+body; extract exception type, termination, faulting-thread frames, and Metal symbol stack.
+- Raw evidence: `.local/voice-agent/runs/VA-VB-002-crash-signatures.json`.
+- Actual result: **six independent events** (each duplicated as a `.000`/plain pair), all inside MLX Metal command execution:
+  - 3 × `EXC_BAD_ACCESS` segfault in `mlx::core::eval_impl` during `MetalCommandQueue _submitCommandBuffers` (11-10 18:11, 11-13 10:12, 11-14 00:51).
+  - 3 × `abort` from `mlx::core::gpu::check_error(MTL::CommandBuffer*)` on `didCompleteWithStartTime:endTime:error:` or `MetalBuffer initWithDevice` (11-13 08:57, 11-13 10:08, 11-14 21:37 — the 21:37 pair is the soak crash).
+  - No crash reports from any other subsystem; no crashes before 2026-11-10.
+- Key observation: the **currently running sidecar reports `backend_variant: "cpu"`** while every crash frame is Metal/GPU. The 20 crash-free generations in VA-VB-001 ran on the CPU path, so the crash trigger is in the Metal command path, plausibly aggravated by memory pressure (guardian started 21:16 UTC, 21 min before the 21:37 soak crash), but that link is **not established**.
+- Validation level: **Level 1** (forensics of existing artifacts; no live experiment on the crash path).
+- Limitations: `.ips` files carry no uptime or footprint at crash time; crash-frequency comparison against footprint trajectories can't be completed until the A/B runs exist.
+- Next action: owner-gated VoiceBox restart with `MLX_BUFFER_CACHE_LIMIT=4G` and explicit Metal backend to test whether the crash signature reproduces on the GPU path; keep steps 6/8–10 BLOCKED until then.
+
+## Iteration log — 2026-11-15 17:35 UTC (VA-VB-001: VoiceBox footprint baseline — bounded working set, no per-generation drift)
+
+- Scenario: VA-VB-001 (Priority B steps 1–5). Hypothesis: the soak-era footprint growth (5.6→9 GB) is a one-time MLX working-set allocation during generation, not unbounded per-generation leak growth.
+- Baseline/environment: HEAD `16ee1732` (no code change this iteration); VoiceBox sidecar pid 63081, 0.6B model, backend `mlx/cpu`, listener verified via `lsof`; controller 38298 untouched; no microphone opened.
+- Experiment: ten consecutive `/generate/stream` calls (distinct short sentences, profile Akshay `4bde1e0f-…`), `footprint -p 63081` after every generation.
+- Raw evidence: `.local/voice-agent/runs/VA-VB-001-baseline.json` (run 1) and `VA-VB-001-baseline-2.json` (run 2, clean).
+- Run 1: idle 4,037 MB → 8,506 MB across 10 generations; 6 footprint probes returned no match (parser flake; first attempt of the `footprint` CLI intermittently produced empty output). Subsequent direct check: 3,794 MB.
+- Run 2 (retry-hardened parser): idle 3,792 MB → first generation 8,273 MB → generations 2–10 span 8,226–8,333 MB (+60 MB over nine generations, non-monotonic). Latency: 7.1 s cold → 4.0–4.8 s warm.
+- Settle: 60 s after the run, footprint = 3,220 MB. Working set is released when idle.
+- Stability: 20 consecutive generations, zero sidecar crashes; crash-report backlog unchanged at 12 (newest `voicebox-server-2026-11-14-213715/213716.ips` — a duplicate pair from the known SIGABRT).
+- Failure analysis: Run 1's all-422 generations were a probe bug (urllib omitted `Content-Type: application/json`), not a service failure — preserved as recorded, not counted as evidence. Run 1 still yielded valid idle→active footprint data since the server processed some earlier curl probes.
+- Validation level: **Level 3** (real VoiceBox service; no playback through the controller yet).
+- Acceptance status: "No unexplained monotonic memory growth" **PASS for the 10-generation window** — growth plateaus after warm-up and is released on idle. The crash trigger is **not established**: the 24-generation soak crash coincided with footprint ~9 GB, but a bounded 8.3 GB working set alone does not explain the MLX Metal `check_error`.
+- Limitations: 10 generations is short; growth beyond warm-up (21–24+ generations) untested. `MLX_BUFFER_CACHE_LIMIT=4G` A/B, restart measurement, and six-cycle soak require an owner-gated VoiceBox restart (GUI app) → **BLOCKED**. Speech delivery through the controller (soak acceptance "held sentences recover") additionally requires the A2 controller restart → **BLOCKED**.
+- Next action: owner restarts VoiceBox with `MLX_BUFFER_CACHE_LIMIT=4G` set (runbook procedure) for the A/B; meanwhile A2/A3/A4 remain the gating owner actions.
+
+## Iteration log — 2026-11-15 18:50 UTC (VA-INT-AUTO-041 revalidation: stop path survives the 11-15 working-tree changes)
+
+- Scenario: VA-INT-AUTO-041 (Priority E stop-path revalidation). Hypothesis: the stop path (`barge hold → Whisper → stopPlayback → real afplay kill`) still works after the VA-LOG-004 `voiceStateDir()` change and the VA-OPS-001b pid-lock edit, and `stop_latency_s` stays within the ≤ 1.076 s acceptance.
+- Baseline: 2026-11-13/14 runs — controller `stop_latency_s` 0.589–0.832 s; probe-detected afplay death 1.076 s.
+- Environment: HEAD `16ee1732` + uncommitted working tree; controller module loaded from `bin/omp-voice-controller` via `SourceFileLoader` (so the tested code is the working-tree code); VoiceBox sidecar pid 63081 (0.6B, `mlx/cpu`); isolated `omp -p` session pid 78315, bridge port 57324 discovered dynamically; microphone never opened (`microphone_opened: false`).
+- Experiment: `~/.local/share/omp-voice/venv/bin/python scripts/run_interrupt_probe.py` — real reply generated, real `afplay` playing (pid 79282), fixture `stop-say.wav` fed through the production frame loop.
+- Raw evidence: `.local/voice-agent/runs/VA-INT-AUTO-041.json`.
+- Actual result: PASS. Whisper heard `stop.`; stages `speaking → hold → clip → whisper → stop_playback → speaking`; `stop_latency_s` 0.771 s; probe-detected death 1.15 s after hold; `resumed: false`; second turn generated and played (`second_playback: true`); final state `IDLE`. Exit 0.
+- Failure analysis: none. No code changes this iteration.
+- Regression: full Python (297) and Node (110) suites unchanged from the 17:10 UTC run; no production-code surface was touched, so re-running the suites was not required.
+- Validation level: **Level 3** (real VoiceBox, real `afplay`, isolated OMP session). The barge audio is fixture-fed, not the owner's voice — not Level 4.
+- Limitations: single run; `stop_latency_s` here comes from the probe-loaded controller instance, not the live pid 38298 (which predates the pid lock). Live controller publication of `stop_latency_s` still awaits the owner-gated restart (A2).
+- Next action: owner restarts the controller to deploy the pid lock + VA-AUD-004, then Priority C dictation validation; VoiceBox restart for the B step-6 A/B remains the top Priority B blocker.
+
+## Iteration log — 2026-11-15 17:45 UTC (VA-VB-002: crash-report forensics — one fault family, two subtypes)
+
+- Scenario: VA-VB-002 (Priority B step 7, crash signature comparison). Hypothesis: the 12 crash reports share one root-cause family rather than unrelated triggers.
+- Baseline/environment: `~/Library/Logs/DiagnosticReports/voicebox-server-2026-11-{10,13,14}-*.ips` (12 files), HEAD `16ee1732`, read-only parse; live sidecar pid 63081 (`/health` `mlx/cpu`), controller 38298 untouched, no microphone opened.
+- Experiment: parse each `.ips` header+body; extract signal, termination, faulting-thread frames, and process uptime from `procStartAbsTime`/`procExitAbsTime`.
+- Raw evidence: `.local/voice-agent/runs/VA-VB-002-crash-signatures.json`. First parse attempt aborted on a `str - str` uptime bug; the corrected parse is what is preserved.
+- Actual result: 12 files = **6 unique events** (macOS wrote a duplicate per event). All six fault inside MLX Metal execution — no non-MLX fault frame in any report:
+  - Subtype A — `EXC_BAD_ACCESS` SIGSEGV in `mlx::core::eval_impl` ← `mlx::core::eval` ← `_PyEval_EvalFrameDefault`: 11-10 18:11 (uptime 1.4 s), 11-13 10:12 (0.9 s), 11-14 00:51 (81.6 s).
+  - Subtype B — SIGABRT via `mlx::core::gpu::check_error(MTL::CommandBuffer*)` on `didCompleteWithStartTime:endTime:error:` → uncaught C++ terminate: 11-13 08:57 (uptime 2765 s), 11-13 10:08 (93 s), 11-14 21:37 (461 s — this is the soak crash after ~24 generations).
+  - Two of the six segfault within 1.5 s of process start: model-load-time Metal faults, not generation-time faults.
+- Expected vs actual: expected one shared signature → actual one shared family (MLX Metal command execution) with start-up and runtime subtypes. Pattern established; **trigger still not identified** — the reports carry no footprint or memory-pressure context at crash time.
+- Code changes: none (read-only forensics).
+- Regression: none needed; Python 297 / Node 110 suites remain as recorded at 17:10 UTC.
+- Validation level: **Level 1** (artifact forensics; no live reproduction of the crash path).
+- Limitations: crash frequency cannot be correlated with footprint trajectories until the step-6 A/B and step-8 restart runs exist. Note the live sidecar reports `backend_variant: "cpu"` in `/health` while every crash frame is Metal — the crash path may only exist under the Metal backend.
+- Next action: owner-gated VoiceBox restart with `MLX_BUFFER_CACHE_LIMIT=4G` (step 6 A/B); steps 8–10 stay BLOCKED until then.
+
+## Iteration log — 2026-11-15 17:10 UTC (VA-LOG-004: mock suites no longer pollute the production speech.log)
+
+- Scenario: VA-LOG-004 (test hygiene). Hypothesis: Node mock suites append mock payloads to the production `~/.local/state/omp-voice/speech.log`, corrupting outage forensics (flagged in the 16:55 audit). Baseline: 1,551 mock `generated` entries (identical 8864-byte/4410-frame `validWav` clips) dated 2026-11-15 in the production log.
+- Environment: HEAD `16ee1732` + uncommitted working-tree edits; root cause: `logSpeech`/`voiceStateDir` hardcoded `os.homedir()/.local/state/omp-voice` with no env override, while the Python controller honors `OMP_VOICE_STATE_DIR`.
+- Experiment 1 (reproduction): run `node --experimental-strip-types --test tests/speech-queue.test.ts tests/voicebox-refusal.test.ts tests/playback-state.test.ts` → production mock entries **1551 → 1854 (delta +303)**.
+- Code change (smallest surface): `voiceStateDir()` now honors `OMP_VOICE_STATE_DIR` (mirroring the controller convention); `logSpeech` uses it; `tests/voicebox-refusal-env.ts` and `tests/memory-defer-env.ts` point it at a per-suite temp dir. Also isolates the mock playback-slot writes, which shared the same hardcoded path.
+- Experiment 2 (identical run, full suite): node exit 0, **110 passed, 0 failed**; production mock entries **1854 → 1854 (delta 0)**; the 303 mock events verified inside `$TMPDIR/omp-voice-refusal-test-state/speech.log` (312 requested / 307 deferred / 303 generated / 5 dropped) and the defer suite's temp dir. Raw evidence: `.local/voice-agent/runs/VA-LOG-004-isolation.json`.
+- Regression: Node full suite green; Python suite untouched. The production extension in *running* OMP sessions still loads the old code until the session reloads the extension — no live process touched.
+- Validation level: **Level 1** (mock-service test isolation; no live service involved).
+- Limitations: production `speech.log` retains ~1,854 historical mock entries — audit tooling must filter `bytes == 8864` mock payloads until the file rotates; no destructive cleanup of owner state files was performed.
+- Next action: owner decides A1–A4; the uncommitted fix (VA-OPS-001b + this) needs owner authorization to commit before CI can verify it.
+
+## Iteration log — 2026-11-15 17:10 UTC (VA-OPS-001b: `run` refuses instead of hanging on a held lock)
+
+- Scenario: VA-OPS-001b (VA-OPS-002 precondition). Hypothesis: a supervisor starting `run` while another instance holds the pid lock would block forever instead of refusing, making KeepAlive supervision unsafe. Baseline: `run_daemon` used `_open_pid_lock(block=True)`; the lock was only a non-blocking probe in `cmd_start_bg`.
+- Environment: HEAD `16ee1732` + this iteration's uncommitted edits; no running process touched (live controller 38298 predates the lock code and holds no lock).
+- Experiment 1 (reproduction): synthetic flock holder + `venv bin/omp-voice-controller run` with `OMP_VOICE_STATE_DIR` pointed at a temp dir → **hung 12 s after loading openWakeWord/Whisper, never exited**. Raw evidence: `.local/voice-agent/runs/VA-OPS-001b-repro.json`. Reproduction confirmed the gap before fixing it.
+- Code change (smallest surface): new `_claim_run_lock()` (non-blocking; inherits `OMP_VOICE_PID_LOCK_FD` for the `start` path); `run_daemon` claims it before importing sounddevice/Whisper/openWakeWord and returns 1 with an explicit refusal message; `run_daemon` now returns int and `main` propagates the exit code. Old blocking claim at line ~4047 deleted.
+- Experiment 2 (same experiment, after fix): exit code **1**, **0.07 s**, output `OMP Voice Controller already running (pid lock held); refusing to start a second instance.` — no model load, no microphone opened. Raw evidence: `.local/voice-agent/runs/VA-OPS-001b-postfix.json`.
+- Regressions: `tests/test_pid_lock.py` 7 passed (4 existing + 3 new: in-process refusal, CLI exit code, claim-held-not-transient); full Python suite 297 passed. Node suite not re-run (no Node change).
+- Validation level: **Level 1** (deterministic flock behavior, synthetic holder, mic never opened). Not deployed: live pid 38298 does not carry this code; it predates even VA-OPS-001.
+- Limitations: kernel flock semantics verified, not supervisor behavior — no plist exists and none will be installed without owner approval.
+- Next action: owner decides A1–A4. If Option B is approved, cutover is: stop manual controller, owner installs plist, verify crash-restart within ~5 s and single mic owner.
+
+## Iteration log — 2026-11-15 17:05 UTC (VA-OPS-002 supervision proposal written)
+
+- Scenario: VA-OPS-002 (A4). Hypothesis: launchd KeepAlive supervision removes the manual-restart handover bottleneck without new failure modes. Baseline: manual `run` with shell redirect (pid 38298, ~20 h, drift from validated HEAD), guardian already launchd-managed as a working precedent.
+- Environment: HEAD `16ee1732`, no service dependency; lifecycle code read directly (`bin/omp-voice-controller` lines 2765–2778, 4041–4143, 4200–4247).
+- Result: proposal at `docs/architecture/CONTROLLER-SUPERVISION-PROPOSAL.md`; INDEX row VA-OPS-002 added as BLOCKED (owner decision). Classification: NOT RUN for the supervision itself (no experiment — the decision is pending); PASS for the proposal deliverable (Level 1, code-read evidence).
+- Concrete gap found: `run` opens the pid lock **blocking** (`_open_pid_lock(block=True)`), so a launchd-supervised instance started while a manual one holds the lock would hang blocked forever rather than refuse. The `start` probe path is the only place the lock is non-blocking. Fix (small, test-backed by `tests/test_pid_lock.py`) must land before any plist is installed.
+- No code changes this iteration; no processes touched; nothing committed (per authorization rules).
+- Next action: owner decides A1–A4. Once VoiceBox is reopened and the controller restarted (ideally via the chosen supervisor), the blocked Level-3/4/5 rows (B, C, D, E, F) become executable in that order.
+
+## Iteration log — 2026-11-15 16:55 UTC (read-only state audit; status section reconciled)
+
+- Scenario: VA-OPS-003 (operational reconciliation). Hypothesis: the authoritative status section's live claims are stale relative to the running processes. Baseline: status header dated 2026-11-14 16:53 UTC with claims "controller carries the current tree", "bridge ok for session 2734", "Python 256 / Node 104".
+- Environment: repo HEAD `16ee1732` (== origin/main, clean tree), CI run 43737276711 success on that HEAD. Actuals: Python suite 294 passed, Node 110 passed; controller 38298 up since 21:16:19 UTC 2026-11-14, so it does **not** carry `16ee173`'s VA-AUD-004/VA-OPS-001 changes; bridge is session 22430 on 53839; VoiceBox listener absent (GUI 38478 only); guardians 38389 (manual) + 38402 (launchd) both predate the VA-MEM-007 lock; `watcher.lock` names pid 57227, not a running watcher.
+- Raw evidence: `omp-voice-controller status` output, `lsof -iTCP:17493 -sTCP:LISTEN` (empty), `gh run list` output, `ps -o lstart` for 38298/38389/38402, `stat` on `controller.log` (31,063,970 B, mtime = restart instant) vs `controller-restart.log` (185,840 B, live mtime), `speech.log` tail (identical 8864-byte mock clips at millisecond cadence).
+- Findings: (1) status section updated in place; (2) the running controller's stdout log is `controller-restart.log`, outside VA-LOG-003's rotation guard — rotation never fires for it; (3) Node mock tests write into the production `speech.log`, polluting the outage forensics (test isolation should point `OMP_VOICE_STATE_DIR`/log path at a temp dir — not yet done); (4) `expiredSpeech: 17` on session 22430 is real Level-3 evidence that the 120 s deferral expiry fired during the VoiceBox outage.
+- Result: PASS for the audit itself (Level 1 observation, read-only, no code change). No production code touched.
+- Remaining blockers (owner-gated, unchanged): reopen VoiceBox (A1), restart controller 38298 to load `16ee173` (A2), retire the manual watcher 38389 and restart the launchd instance so the single-instance lock is loaded (A3), decide VA-OPS-002 controller supervision (A4).
+- Next action: prepare the VA-OPS-002 supervision proposal (the only Priority-A item executable without owner action).
 
 ## Iteration log — 2026-11-14 20:05 UTC (a 300-sentence reply survives an outage)
 
