@@ -95,8 +95,8 @@ def main() -> int:
         "controller_is_pre_existing": True,
         "omp_pid": pid,
         "bridge_port": port,
-        "note": "guard counter (aec_guard_blocks) is not yet published by the "
-        "pre-existing controller; windows are raw aec_echo_db only",
+        "note": "guard counter (aec_guard_blocks) is published by the "
+        "pre-existing controller; windows record aec_echo_db and guard blocks",
     }
     try:
         submit = post(
@@ -130,6 +130,7 @@ def main() -> int:
                 "render_connected": snap.get("render_connected"),
                 "aec_echo_db": snap.get("aec_echo_db"),
                 "aec_blocks": snap.get("aec_blocks"),
+                "aec_guard_blocks": snap.get("aec_guard_blocks"),
                 "render_cursor": snap.get("render_cursor"),
                 "state": snap.get("state"),
             }
