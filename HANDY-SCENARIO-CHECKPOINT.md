@@ -2,18 +2,20 @@
 
 This file is the only source of truth for the Handy / Hey Jarvis test pass. Each turn, read this file fresh. Skip every row whose result is `pass`. Take the next `pending` or `fail` row, test it, and write the log result back into that row. If it fails, fix the controller in that same turn and retest until that row passes. Then mark it `pass` and move to the next open row. Do not retest a `pass`. Do not carry the plan from chat memory.
 
-## Current engineering status (authoritative — 2026-11-16 00:50 UTC live re-derivation)
+## Current engineering status (authoritative — 2026-11-16 03:55 UTC live re-derivation)
 
 This section is the only current status. Everything below it is dated historical evidence and must never be read as live state. Pids, ports, and model sizes in any other section are snapshots; re-derive them from `omp-voice-controller status`, `~/.local/state/omp-voice/sessions/<pid>.json`, and `curl -fsS -m 2 http://127.0.0.1:17493/health` before acting.
 
-Verified live at 23:25 UTC this run:
-- **Repo/CI:** branch `main`, HEAD `9d22501` == origin/main (pushed 2026-11-16 03:20 UTC with owner authorization: all VA-LOOP-005–015 work — controller rotation + paste-verify, deferral-chain player-failure fix, tests, scenario docs, supervision proposal). CI on the new HEAD pending; previous HEAD `16ee1732` was green (Actions run 43737276711). Working tree now clean. Local suites before push: 308 Python + 114 Node passed (raw: `.local/voice-agent/runs/VA-LOOP-015-suite.txt`).
-- **Controller (A2 effectively DONE, owner-approved restart):** pid 90992, started 2026-11-15 23:19 UTC from the **working tree** — the pid lock, VA-AUD-004 flush buffer, turn-latency fields, and the clipboard-settle fix are loaded. `status.json`: `state IDLE`, `pid 90992`, `turn` key present (`turn_seq 1`); `aec_echo_db`/`aec_blocks` not yet published because no render reference has connected since restart. Mic owned by 90992 only; Handy pid 4625. Restart stdout → `controller-restart.log`.
-- **VoiceBox: DOWN — A1 OPEN.** No listener on 17493 (connection refused), no `voicebox-server` process, 12 voicebox crash reports in `~/Library/Logs/DiagnosticReports`. The 17:19 UTC "A1 CLOSED" entry is superseded: the sidecar died after the soak window. Owner must reopen VoiceBox.app before any Priority B/E/F run (runbook: agents must not restart the GUI).
-- **Bridge (re-derived 01:50 UTC):** only session 56658 (`:61545`) remains registered and alive; session 22430 has exited and its registry file is gone. `/health` 404s on these bridges; `/status` is the endpoint.
-- **Guardian (A3 open):** manual 38389 + launchd 38402 (`com.akshay.strata-memory-ceiling`) both running, both started 2026-11-14 21:16 UTC — predating the VA-MEM-007 lock, so neither holds it. `~/.local/state/strata/watcher.lock` contains pid 50063 (re-derived 02:40 UTC: dead — the lock keeps being claimed by short-lived control instances and then orphaned; the dead-owner replace logic itself is verified, VA-LOOP-007/VA-MEM-007b). The two long-running watchers 38389/38402 predate the lock and never claimed it, so nothing is currently guarding the engine. Two unlocked watchers still share kill decisions. `pressure.json` live.
-- **Idle-unload conflict (A5, analyzed 01:25 UTC, VA-OPS-003):** the `local-llm` watchdog (live pid 4616, `policy=idle`, `idle_timeout_sec=300`) stops the engine on any 300 s request gap regardless of memory pressure, while guardian Rule 4 deliberately keeps the model resident below the 62 GiB arm. Predicate reproduction on one snapshot (idle 400 s, Used 59.2 GiB): watchdog stop=True, guardian stop=False. Latent only — agent traffic currently keeps `last_activity` under 300 s. Owner decision: `local-llm policy keep` or raise `idle_timeout_sec`; engine reload costs ~871 s, so a false unload is the expensive side.
-- **Level 4 (physical acoustic): untouched.** No physical double-talk, ERLE, or interruption test has ever run; VA-INT-001 remains the open gate.
+Verified live at 03:45–03:55 UTC this run (RALF run 3, iterations 1–3):
+- **Repo/CI:** branch `main`, HEAD `4632308` == origin/main; working tree carries the VA-OPS-004 fix (cmd_stop verification) plus its scenario doc until committed. Suites on the tree: 311 Python passed (03:50 UTC, was 308), Node 114 baseline stands (no TS touched this run).
+- **Controller:** pid 90992 (started 2026-11-15 23:19 UTC from the working tree — pid lock, VA-AUD-004 flush buffer, turn-latency fields, clipboard-settle, AEC path loaded; paste-verify and stdout rotation landed after 23:19 UTC and are NOT loaded). `status.json`: `IDLE`, `turn_seq 2`. AEC fields ARE now published live: the 03:53 UTC echo probe saw `aec_echo_db`/`aec_blocks`/`render_cursor` through a real playback. Mic owned by 90992 only; Handy pid **85667** (drift from 4625 — Handy was restarted). Restart stdout → `controller-restart.log` (still unrotated until A2').
+- **VoiceBox: UP — A1 CLOSED (03:46 UTC).** `/health` healthy, 0.6B loaded; a real `/generate/stream` request produced a 215 KB, 4.48 s, 24 kHz mono WAV; the clip played end-to-end in the echo probe (`clip_frames 222720`, afplay confirmed). Crash-report count unchanged (12 historical).
+- **Handy functional proof (03:46 UTC):** the VoiceBox clip was fed to `handy --transcribe-file` (real Qwen3-ASR-0.6B, Metal, 35.8× realtime) and came back verbatim: "The quick brown fox jumps over the lazy dog at four twenty-seven." First same-process VoiceBox→Handy round trip with verbatim text.
+- **Bridge (re-derived 03:46 UTC):** live sessions 85492 (`:63399`) and 54314 (`:62725`); 54314 predates the newest extension edits. `/status` is the endpoint, `/health` 404s.
+- **Guardian (A3 open, unchanged):** manual 38389 + launchd 38402 both running, both pre-lock, neither holds `watcher.lock` (owner 64635, dead). Nothing is guarding the engine; two unlocked watchers share kill decisions. `pressure.json` live.
+- **Idle-unload conflict (A5, unchanged):** watchdog (policy=idle, 300 s) vs guardian Rule 4 predicate disagreement stands (VA-OPS-003). Owner decision pending.
+- **Level 4 (physical acoustic): echo-only criteria now PASSED (03:53 UTC).** Real speakers → real mic: 9 status windows during a 9.28 s reply, residual echo −1.0…−4.4 dB (median −2.1), `aec_blocks` counted (13), zero wake lines, zero barge holds, controller alive. Remaining Level-4 rows — verbatim double-talk transcription and human-barge stop latency — need Akshay's voice (A6).
+- **`cmd_stop` reporting defect fixed (VA-OPS-004):** the old code printed "Stopped" and unlinked the pid file even when SIGTERM failed; now exit 1 with "still alive" and the pid file kept. Verified at Level 1 and Level 2 against the production binary.
 
 **CI baseline fixed (2026-11-14).** Eight consecutive failed Actions runs (43530350727 → 43542615491) had two causes: (1) the openWakeWord wheel ships no model files, so four wake tests failed on the runner — fixed by `ensure_wake_models()` in `bin/omp-voice-controller` (downloads the two ONNX models when missing) plus an autouse fixture in `tests/conftest.py` that calls it before any test needing wake files; (2) `aec-audio-processing` was a bare line in `requirements-dev.txt` — moved to `requirements-aec.txt` and made best-effort in `bin/install`. Reproduced with the exact CI commands in a fresh Python 3.12 venv: `python -m py_compile bin/omp-voice-controller` and `python -m pytest tests/` pass; the three Node files pass on the local node. GitHub still shows the old failing runs until the fix is pushed.
 
@@ -46,6 +48,39 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Guardians 38389/38402** predate the VA-MEM-007 lock and own nothing; `watcher.lock` records dead pid 50063 (re-derived 02:40 UTC; A3 open).
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
+
+## Iteration log — 2026-11-16 03:53 UTC (RALF-3 iter 3: echo-only physical acceptance finally runs — PASS)
+
+- Scenario: Objective B / AEC acceptance, echo-only subset (no wake or barge from the agent's own speech through the real speaker→mic path).
+- Baseline: VoiceBox UP since 03:46 UTC, controller 90992 IDLE holding the mic, probe launches its own omp session (pid 88735, bridge :65006) — never touches 85492.
+- Experiment: `scripts/run_echo_only_status_probe.py` against the live stack; 9.28 s reply played through the speakers while the live controller ran the AEC.
+- Actual: PASS. 9 status windows, `render_connected` true, residual −1.0…−4.4 dB (median −2.1), `aec_blocks` 1–13, zero wake lines, zero barge-hold lines, controller alive afterward. Raw: `.local/voice-agent/runs/AEC-REAL-001-LIVE.json` (03:53 UTC).
+- Note: `aec_echo_db`/`aec_blocks`/`render_cursor` are now observable on 90992 — the old "AEC fields not published" gate is gone. The −2 dB median matches the AEC-REAL-001 attribution (echo trails past the 300 ms guard window; suppression of the *wake decision* is what the criteria require and it holds).
+- Limitations: the physical guard-block counter (`aec_guard_blocks`) is only in the tree, not in 90992 (pre-23:19-UTC process). Verbatim double-talk and human-barge stop latency still need Akshay's voice (A6).
+- Code changes: none. Regression: none needed (probe-only iteration).
+- Next: Level-4 human rows are owner-gated; A3/A4/A5/A2' unchanged.
+
+## Iteration log — 2026-11-16 03:50 UTC (RALF-3 iter 2: `cmd_stop` reported success on a process that survived SIGTERM — VA-OPS-004)
+
+- Scenario: Objective D, explicit RALF requirement — "verify that cmd_stop() does not report successful termination when the process remains alive after its timeout."
+- Root cause: `cmd_stop()` polled `kill(pid, 0)` for 30 × 50 ms, then *unconditionally* printed "Stopped", unlinked `controller.pid`, and returned 0. A failed stop destroyed the only evidence the mic-owning daemon was still running, making `status` lie. Secondary: `kill(pid, 0)` succeeds on a zombie, so a supervisor that spawned the daemon would classify an exited child as alive.
+- Acceptance criteria (written first): cooperative exit → 0/"Stopped"/file removed; survivor → 1/"still alive"/file kept; stale dead pid → 0/"not running"/file removed (unchanged); zombie child counted as exited.
+- Fix (`bin/omp-voice-controller`): `_process_exited()` reaps own-child zombies via `waitpid(WNOHANG)` before the liveness probe; `cmd_stop()` branches on the result, returns 1 and keeps the pid file on failure. Deliberately NOT force-killing — honest reporting is the contract, escalation is a policy decision.
+- Tests: 3 new in `tests/test_pid_lock.py`. First draft of the survivor test failed for a *good* reason: SIGTERM landed before the stub installed its handler and it died with the default disposition (waitpid showed `(pid, 15)`) — the test would have passed vacuously. Fixed with a ready-sentinel file the stub writes after installing the handler.
+- Verification: `test_pid_lock.py` 10 passed; production binary `/Users/akshay/.local/bin/omp-voice-controller stop` with `OMP_VOICE_STATE_DIR` pointed at a temp dir and a SIGTERM-ignoring stub → `exit 1`, "Controller pid 88379 is still alive 1.5s after SIGTERM; stop failed, pid file kept" (Level 2). Full Python suite **311 passed** (308 + 3); Node untouched (114 baseline).
+- Regression risk: a daemon that legitimately takes >1.5 s to shut down now surfaces as a reported failure instead of a fake success — strictly better information; no caller relies on the old unconditional 0.
+- Limitations: live stop of 90992 not exercised (owner-gated A2').
+- Next: echo-only physical probe (iter 3).
+
+## Iteration log — 2026-11-16 03:46 UTC (RALF-3 iter 1: state reconciliation — VoiceBox is UP, first verbatim VoiceBox→Handy round trip)
+
+
+- Scenario: loop §8 iteration 1 — establish actual repo/service/deployment state, no assumptions from the prior checkpoint.
+- Actual: HEAD `4632308` == origin/main. VoiceBox listener on 17493, `/health` healthy with 0.6B loaded → **A1 CLOSED**, the gate that blocked every Priority B/E/F live row for two days. Handy pid 85667 running; `handy --transcribe-file` on a real VoiceBox clip returned the sentence verbatim in 0.13 s (35.8× realtime, Qwen3-ASR-0.6B on M5 Pro Metal). Controller 90992 `IDLE`, `turn_seq 2`, mic exclusive. Bridges: 85492 `:63399` (this session), 54314 `:62725`. Watchers 38389/38402 still unlocked, lock owner 64635 dead (A3 unchanged).
+- Failure analysis: none — the drift is VoiceBox having been reopened and Handy restarted.
+- Code changes: none. Regression: none run (read-only audit).
+- Level: 3 (live service integration).
+- Next: Objective D `cmd_stop` audit (iter 2).
 
 ## Iteration log — 2026-11-16 03:15 UTC (VA-LOOP-015: every un-heard player outcome defers, not just watchdog kills)
 

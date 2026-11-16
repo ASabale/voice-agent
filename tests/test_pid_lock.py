@@ -224,4 +224,74 @@ def test_stop_on_a_dead_pid_file_leaves_no_stale_state(tmp_path, capsys):
         assert not pid_file.exists()
 
 
+def _stub(code: str) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-c", code],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def test_stop_reports_success_when_the_process_exits_on_sigterm(tmp_path, capsys):
+    """VA-OPS-004 criterion 1: a cooperative daemon is stopped, reported, and
+    its pid file removed."""
+    with _PointedState(tmp_path) as state:
+        pid_file = state / "controller.pid"
+        proc = _stub("import time; time.sleep(30)")
+        pid_file.write_text(str(proc.pid), encoding="utf-8")
+        try:
+            assert controller.cmd_stop() == 0
+            assert "Stopped" in capsys.readouterr().out
+            assert not pid_file.exists()
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def test_stop_reports_failure_when_the_process_survives_sigterm(tmp_path, capsys):
+    """VA-OPS-004 criterion 2: a SIGTERM-ignoring process must not be reported
+    as stopped, and the pid file must survive so `status` still tells the truth.
+    The sentinel wait matters: a SIGTERM landing before the handler is installed
+    kills the stub with the default disposition and the test would pass vacuously."""
+    with _PointedState(tmp_path) as state:
+        pid_file = state / "controller.pid"
+        ready = tmp_path / "handler-installed"
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time, sys\n"
+             "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+             "open(sys.argv[1], 'w').write('ready')\n"
+             "time.sleep(30)\n",
+             str(ready)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5.0
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), "stub never installed its SIGTERM handler"
+        pid_file.write_text(str(proc.pid), encoding="utf-8")
+        try:
+            assert controller.cmd_stop() == 1
+            out = capsys.readouterr().out
+            assert "still alive" in out.lower()
+            assert pid_file.read_text(encoding="utf-8").strip() == str(proc.pid)
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+def test_stop_reaps_a_terminated_child_instead_of_calling_it_alive(tmp_path, capsys):
+    """VA-OPS-004 criterion 4: kill(pid, 0) succeeds on a zombie; the reap in
+    _process_exited must classify a dead own-child as exited."""
+    with _PointedState(tmp_path) as state:
+        pid_file = state / "controller.pid"
+        proc = _stub("import time; time.sleep(30)")
+        pid_file.write_text(str(proc.pid), encoding="utf-8")
+        proc.terminate()
+        time.sleep(0.3)  # dead but deliberately NOT yet reaped: poll() would reap it
+        assert proc.returncode is None  # harness has not reaped the zombie yet
+        assert controller.cmd_stop() == 0
+        assert "Stopped" in capsys.readouterr().out
+        assert not pid_file.exists()
+
+
 
