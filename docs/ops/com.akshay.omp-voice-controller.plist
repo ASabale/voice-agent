@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.akshay.omp-voice-controller</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/akshay/.local/bin/omp-voice-controller</string>
+    <string>run</string>
+    <string>--wake-word</string>
+    <string>hey_jarvis</string>
+    <string>--wake-threshold</string>
+    <string>0.5</string>
+    <string>--pause-seconds</string>
+    <string>5.0</string>
+    <string>--idle-timeout</string>
+    <string>15.0</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/akshay/.local/state/omp-voice/controller-restart.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/akshay/.local/state/omp-voice/controller-restart.log</string>
+</dict>
+</plist>

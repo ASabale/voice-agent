@@ -63,7 +63,8 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **A4 controller supervision** — decision doc written (`docs/ops/controller-supervision.md`, launchd KeepAlive recommended); owner must approve the install. Controller 251 is currently unsupervised (parent 1).
 - Verbatim double-talk transcription (A6) also needs Akshay's voice.
 
-**Loop economics:** every remaining automated row I can run is already PASS; the remaining rows need an owner action (E, G, A4, double-talk). Continuing iterations would burn budget re-verifying closed rows or gaming the same probes. Recommendation: Akshay supplies the E and G verdicts (five minutes each), decides on the launchd unit, and either issues a fresh RALF budget scoped to those rows or closes RALF-3 with this assessment as the acceptance record.
+**Loop economics:** every remaining automated row I can run is already PASS; the remaining rows need an owner action (E, G, double-talk). Continuing iterations would burn budget re-verifying closed rows or gaming the same probes. Recommendation: Akshay supplies the E and G verdicts (five minutes each) and either issues a fresh RALF budget scoped to those rows or closes RALF-3 with this assessment as the acceptance record.
+- **A4 CLOSED same turn (07:16 UTC):** owner approved; launchd KeepAlive unit installed (`com.akshay.omp-voice-controller`, plist archived in `docs/ops/`). Respawn verified: SIGINT to 4085 → launchd re-spawned 4387 in ~14 s, IDLE, mic owned, restart log flowing.
 
 ## Iteration log — 2026-11-16 07:05 UTC (RALF-3 iter 11: VA-QUALITY-001 conversation matrix PASSes all automated rows — §5 closed except E/G)
 
