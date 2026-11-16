@@ -128,9 +128,13 @@ def run_watch(mod, snaps, *, voice_playing: bool = False, idle_sec: float = 0.0,
     names = (
         "time", "sample", "stop_engine", "shed_voice", "write_pressure",
         "log_line", "_voice_is_playing", "_idle_seconds", "_strata_slot_busy",
+        "_claim_watcher_slot",
     )
     original = {name: getattr(mod, name) for name in names}
     try:
+        # Without this stub, watch() sees the live guardian's watcher.lock and
+        # exits before replaying the synthetic trace (owner-locked machine).
+        mod._claim_watcher_slot = lambda: None
         mod.time = clock
         def fake_sample(baseline_swap=None, prev_swapouts=None):
             nonlocal sample_count
