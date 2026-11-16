@@ -49,6 +49,12 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
 
+## Iteration log — 2026-11-16 12:46 UTC (RALF-3 iter 13: physical `-r` render-alignment leg PASS; pause leg proven unreachable)
+
+- **VA-AUD-001 hardware `-r` leg: PASS.** New probe `scripts/run_render_rate_alignment_probe.py` launches an isolated omp session, drives a real reply through live VoiceBox (`afplay -r 1.18`), and regresses `render_cursor` against wall time. Measured cursor slope 1.169 on the 16 kHz grid vs slot `playback_rate` 1.18 (0.9% error); plain wall-clock hypothesis off by 16.9%; final cursor ≥ 98% of the clip. Evidence `.local/voice-agent/runs/VA-AUD-001-RATE-ALIGN.json`. Probe iteration: stale pre-connect status cursors and multi-clip cursor resets produced three false FAILs before the segment-split fix; the measurement itself was never weakened.
+- **Pause leg: NOT_RUN-BY-DESIGN.** Exhaustive scan of `bin/omp-voice-controller`: `pause_tts_clips` has zero call sites; `resume_tts_clips` is called only at line 3630 to clean up holds created without pausing. The barge redesign (line 3516: "Do not SIGSTOP the clip here") deliberately stopped pausing clips, so the spec's hardware criterion "under `-r` and pause" has no production path to exercise. The pause clock (`_render_paused_*`, `paused_playback_seconds`) stays unit-tested as a dormant hook. Disposition (delete the dead pause path, or restore a pause caller) is owner-gated: ~20 test stubs across `test_barge_fixture.py`, `test_wake_and_gain.py`, `test_handy_control.py` monkeypatch `pause_tts_clips` as a "must not be called" assertion.
+- Remaining owner-gated rows unchanged: E (human barge), G (eyes-off 10 min), A6 (double-talk transcription by Akshay's voice).
+
 ## Iteration log — 2026-11-16 07:15 UTC (RALF-3 iter 12: consolidated assessment — stop new implementation; remaining rows are human-gated)
 
 **Production-proven (automated, live evidence, current tree `0c5b240`):**
