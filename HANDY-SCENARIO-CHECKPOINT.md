@@ -49,8 +49,19 @@ A unit or fixture pass is not live behavior until the process loads it.
 - **Tested, not yet live-observed**: paste verify by pid (not even loaded in 90992); headroom-driven voice deferral against a real pressure event (synthetic files only); watcher-lock enforcement in production (VA-MEM-007b proved it against the real binary with a synthetic owner).
 - All "the live controller keeps the old path until restart" caveats in `docs/testing/INDEX.md` were swept on 2026-11-16: they were written against pids 64238/38298 and are false for code that landed before 23:19 UTC. Rows whose fix landed after 23:19 UTC must state "not loaded in 90992" individually.
 
-## Iteration log — 2026-11-16 03:53 UTC (RALF-3 iter 3: echo-only physical acceptance finally runs — PASS)
+## Iteration log — 2026-11-16 04:10 UTC (RALF-3 iter 5: `cmd_start_bg` claimed success for a daemon that died instantly — VA-OPS-005)
 
+- Scenario: Objective D restart leg — `cmd_start_bg` slept 1.2 s and printed "Started ... pid N" with exit 0 without ever checking `proc.poll()` or whether the pid file was written.
+- Reproduced first: stub child printing `boom` and exiting 3 was reported as `Started OMP Voice Controller in background (pid 92505)` with exit 0.
+- Fix: poll inside the window — child exited → "spawn failed: pid N exited with code C" → 1; pid file names the child → "Started" → 0; window expires alive-but-unregistered → explicit "did not register ... it is still running" → 1. No force-kill (same honest-reporting policy as VA-OPS-004).
+- Tests: 3 new (dies-before-register, registers→success, alive-unregistered→1). `_SpawnRecorder`'s fake now registers — the old assertion `"Started" in out` still holds under the new contract. `test_pid_lock.py` 13 passed; full Python suite **314 passed**; py_compile ok.
+- Level 2: production binary `start` against a held lock still refuses correctly ("already running", exit 0 path unchanged).
+- Boundary discovered: the flock open creates an *empty* pid file, so success must mean "the file names the child," not "the file exists."
+- Limitation: a daemon that registers then dies a second later (import crash after pid write) is still reported Started at check time; `stop`/`status` catch it. Live restart is owner-gated (A2').
+- Regression risk: none identified — callers only consume the exit code/print; the refusal path is untouched.
+- Next: soak run 6 result (iter 4).
+
+## Iteration log — 2026-11-16 03:53 UTC (RALF-3 iter 3: echo-only physical acceptance finally runs — PASS)
 - Scenario: Objective B / AEC acceptance, echo-only subset (no wake or barge from the agent's own speech through the real speaker→mic path).
 - Baseline: VoiceBox UP since 03:46 UTC, controller 90992 IDLE holding the mic, probe launches its own omp session (pid 88735, bridge :65006) — never touches 85492.
 - Experiment: `scripts/run_echo_only_status_probe.py` against the live stack; 9.28 s reply played through the speakers while the live controller ran the AEC.

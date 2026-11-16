@@ -12,6 +12,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -58,7 +59,7 @@ class _PointedState:
         controller.STATE_DIR = self.tmp
         controller.PID_FILE = self.tmp / "controller.pid"
         controller.LOG_FILE = self.tmp / "controller.log"
-        controller.START_SPAWN_WAIT_SECONDS = 0
+        controller.START_SPAWN_WAIT_SECONDS = 0.2
         return self.tmp
 
     def __exit__(self, *exc: object) -> None:
@@ -95,7 +96,11 @@ def _wait_for_release(pid_file: Path, released: bool, timeout: float = 3.0) -> b
 
 
 class _SpawnRecorder:
-    """Record what `cmd_start_bg` would spawn without touching the microphone."""
+    """Record what `cmd_start_bg` would spawn without touching the microphone.
+
+    The fake daemon 'registers' by writing its pid to the pid file, which is
+    what the post-VA-OPS-005 `cmd_start_bg` waits for before claiming success.
+    """
 
     def __init__(self) -> None:
         self.argvs = []
@@ -106,7 +111,12 @@ class _SpawnRecorder:
         class _Fake:
             pid = 999999
 
-        return _Fake()
+            def poll(self):
+                return None
+
+        fake = _Fake()
+        controller.PID_FILE.write_text(str(fake.pid), encoding="utf-8")
+        return fake
 
 
 def test_a_second_start_refuses_while_the_daemon_holds_the_lock(tmp_path, capsys, monkeypatch):
@@ -213,6 +223,91 @@ def test_run_claim_acquires_and_holds_when_free(tmp_path):
         assert controller._open_pid_lock(block=False) is None, "the claim must be held, not a transient probe"
         handle.close()
         assert controller._open_pid_lock(block=False) is not None, "closing the handle releases the lock"
+
+
+def test_start_bg_reports_failure_when_the_spawned_daemon_dies(tmp_path, capsys, monkeypatch):
+    """VA-OPS-005: a child that exits without ever writing the pid file must not
+    be reported as 'Started'. Reproduced first with the same stub shape (see
+    .local/voice-agent/probes/repro_start_bg_false_success.py): the old code
+    slept 1.2s and printed 'Started ... pid N' unconditionally, exit 0."""
+    with _PointedState(tmp_path) as state:
+        stub = state / "stub-controller.py"
+        stub.write_text(
+            "import sys\nprint('boom', file=sys.stderr)\nraise SystemExit(3)\n",
+            encoding="utf-8",
+        )
+        real_popen = controller.subprocess.Popen
+
+        def patched(cmd, **kwargs):
+            return real_popen([sys.executable, str(stub)], **kwargs)
+
+        monkeypatch.setattr(controller.subprocess, "Popen", patched)
+        controller.START_SPAWN_WAIT_SECONDS = 2.0
+        assert controller.cmd_start_bg(_ARGS) == 1
+        out = capsys.readouterr().out
+        assert "spawn failed" in out.lower()
+        # The flock open creates an empty pid file; the point is that no live
+        # pid is ever claimed for the dead child.
+        content = controller.PID_FILE.read_text(encoding="utf-8") if controller.PID_FILE.exists() else ""
+        assert content.strip() == ""
+
+
+def test_start_bg_reports_success_only_after_the_daemon_registers(tmp_path, capsys, monkeypatch):
+    """VA-OPS-005 criterion 2: success requires the pid file to name the child."""
+    with _PointedState(tmp_path) as state:
+        stub = state / "stub-daemon.py"
+        stub.write_text(
+            "import os, sys, time\n"
+            "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        real_popen = controller.subprocess.Popen
+
+        def patched(cmd, **kwargs):
+            return real_popen([sys.executable, str(stub), str(state / "controller.pid")], **kwargs)
+
+        monkeypatch.setattr(controller.subprocess, "Popen", patched)
+        controller.START_SPAWN_WAIT_SECONDS = 5.0
+        try:
+            assert controller.cmd_start_bg(_ARGS) == 0
+            out = capsys.readouterr().out
+            assert "Started" in out
+            pid = int(controller.PID_FILE.read_text(encoding="utf-8"))
+            os.kill(pid, 0)  # the reported pid really exists
+        finally:
+            if controller.PID_FILE.exists():
+                try:
+                    os.kill(int(controller.PID_FILE.read_text(encoding="utf-8")), signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def test_start_bg_flags_a_daemon_that_never_registers(tmp_path, capsys, monkeypatch):
+    """VA-OPS-005 criterion 3: alive-but-unregistered is neither success nor a
+    crash — it is reported as unverified and the start is not claimed."""
+    with _PointedState(tmp_path) as state:
+        stub = state / "stub-silent.py"
+        stub.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+        real_popen = controller.subprocess.Popen
+
+        def patched(cmd, **kwargs):
+            return real_popen([sys.executable, str(stub)], **kwargs)
+
+        monkeypatch.setattr(controller.subprocess, "Popen", patched)
+        controller.START_SPAWN_WAIT_SECONDS = 1.0
+        try:
+            assert controller.cmd_start_bg(_ARGS) == 1
+            out = capsys.readouterr().out
+            assert "did not register" in out.lower()
+        finally:
+            for line in out.splitlines():
+                token = line.split("pid ")[1].split(")")[0] if "pid " in line else ""
+                if token.isdigit():
+                    try:
+                        os.kill(int(token), signal.SIGKILL)
+                    except OSError:
+                        pass
 
 
 def test_stop_on_a_dead_pid_file_leaves_no_stale_state(tmp_path, capsys):
