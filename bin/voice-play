@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Per-stream TTS player with live gain control.
+
+Replaces `afplay` for VoiceBox clips when per-stream ducking is wanted:
+the emitted samples are scaled by a gain read from a JSON file
+(`~/.local/state/omp-voice/stream-gain.json`) every chunk, so the
+controller can attenuate only the assistant's stream instead of the
+macOS master output volume. Other applications are untouched.
+
+Usage: voice-play <wav> [--gain-file PATH] [--chunk-ms 40]
+Exit code mirrors afplay: 0 on clean completion, 1 on bad input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import signal
+import struct
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import sounddevice as sd
+
+
+def _load_gain(path: Path) -> float:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        gain = float(data.get("gain", 1.0))
+    except Exception:
+        return 1.0
+    return max(0.0, min(1.0, gain))
+
+
+def _parse_wav(data: bytes) -> tuple[int, int, np.ndarray] | None:
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    rate = channels = 0
+    pos = 12
+    pcm = b""
+    while pos + 8 <= len(data):
+        tag = data[pos : pos + 4]
+        size = struct.unpack("<I", data[pos + 4 : pos + 8])[0]
+        body = data[pos + 8 : pos + 8 + size]
+        if tag == b"fmt ":
+            fmt = struct.unpack("<H", body[0:2])[0]
+            channels = struct.unpack("<H", body[2:4])[0]
+            rate = struct.unpack("<I", body[4:8])[0]
+            if fmt != 1:  # only PCM supported
+                return None
+        elif tag == b"data":
+            pcm = body
+        pos += 8 + size
+    if not rate or not channels or not pcm:
+        return None
+    samples = np.frombuffer(pcm, dtype="<i2")
+    samples = samples.reshape(-1, channels)
+    return rate, channels, samples
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="voice-play")
+    parser.add_argument("wav", type=Path)
+    parser.add_argument("--gain-file", type=Path, default=Path.home() / ".local" / "state" / "omp-voice" / "stream-gain.json")
+    parser.add_argument("--chunk-ms", type=int, default=40)
+    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (mirrors afplay -r)")
+    args = parser.parse_args()
+
+    parsed = _parse_wav(args.wav.read_bytes())
+    if parsed is None:
+        print(f"voice-play: cannot parse {args.wav}", file=sys.stderr)
+        return 1
+    rate, channels, samples = parsed
+    speed = max(0.25, min(2.0, args.speed))
+    if speed != 1.0:
+        # Linear resampling is plenty for speech and keeps the gain ramp
+        # applied to the samples the speakers actually emit.
+        n_out = max(1, int(len(samples) / speed))
+        idx = np.linspace(0.0, len(samples) - 1.0, n_out)
+        grid = np.arange(len(samples), dtype=np.float64)
+        samples = np.stack([np.interp(idx, grid, samples[:, c]) for c in range(channels)], axis=1).astype(np.int16)
+    chunk = max(1, int(rate * args.chunk_ms / 1000))
+
+    stop = {"flag": False}
+
+    def handle_sig(signum, frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, handle_sig)
+    signal.signal(signal.SIGINT, handle_sig)
+
+    gain = _load_gain(args.gain_file)
+    target = gain
+    with sd.OutputStream(samplerate=rate, channels=channels, dtype="int16") as out:
+        for i in range(0, len(samples), chunk):
+            if stop["flag"]:
+                break
+            # Ramp toward the target gain so a duck change does not click.
+            if gain != target:
+                step = min(1.0, chunk / max(rate * 0.05, 1))
+                gain += (target - gain) * step
+                if abs(target - gain) < 0.01:
+                    gain = target
+            target = _load_gain(args.gain_file)
+            out.write((samples[i : i + chunk] * gain).astype(np.int16))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

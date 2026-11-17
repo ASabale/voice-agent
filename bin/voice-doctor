@@ -1,0 +1,1035 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import sys
+
+_venv = os.path.expanduser("~/.local/share/omp-voice/venv/bin/python")
+if os.path.exists(_venv) and os.path.realpath(sys.executable) != os.path.realpath(_venv):
+    os.execv(_venv, [_venv, os.path.abspath(__file__), *sys.argv[1:]])
+
+"""
+Voice environment doctor: independent diagnosis and recovery for the voice stack.
+
+Subcommands:
+  status                         compact live snapshot of every service
+  doctor                         full check suite -> verdict, diagnoses, actions
+  restart controller|handy|voicebox   evidence-first controlled restart
+  verify handy|voicebox|integration   functional end-to-end test
+  loop                           physical speaker->mic->Handy->OMP->VoiceBox driver
+
+Every run writes timestamped evidence under .local/voice-agent/doctor/.
+Exit codes: 0 healthy/success, 1 degraded/failed, 2 blocked (human action).
+"""
+
+import argparse
+import difflib
+import json
+import re
+import select
+import signal
+import subprocess
+import time
+import urllib.error
+import urllib.request
+import wave
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("OMP_VOICE_STATE_DIR", str(HOME / ".local" / "state" / "omp-voice")))
+DOCTOR_RUNS = ROOT / ".local" / "voice-agent" / "doctor"
+VOICEBOX_URL = "http://127.0.0.1:17493"
+HANDY_BIN = "/Applications/Handy.app/Contents/MacOS/handy"
+HANDY_DIR = HOME / "Library" / "Application Support" / "com.pais.handy"
+HANDY_DB = HANDY_DIR / "history.db"
+HANDY_LOG = HOME / "Library" / "Logs" / "com.pais.handy" / "handy.log"
+CRASH_DIR = HOME / "Library" / "Logs" / "DiagnosticReports"
+LAUNCHD_JOB = "com.akshay.omp-voice-controller"
+LAUNCHD_PLIST = Path.home() / "Library/LaunchAgents/com.akshay.omp-voice-controller.plist"
+WAKE_FIXTURE = ROOT / "tests" / "fixtures" / "hey-jarvis-say.wav"
+SPEECH_LOG = STATE_DIR / "speech.log"
+
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def save_evidence(name: str, payload: dict) -> Path:
+    DOCTOR_RUNS.mkdir(parents=True, exist_ok=True)
+    path = DOCTOR_RUNS / f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{name}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def run(argv: list[str], timeout: float = 10, env: dict | None = None) -> dict:
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
+        return {"argv": argv, "code": res.returncode, "stdout": res.stdout.strip(), "stderr": res.stderr.strip()}
+    except Exception as exc:
+        return {"argv": argv, "code": None, "error": str(exc)}
+
+
+def http(url: str, method: str = "GET", body: dict | None = None, timeout: float = 30) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json"})
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read()
+        return {"url": url, "status": res.status, "latency_ms": round((time.monotonic() - started) * 1000, 1), "body": raw[:2000].decode("utf-8", "replace"), "bytes": len(raw)}
+    except urllib.error.HTTPError as exc:
+        return {"url": url, "status": exc.code, "latency_ms": round((time.monotonic() - started) * 1000, 1), "error": exc.read()[:500].decode("utf-8", "replace")}
+    except Exception as exc:
+        return {"url": url, "status": None, "error": str(exc)}
+
+
+def process_list() -> list[dict]:
+    listing = run(["/bin/ps", "-axo", "pid=,command="], timeout=5)
+    procs = []
+    for line in listing.get("stdout", "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            procs.append({"pid": int(parts[0]), "command": parts[1]})
+    return procs
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- services
+
+def controller_snapshot() -> dict:
+    snap: dict = {"state_file": str(STATE_DIR / "status.json")}
+    if not STATE_DIR.exists() or not (STATE_DIR / "status.json").exists():
+        snap["error"] = f"status.json missing under {STATE_DIR}"
+        return snap
+    try:
+        data = json.loads((STATE_DIR / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        snap["error"] = f"status.json unreadable: {exc}"
+        return snap
+    snap["controller"] = data
+    pid = data.get("pid")
+    snap["pid_alive"] = pid_alive(pid) if isinstance(pid, int) else False
+    snap["status_age_s"] = round(time.time() - (STATE_DIR / "status.json").stat().st_mtime, 1)
+    link = HOME / ".local" / "bin" / "omp-voice-controller"
+    if link.exists():
+        target = Path(os.path.realpath(link))
+        snap["loaded_code"] = str(target)
+        snap["code_matches_repo"] = target == (ROOT / "bin" / "omp-voice-controller")
+    duck_state = STATE_DIR / "duck-state.json"
+    if duck_state.exists():
+        try:
+            snap["outstanding_duck"] = json.loads(duck_state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            snap["outstanding_duck"] = {"note": "unreadable duck-state.json"}
+    stale_slots = []
+    slot_dir = STATE_DIR / "tts-playing"
+    if slot_dir.is_dir():
+        for slot in slot_dir.glob("*.json"):
+            try:
+                s = json.loads(slot.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stale_slots.append({"file": slot.name, "note": "unreadable"})
+                continue
+            afplay = s.get("afplay_pid")
+            if afplay and not s.get("ended_at") and not pid_alive(int(afplay)):
+                stale_slots.append({"file": slot.name, "afplay_pid": afplay})
+    snap["stale_playback_slots"] = stale_slots
+    procs = process_list()
+    snap["active_afplay"] = [p["pid"] for p in procs if "afplay" in p["command"] and "omp-vb-" in p["command"]]
+    log_path = STATE_DIR / "controller.log"
+    tail = []
+    if log_path.exists():
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = [l for l in lines[-60:] if any(k in l.lower() for k in ("error", "failed", "refused", "exception", "unverified", "dropped"))]
+    snap["log_error_tail"] = tail[-8:]
+    return snap
+
+
+def handy_snapshot() -> dict:
+    procs = process_list()
+    gui = [p for p in procs if "Handy.app" in p["command"] and "--transcribe-worker" not in p["command"]]
+    worker = [p for p in procs if "--transcribe-worker" in p["command"]]
+    snap = {"gui_pids": [p["pid"] for p in gui], "worker_pids": [p["pid"] for p in worker]}
+    if HANDY_DB.exists():
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(f"file:{HANDY_DB}?mode=ro", uri=True, timeout=2)
+            try:
+                row = conn.execute(
+                    "SELECT id, COALESCE(post_processed_text, transcription_text, '') "
+                    "FROM transcription_history ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                total = conn.execute("SELECT COUNT(*) FROM transcription_history").fetchone()[0]
+                snap["db"] = {"exists": True, "latest_id": row[0] if row else 0, "latest_text": (row[1] or "")[:160] if row else "", "total_rows": total}
+                recent = conn.execute(
+                    "SELECT id, timestamp, transcription_text FROM transcription_history "
+                    "ORDER BY id DESC LIMIT 3"
+                ).fetchall()
+                snap["db"]["recent_rows"] = [
+                    {"id": r[0], "age_s": round(time.time() - r[1], 1), "transcript_len": len(r[2] or "")}
+                    for r in recent
+                ]
+                # A row created within the last 120 s whose transcription_text is
+                # still empty is an open capture that has not finalized: a stuck
+                # recording, not just old history.
+                snap["db"]["stuck_recording"] = any(
+                    (time.time() - r[1]) < 120 and not (r[2] or "").strip()
+                    for r in recent
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            snap["db"] = {"exists": True, "error": str(exc)}
+    else:
+        snap["db"] = {"exists": False}
+    snap["log_tail"] = []
+    if HANDY_LOG.exists():
+        snap["log_tail"] = HANDY_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-6:]
+    hook = None
+    settings_path = HANDY_DIR / "settings_store.json"
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            inner = settings.get("settings", settings)
+            hook = inner.get("external_script_path") or inner.get("external_script")
+        except Exception:
+            hook = None
+    snap["external_script_hook"] = hook
+    return snap
+
+
+def voicebox_snapshot() -> dict:
+    procs = process_list()
+    gui = [p for p in procs if p["command"].endswith("MacOS/voicebox")]
+    servers = [p for p in procs if "voicebox-server" in p["command"]]
+    snap = {"gui_pids": [p["pid"] for p in gui], "server_pids": [p["pid"] for p in servers]}
+    snap["health"] = http(f"{VOICEBOX_URL}/health")
+    snap["listener"] = "reachable" if snap["health"].get("status") == 200 else None
+    body = snap["health"].get("body")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            body = {}
+    if isinstance(body, dict):
+        snap["model_ready"] = body.get("model_loaded")
+        snap["model_size"] = body.get("model_size")
+        snap["backend"] = body.get("backend_type")
+    snap["profiles"] = http(f"{VOICEBOX_URL}/profiles")
+    profile_name = ""
+    profile_file = STATE_DIR / "profile"
+    if profile_file.exists():
+        profile_name = profile_file.read_text(encoding="utf-8").strip()
+    snap["active_profile"] = profile_name
+    crashes = sorted(CRASH_DIR.glob("voicebox-server-*.ips"), key=lambda p: p.stat().st_mtime, reverse=True)[:6] if CRASH_DIR.exists() else []
+    snap["recent_crash_reports"] = [{"file": c.name, "mtime": datetime.fromtimestamp(c.stat().st_mtime, timezone.utc).isoformat()} for c in crashes]
+    snap["crash_loop_24h"] = sum(1 for c in crashes if c.stat().st_mtime > time.time() - 86400) >= 3
+    return snap
+
+
+def audio_snapshot() -> dict:
+    snap: dict = {}
+    volume = run(["/usr/bin/osascript", "-e", "output volume of (get volume settings)"], timeout=5)
+    try:
+        snap["master_volume"] = int(volume.get("stdout") or "")
+    except ValueError:
+        snap["master_volume"] = None
+    muted = run(["/usr/bin/osascript", "-e", "output muted of (get volume settings)"], timeout=5)
+    snap["master_muted"] = muted.get("stdout")
+    try:
+        import sounddevice as sd
+
+        devices = list(sd.query_devices())
+        default_in, default_out = sd.default.device
+        if default_in is not None and 0 <= default_in < len(devices):
+            d = devices[default_in]
+            snap["default_input"] = {"id": default_in, "name": d["name"], "rate": d["default_samplerate"], "channels": d["max_input_channels"]}
+        if default_out is not None and 0 <= default_out < len(devices):
+            d = devices[default_out]
+            snap["default_output"] = {"id": default_out, "name": d["name"], "rate": d["default_samplerate"], "channels": d["max_output_channels"]}
+        snap["loopback_devices"] = [d["name"] for d in devices if "loopback" in d["name"].lower()]
+        snap["per_app_volume_feasibility"] = {
+            "os_api": "none: macOS exposes no per-application output gain; osascript volume settings are master-only",
+            "implemented": "per-stream ducking via bin/voice-play + ~/.local/state/omp-voice/stream-gain.json when OMP_VOICE_STREAM_PLAYER=1 (docs/ops/PER-STREAM-DUCKING.md)",
+            "fallback": "osascript master-volume duck when OMP_VOICE_STREAM_PLAYER is unset",
+        }
+        try:
+            import numpy as np
+
+            # sd.rec returns uninitialized buffers on this machine (sounddevice
+            # 0.5.6); stream the probe through an InputStream instead.
+            stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16")
+            stream.start()
+            try:
+                chunks = [stream.read(960)[0][:, 0] for _ in range(5)]
+            finally:
+                stream.stop()
+            rec = np.concatenate(chunks).astype(np.float32) / 32768.0
+            if float(np.abs(rec).max()) > 1.0:
+                snap["mic_probe"] = {"ok": False, "error": "capture buffers invalid (sounddevice stream fault)"}
+            else:
+                rms = float(np.sqrt(np.mean(rec ** 2)))
+                snap["mic_probe"] = {"ok": True, "rms": round(rms, 4), "samples": int(rec.shape[0])}
+        except Exception as exc:
+            snap["mic_probe"] = {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        snap["audio_stack_error"] = str(exc)
+    return snap
+
+
+def integration_snapshot() -> dict:
+    sessions = []
+    reg = STATE_DIR / "sessions"
+    if reg.is_dir():
+        for path in reg.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            pid, port = data.get("pid"), data.get("port")
+            entry = {"pid": pid, "port": port, "pid_alive": pid_alive(pid) if isinstance(pid, int) else False}
+            if isinstance(port, int) and port > 0:
+                res = http(f"http://127.0.0.1:{port}/status")
+                body = {}
+                try:
+                    body = json.loads(res.get("body", "{}"))
+                except Exception:
+                    body = {}
+                entry["ok"] = res.get("status") == 200 and body.get("ok") is True
+                entry["agentBusy"] = body.get("agentBusy")
+                entry["speaking"] = body.get("speaking")
+            sessions.append(entry)
+    return {"sessions": sessions}
+
+
+# ---------------------------------------------------------------- diagnosis
+
+def diagnose(services: dict) -> list[dict]:
+    findings: list[dict] = []
+    ctrl = services["controller"]
+    ctrl_data = ctrl.get("controller") or {}
+    if not ctrl_data:
+        findings.append({"service": "controller", "severity": "critical", "issue": "no status.json; controller daemon not running", "action": "voice-doctor restart controller"})
+    elif not ctrl.get("pid_alive"):
+        findings.append({"service": "controller", "severity": "critical", "issue": f"status.json names pid {ctrl_data.get('pid')} but the process is dead", "action": "voice-doctor restart controller"})
+    elif (ctrl.get("status_age_s") or 0) > 120:
+        findings.append({"service": "controller", "severity": "warning", "issue": f"status.json last written {ctrl.get('status_age_s')}s ago; loop may be wedged", "action": "voice-doctor restart controller"})
+    if ctrl_data.get("mic_dropped", 0) > 1000:
+        findings.append({"service": "controller", "severity": "warning", "issue": f"mic frame drops: {ctrl_data.get('mic_dropped')} since controller start", "action": "check audio device contention and input device sample rate"})
+    if ctrl.get("code_matches_repo") is False:
+        findings.append({"service": "controller", "severity": "warning", "issue": f"running code is {ctrl.get('loaded_code')}, not the repo tree", "action": "run bin/install then restart controller"})
+    if ctrl.get("outstanding_duck"):
+        findings.append({"service": "controller", "severity": "warning", "issue": f"outstanding duck transaction on disk: {ctrl['outstanding_duck']}", "action": "restart controller; reconcile_duck_state restores the volume on start"})
+    if ctrl.get("stale_playback_slots"):
+        findings.append({"service": "controller", "severity": "info", "issue": f"playback slots with dead afplay and no ended_at: {ctrl['stale_playback_slots']}", "action": "slots re-derive on next read; prune if they persist"})
+
+    vb = services["voicebox"]
+    if not vb.get("listener"):
+        if vb.get("gui_pids") and vb.get("server_pids"):
+            findings.append({"service": "voicebox", "severity": "critical", "issue": "voicebox-server processes exist but nothing listens on 17493", "action": "voice-doctor restart voicebox"})
+        elif vb.get("gui_pids"):
+            findings.append({"service": "voicebox", "severity": "critical", "issue": "VoiceBox GUI up but the server never started or crashed", "action": "voice-doctor restart voicebox (quit + reopen runs the supported start path)"})
+        else:
+            findings.append({"service": "voicebox", "severity": "critical", "issue": "VoiceBox is not running at all", "action": "voice-doctor restart voicebox"})
+    elif vb.get("crash_loop_24h"):
+        findings.append({"service": "voicebox", "severity": "critical", "issue": "3+ voicebox-server crash reports in 24h (MLX Metal abort signature)", "action": "reduce concurrent Metal load before restarting; do not relaunch in a loop"})
+    elif vb.get("health", {}).get("status") != 200:
+        findings.append({"service": "voicebox", "severity": "critical", "issue": f"/health failed: {vb.get('health')}", "action": "voice-doctor restart voicebox"})
+    elif vb.get("model_ready") is False:
+        findings.append({"service": "voicebox", "severity": "warning", "issue": "VoiceBox listener is up but no TTS model is loaded", "action": "voice-doctor verify voicebox (functional generation will fail until a model loads)"})
+    elif vb.get("functional") is not None and not vb["functional"].get("ok"):
+        findings.append({"service": "voicebox", "severity": "critical", "issue": f"/health is 200 but real generation failed: {vb['functional'].get('reason') or vb['functional'].get('wav_error') or 'empty/quiet audio'}", "action": "voice-doctor restart voicebox (quit + reopen runs the supported start path)"})
+
+    handy = services["handy"]
+    if not handy.get("gui_pids"):
+        findings.append({"service": "handy", "severity": "critical", "issue": "Handy app is not running", "action": "voice-doctor restart handy"})
+    elif not handy.get("worker_pids"):
+        findings.append({"service": "handy", "severity": "info", "issue": "Handy GUI up but no resident --transcribe-worker; the worker spawns on demand (verify handy transcribes the wake fixture through it)", "action": "run voice-doctor verify handy to confirm transcription readiness"})
+    elif handy.get("db", {}).get("latest_id", 0) == 0:
+        findings.append({"service": "handy", "severity": "warning", "issue": "Handy history DB has no rows; no capture has ever finalized", "action": "voice-doctor verify integration"})
+    if handy.get("external_script_hook") is None:
+        findings.append({"service": "handy", "severity": "info", "issue": "external_script hook not visible in Handy settings", "action": "check Handy settings for the omp-handy-hook path"})
+
+    audio = services["audio"]
+    if audio.get("mic_probe", {}).get("ok") is False:
+        findings.append({"service": "audio", "severity": "critical", "issue": f"microphone probe failed: {audio['mic_probe'].get('error')}", "action": "check microphone permission for Terminal/omp in System Settings > Privacy > Microphone"})
+    if audio.get("default_input") is None:
+        findings.append({"service": "audio", "severity": "critical", "issue": "no default input device", "action": "connect a microphone or inspect CoreAudio devices"})
+    duck = ctrl.get("outstanding_duck")
+    vol = audio.get("master_volume")
+    if duck and isinstance(vol, int):
+        original = duck.get("original")
+        if isinstance(original, int) and abs(vol - original) > 2:
+            findings.append({"service": "audio", "severity": "warning", "issue": f"master volume {vol} differs from duck baseline {original} with no active duck: stuck duck", "action": "restore volume with osascript then restart controller"})
+
+    ready = [s for s in services["integration"]["sessions"] if s.get("ok")]
+    if not ready:
+        findings.append({"service": "integration", "severity": "critical", "issue": "no OMP session bridge responded", "action": "start an omp session; the extension binds an ephemeral port per session"})
+    return findings
+
+
+def doctor(args: argparse.Namespace) -> int:
+    services = {
+        "assembled_at": utc_stamp(),
+        "controller": controller_snapshot(),
+        "handy": handy_snapshot(),
+        "voicebox": voicebox_snapshot(),
+        "audio": audio_snapshot(),
+        "integration": integration_snapshot(),
+    }
+    # A live health endpoint is not readiness: generate real speech and check
+    # the bytes, the same functional test `verify voicebox` uses.
+    if services["voicebox"].get("listener"):
+        services["voicebox"]["functional"] = functional_voicebox()
+    findings = diagnose(services)
+    severities = {f["severity"] for f in findings}
+    verdict = "healthy" if not (severities - {"info"}) else ("broken" if "critical" in severities else "degraded")
+    services["diagnosis"] = findings
+    services["verdict"] = verdict
+    path = save_evidence("doctor", services)
+    print(json.dumps({"verdict": verdict, "diagnosis": findings, "services": services}, indent=2))
+    print(f"evidence: {path}", file=sys.stderr)
+    return 0 if verdict == "healthy" else 1
+
+
+def status(args: argparse.Namespace) -> int:
+    ctrl = controller_snapshot()
+    print(json.dumps({
+        "assembled_at": utc_stamp(),
+        "controller": {k: (ctrl.get("controller") or {}).get(k) for k in ("state", "pid", "turn", "render_connected", "ambient_rms", "echo_rms_current", "near_end_rms")},
+        "voicebox": {k: voicebox_snapshot().get(k) for k in ("listener", "health", "active_profile")},
+        "handy": {k: handy_snapshot().get(k) for k in ("gui_pids", "worker_pids", "db")},
+        "audio": {"master_volume": audio_snapshot().get("master_volume")},
+        "sessions": integration_snapshot()["sessions"],
+    }, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------- recovery
+
+def restart_controller(args: argparse.Namespace) -> int:
+    before = controller_snapshot()
+    evidence = {"action": "restart controller", "before": before, "attempts": []}
+    ok = False
+    for attempt in range(1, 3):
+        kick = run(["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_JOB}"], timeout=20)
+        if kick.get("code") != 0:
+            # Job is registered in the plist but not loaded in launchd; load it,
+            # then verify the process comes up via the status file.
+            kick = run(["/bin/launchctl", "load", str(LAUNCHD_PLIST)], timeout=20)
+        entry = {"attempt": attempt, "kick": kick}
+        deadline = time.time() + 25
+        new_status = None
+        while time.time() < deadline:
+            snap = controller_snapshot()
+            data = snap.get("controller") or {}
+            pid = data.get("pid")
+            if isinstance(pid, int) and pid != (before.get("controller") or {}).get("pid") and snap.get("pid_alive"):
+                new_status = data
+                break
+            time.sleep(1)
+        entry["after"] = new_status
+        evidence["attempts"].append(entry)
+        if new_status:
+            ok = True
+            break
+    evidence["after_full"] = controller_snapshot()
+    evidence["ok"] = ok
+    save_evidence("restart-controller", evidence)
+    print(json.dumps(evidence, indent=2))
+    return 0 if ok else 1
+
+
+def restart_handy(args: argparse.Namespace) -> int:
+    before = handy_snapshot()
+    evidence = {"action": "restart handy", "before": before}
+    for pid in before.get("gui_pids", []) + before.get("worker_pids", []):
+        run(["/bin/kill", str(pid)])
+    deadline = time.time() + 10
+    while time.time() < deadline and any(pid_alive(p) for p in before.get("gui_pids", [])):
+        time.sleep(0.5)
+    evidence["open_result"] = run(["/usr/bin/open", "-a", "Handy"], timeout=20)
+    deadline = time.time() + 30
+    after = handy_snapshot()
+    while time.time() < deadline and not after.get("worker_pids"):
+        time.sleep(1)
+        after = handy_snapshot()
+    evidence["after"] = after
+    ok = bool(after.get("gui_pids") and after.get("worker_pids"))
+    evidence["ok"] = ok
+    save_evidence("restart-handy", evidence)
+    print(json.dumps(evidence, indent=2))
+    return 0 if ok else 1
+
+
+def restart_voicebox(args: argparse.Namespace) -> int:
+    before = voicebox_snapshot()
+    evidence = {"action": "restart voicebox", "before": before}
+    if before.get("crash_loop_24h"):
+        evidence["ok"] = False
+        evidence["blocked_reason"] = "crash loop: >=3 voicebox-server crash reports in 24h; relaunching will crash again. Reduce Metal memory pressure (unload the local LLM) before retrying."
+        save_evidence("restart-voicebox", evidence)
+        print(json.dumps(evidence, indent=2))
+        return 2
+    for pid in before.get("gui_pids", []):
+        run(["/bin/kill", str(pid)])
+    deadline = time.time() + 10
+    while time.time() < deadline and any(pid_alive(p) for p in before.get("gui_pids", [])):
+        time.sleep(0.5)
+    evidence["open_result"] = run(["/usr/bin/open", "-a", "Voicebox"], timeout=20)
+    deadline = time.time() + 90
+    after = voicebox_snapshot()
+    while time.time() < deadline:
+        after = voicebox_snapshot()
+        if after.get("listener") and after.get("health", {}).get("status") == 200:
+            break
+        time.sleep(2)
+    functional = functional_voicebox() if after.get("health", {}).get("status") == 200 else {"ok": False, "reason": "no health endpoint after restart"}
+    evidence["after"] = after
+    evidence["functional_after_restart"] = functional
+    evidence["ok"] = functional["ok"]
+    save_evidence("restart-voicebox", evidence)
+    print(json.dumps(evidence, indent=2))
+    return 0 if evidence["ok"] else 1
+
+
+# ---------------------------------------------------------------- verification
+
+def functional_voicebox() -> dict:
+    profile_name = ""
+    profile_file = STATE_DIR / "profile"
+    if profile_file.exists():
+        profile_name = profile_file.read_text(encoding="utf-8").strip()
+    profiles = http(f"{VOICEBOX_URL}/profiles")
+    profile_id = None
+    try:
+        for p in json.loads(profiles.get("body", "[]")):
+            if p.get("name") == profile_name:
+                profile_id = p.get("id")
+    except Exception:
+        pass
+    if not profile_id:
+        return {"ok": False, "reason": f"profile '{profile_name}' not in /profiles"}
+    text = "Doctor check complete."
+    model_size = "0.6B"
+    model_file = STATE_DIR / "tts-model"
+    if model_file.exists():
+        model_size = model_file.read_text(encoding="utf-8").strip() or "0.6B"
+    out = DOCTOR_RUNS / f"voicebox-verify-{int(time.time())}.wav"
+    DOCTOR_RUNS.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    result = {"ok": False, "attempts": []}
+    for attempt in range(1, 3):
+        fetch = run(
+            ["/usr/bin/curl", "-fsS", "-m", "90", "-o", str(out), "-X", "POST", f"{VOICEBOX_URL}/generate/stream", "-H", "content-type: application/json", "-d", json.dumps({"profile_id": profile_id, "text": text, "language": "en", "engine": "qwen", "model_size": model_size, "personality": False, "crossfade_ms": 25})],
+            timeout=95,
+        )
+        result["attempts"].append({"attempt": attempt, "curl_code": fetch["code"]})
+        if fetch["code"] == 0 and out.exists():
+            break
+        time.sleep(3)
+    result["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+    result["file"] = str(out)
+    if fetch["code"] == 0 and out.exists():
+        try:
+            import numpy as np
+
+            with wave.open(str(out)) as w:
+                frames, rate, channels = w.getnframes(), w.getframerate(), w.getnchannels()
+                data = np.frombuffer(w.readframes(frames), dtype=np.int16)
+            rms = float(np.sqrt(np.mean(data.astype(np.float32) ** 2))) if len(data) else 0.0
+            result["wav"] = {"frames": frames, "rate": rate, "channels": channels, "duration_s": round(frames / max(rate, 1), 2), "rms": round(rms, 1)}
+            result["ok"] = rms > 50 and frames > 1000
+        except Exception as exc:
+            result["wav_error"] = str(exc)
+    return result
+
+
+def verify_voicebox(args: argparse.Namespace) -> int:
+    result = {"snapshot": voicebox_snapshot(), "functional": functional_voicebox()}
+    result["verdict"] = "voicebox functional" if result["functional"]["ok"] else "voicebox NOT functional"
+    save_evidence("verify-voicebox", result)
+    print(json.dumps(result, indent=2))
+    return 0 if result["functional"]["ok"] else 1
+
+
+def verify_handy(args: argparse.Namespace) -> int:
+    snap = handy_snapshot()
+    if not snap.get("gui_pids"):
+        print(json.dumps({"verdict": "handy not running", "snapshot": snap}, indent=2))
+        return 1
+    res = run([HANDY_BIN, "--transcribe-file", str(WAKE_FIXTURE), "--json"], timeout=120)
+    text = ""
+    try:
+        payload = json.loads(res.get("stdout", "{}"))
+        text = payload.get("text") or payload.get("transcription") or ""
+    except Exception:
+        pass
+    ok = res["code"] == 0 and text.strip() != ""
+    result = {"verdict": "handy transcription works" if ok else "handy transcription FAILED", "fixture": str(WAKE_FIXTURE), "transcript": text[:200], "process": {"code": res["code"], "stderr": res["stderr"][:200]}, "snapshot": snap}
+    save_evidence("verify-handy", result)
+    print(json.dumps(result, indent=2))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- physical loop
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+def compare_texts(a: str, b: str) -> dict:
+    ta = [t.lower().strip(".,!?\"'") for t in a.split() if t]
+    tb = [t.lower().strip(".,!?\"'") for t in b.split() if t]
+    return {
+        "ratio": round(difflib.SequenceMatcher(None, ta, tb).ratio(), 3),
+        "missing_in_b": [t for t in ta if t not in tb][:10],
+        "extra_in_b": [t for t in tb if t not in ta][:10],
+    }
+
+
+def acoustic_score(target: np.ndarray, rec: np.ndarray) -> dict:
+    """Band-limited (300-3000 Hz, the speech band) 20 ms energy bins,
+    Pearson-correlated against the clip's energy profile. Raw-sample
+    correlation dies in the room path; full-band envelope cosine lets
+    the low-frequency ambient floor score ~0.8 against anything.
+    Calibration VD-ACAL-006: real playback 0.956, silence control 0.376.
+
+    `target` and `rec` are float arrays sampled at 48000 Hz.
+    """
+    import numpy as np
+
+    bin_ = 960  # 20 ms
+    LO, HI = 300.0, 3000.0
+
+    def bandpass(x):
+        spec = np.fft.rfft(x)
+        freqs = np.fft.rfftfreq(len(x), 1 / 48000)
+        spec[(freqs < LO) | (freqs > HI)] = 0
+        return np.fft.irfft(spec, n=len(x))
+
+    def energy_bins(x):
+        n = len(x) // bin_
+        return np.array([float(np.sqrt(np.mean(x[i * bin_:(i + 1) * bin_] ** 2))) for i in range(n)])
+
+    target_bins = energy_bins(bandpass(target))
+    rec_bins = energy_bins(bandpass(rec))
+    floor = float(np.median(rec_bins)) if len(rec_bins) else 0.0
+    tgt = target_bins - float(np.mean(target_bins))
+    tgt_norm = float(np.linalg.norm(tgt))
+    best_corr = 0.0
+    best_offset_ms = -1
+    for start in range(0, max(1, len(rec_bins) - len(target_bins) + 1)):
+        w = rec_bins[start : start + len(target_bins)]
+        w = w - float(np.mean(w))
+        norm = float(np.linalg.norm(w))
+        if norm < 1e-9 or tgt_norm < 1e-9:
+            continue
+        c = float(np.dot(w, tgt) / (norm * tgt_norm))
+        if c > best_corr:
+            best_corr, best_offset_ms = c, start * 20
+    peak = float(max(rec_bins[best_offset_ms // 20 : best_offset_ms // 20 + len(target_bins)])) if best_offset_ms >= 0 and len(rec_bins) else 0.0
+    peak_ratio = peak / floor if floor > 1e-9 else 0.0
+    return {
+        "ok": best_corr > 0.6 and peak_ratio >= 3.0,
+        "correlation": round(best_corr, 3),
+        "peak_over_floor": round(peak_ratio, 2),
+        "best_offset_ms": best_offset_ms,
+        "noise_floor_rms": round(floor, 6),
+    }
+
+
+def acoustic_verify(pid: int, timeout: float = 25.0, verify_seq: int = 0) -> dict:
+    """Record the microphone while the session's clip plays and correlate the
+    captured sound with the clip PCM: independent proof the speakers emitted
+    the speech, not just that a generation call returned 200.
+
+    The caller must stop the controller first: the mic stream is exclusive,
+    and a second capture while the controller holds it records silence. The
+    voice-play player keeps playing regardless.
+    """
+    import numpy as np
+    import sounddevice as sd
+
+    slot_path = STATE_DIR / "tts-playing" / f"{pid}.json"
+    deadline = time.time() + timeout
+    best: dict | None = None
+    # Start the capture before the slot appears: the TTS request is logged
+    # before generation, and a ~5 s clip can play out entirely inside the
+    # polling window if we only open the stream after the slot is visible.
+    stream = sd.InputStream(samplerate=48000, channels=1, dtype="int16")
+    stream.start()
+    frames = []
+    clip_pcm = None
+    rate = 24000
+    try:
+        while time.time() < deadline:
+            try:
+                slot = json.loads(slot_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                slot = None
+            if isinstance(slot, dict) and slot.get("afplay_pid") and not slot.get("ended_at"):
+                wav = slot.get("wav") or (slot.get("reference") or {}).get("wav")
+                if wav and pid_alive(int(slot["afplay_pid"])) and Path(wav).exists():
+                    # Snapshot the clip bytes before afplay exits and the
+                    # extension unlinks it.
+                    try:
+                        with wave.open(wav) as w:
+                            rate = w.getframerate()
+                            clip_pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+                    except Exception as exc:
+                        stream.stop()
+                        return {"ok": False, "reason": f"clip unreadable: {exc}", "clip": wav}
+                    speed = float(slot.get("playback_rate", 1.0) or 1.0)
+                    if speed != 1.0:
+                        n_out = max(1, int(len(clip_pcm) / speed))
+                        idx = np.linspace(0.0, len(clip_pcm) - 1.0, n_out)
+                        clip_pcm = np.interp(idx, np.arange(len(clip_pcm), dtype=np.float64), clip_pcm.astype(np.float64)).astype(np.int16)
+                    break
+            try:
+                frames.append(stream.read(2400)[0][:, 0])
+            except Exception:
+                break
+        else:
+            stream.stop()
+            return {"ok": False, "reason": "no playback detected within window"}
+        # Capture the remainder of the clip: 5 s covers a short reply clip.
+        for _ in range(100):
+            try:
+                frames.append(stream.read(2400)[0][:, 0])
+            except Exception:
+                break
+    finally:
+        stream.stop()
+    rec = np.concatenate(frames) if frames else np.zeros(0, dtype=np.int16)
+    recf = rec.astype(np.float64) / 32768.0
+    if clip_pcm is None or len(recf) < 48000 or float(np.abs(recf).max()) > 1.5:
+        DOCTOR_RUNS.mkdir(parents=True, exist_ok=True)
+        np.save(DOCTOR_RUNS / f"invalid-capture-{int(time.time())}-{verify_seq}.npy", recf)
+        return {
+            "ok": False,
+            "reason": "mic capture invalid or too short",
+            "correlation": 0.0,
+            "invalid_blocks": int(np.sum(np.abs(recf) > 1.0)),
+            "recording_rms": round(float(np.sqrt(np.mean(recf ** 2))), 4) if len(recf) else 0.0,
+        }
+    if rate != 48000:
+        factor = 48000 / rate
+        n_out = int(len(clip_pcm) * factor)
+        idx = np.linspace(0.0, len(clip_pcm) - 1.0, n_out)
+        target = np.interp(idx, np.arange(len(clip_pcm), dtype=np.float64), clip_pcm.astype(np.float64))
+    else:
+        target = clip_pcm.astype(np.float64)
+    result = acoustic_score(target, recf)
+    result["recording_rms"] = round(float(np.sqrt(np.mean(recf ** 2))), 4)
+    result["clip_frames"] = int(len(clip_pcm))
+    result["clip"] = wav
+    if not result["ok"]:
+        DOCTOR_RUNS.mkdir(parents=True, exist_ok=True)
+        np.save(DOCTOR_RUNS / f"verify-rec-{int(time.time())}-{verify_seq}.npy", recf)
+    return result
+
+
+def loop(args: argparse.Namespace) -> int:
+    """Physical loop with a controlled session:
+    stop the shared controller -> start a dedicated controller bound to the
+    test session -> play wake+phrase out of the speakers -> physical mic wakes
+    openWakeWord -> Handy captures and finalizes -> controller dispatches the
+    one turn -> assistant replies -> VoiceBox generates -> afplay emits ->
+    mic records the emission -> three-way text comparison.
+    Injected audio is synthetic; no human barge-in claim is made."""
+    if not WAKE_FIXTURE.exists():
+        print(json.dumps({"error": f"missing wake fixture {WAKE_FIXTURE}"}))
+        return 2
+    services = {"controller": controller_snapshot(), "handy": handy_snapshot(), "voicebox": voicebox_snapshot(), "audio": audio_snapshot(), "integration": integration_snapshot()}
+    findings = diagnose(services)
+    critical = [f for f in findings if f["severity"] == "critical"]
+    if critical:
+        print(json.dumps({"blocked": critical}, indent=2))
+        return 2
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import run_fixture_pipeline as pipe
+
+    evidence: dict = {"id": "VD-LOOP-001", "at": utc_stamp(), "audio_path": "physical: speakers -> controller mic"}
+    test_controller = None
+    proc = None
+    master = None
+    os.environ["OMP_VOICE_STREAM_PLAYER"] = "1"
+    try:
+        # Dedicated controller so the turn lands on the controlled session.
+        run(["/bin/launchctl", "unload", str(LAUNCHD_PLIST)], timeout=10)
+        proc, record, master = pipe.start_omp()
+        pid, port = int(record["pid"]), int(record["port"])
+        evidence["omp_pid"] = pid
+        evidence["bridge_port"] = port
+
+        # The omp session auto-starts a plain controller at session_start; stop it
+        # so the dedicated bridge-only controller can take the lock.
+        run([str(ROOT / "bin" / "omp-voice-controller"), "stop"], timeout=15)
+        # Any other live controller (e.g. one auto-started by the driving session)
+        # contends for the exclusive mic and corrupts the capture buffers.
+        strays = [int(x) for x in subprocess.run(["pgrep", "-f", "omp-voice-controller"], capture_output=True, text=True).stdout.split()]
+        for p in strays:
+            if p != os.getpid():
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except OSError:
+                    pass
+        deadline = time.time() + 15
+        while time.time() < deadline and controller_snapshot().get("pid_alive"):
+            time.sleep(1)
+
+        env = dict(os.environ)
+        env["OMP_VOICE_BRIDGE_ONLY"] = f"http://127.0.0.1:{port}"
+        # File mode: the flush transcribes the frames the controller already
+        # captured (speakers -> mic is still physical) instead of toggling the
+        # Handy GUI, whose window check can end dictation early in a test run.
+        env["OMP_VOICE_HANDY"] = "transcribe-file"
+        # Exercise the per-stream ducking player end-to-end: the reply plays
+        # through voice-play, whose gain the controller can attenuate without
+        # touching the master volume.
+        env["OMP_VOICE_STREAM_PLAYER"] = "1"
+        ctrl_log = DOCTOR_RUNS / f"loop-controller-{int(time.time())}.log"
+        test_controller = subprocess.Popen(
+            [str(ROOT / "bin" / "omp-voice-controller"), "run", "--wake-word", "hey_jarvis", "--wake-threshold", "0.5", "--pause-seconds", "5.0", "--idle-timeout", "15.0"],
+            env=env,
+            stdout=open(ctrl_log, "w", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        deadline = time.time() + 60
+        ready = False
+        while time.time() < deadline:
+            try:
+                logtext = ctrl_log.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                logtext = ""
+            if "ready in IDLE" in logtext and test_controller.poll() is None:
+                ready = True
+                break
+            time.sleep(1)
+        evidence["test_controller_ready"] = ready
+        if not ready:
+            evidence["verdict"] = "loop aborted: test controller never reached IDLE"
+            evidence["controller_log"] = ctrl_log.read_text(encoding="utf-8", errors="replace")[-1500:] if ctrl_log.exists() else ""
+            path = save_evidence("loop", evidence)
+            print(json.dumps(evidence, indent=2))
+            print(f"evidence: {path}", file=sys.stderr)
+            return 1
+
+        phrase = "Voice doctor loop check. Reply with exactly: LOOP-771 complete."
+        say = DOCTOR_RUNS / f"loop-phrase-{int(time.time())}.wav"
+        pipe.say_wav(say, phrase)
+        t_start = time.time()
+        row = None
+        t_transcript = None
+        for attempt in range(1, 4):
+            run(["/usr/bin/afplay", str(WAKE_FIXTURE)], timeout=15)
+            time.sleep(0.6)
+            run(["/usr/bin/afplay", str(say)], timeout=30)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                try:
+                    logtext = ctrl_log.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    logtext = ""
+                marker = "Handy file transcript:"
+                idx = logtext.rfind(marker)
+                if idx >= 0:
+                    line = logtext[idx:].splitlines()[0]
+                    row = {"latest_text": line.split(":", 1)[1].strip().strip('"')}
+                    t_transcript = time.time()
+                    break
+                time.sleep(0.5)
+            if row:
+                break
+            evidence.setdefault("wake_attempts", []).append({"attempt": attempt, "log_tail": logtext[-400:]})
+            time.sleep(2)
+        evidence["prompt_submitted_acoustically"] = phrase
+        evidence["handy_finalized"] = row
+        # The extension only speaks replies while the controller is IDLE;
+        # submitting during DICTATING produces a silent reply and no playback
+        # slot to verify.
+        idle_at = None
+        idle_deadline = time.time() + 60
+        while time.time() < idle_deadline:
+            try:
+                st = json.loads((STATE_DIR / "status.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                st = {}
+            if st.get("state") == "IDLE":
+                idle_at = st.get("updated_at")
+                break
+            time.sleep(1)
+        evidence["controller_idle_before_submit"] = idle_at is not None
+
+        # Production path: dictation lands in the editor; "send prompt" submits.
+        # Inject it through the bridge-only controller so the same command
+        # grammar (parseVoiceTranscript) presses Enter in the test session.
+        # Wait until the bridge editor actually holds the transcript; pressing
+        # Enter on an empty draft delivers nothing.
+        draft_ready = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                st = json.loads(urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/status", timeout=3).read().decode())
+                if (st.get("draft") or "").strip():
+                    draft_ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        evidence["bridge_draft_ready"] = draft_ready
+        submit = run(
+            [str(ROOT / "bin" / "omp-voice-controller"), "inject", "send prompt"],
+            timeout=15,
+            env=env,
+        )
+        evidence["submit_injection"] = submit
+
+        # Release the exclusive mic now: the reply will be spoken by voice-play
+        # (extension-driven), and the acoustic verifier needs the mic.
+        if test_controller.poll() is None:
+            test_controller.terminate()
+            stop_deadline = time.time() + 12
+            while time.time() < stop_deadline and test_controller.poll() is None:
+                time.sleep(0.5)
+
+        # The dedicated controller is gone; any duck gain left in the stream
+        # file from an interrupted transaction would mute the reply player and
+        # starve the acoustic verifier.
+        gain_file = STATE_DIR / "stream-gain.json"
+        try:
+            gain_file.write_text(json.dumps({"gain": 1.0}), encoding="utf-8")
+        except OSError:
+            pass
+
+        reply = ""
+        playback_slot = None
+        verify_attempts = 0
+        t_reply = None
+        t_playback = None
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            try:
+                r, _, _ = select.select([master], [], [], 0.5)
+                if r:
+                    reply += os.read(master, 8192).decode("utf-8", "replace")
+                    if t_reply is None and "771" in reply.lower():
+                        t_reply = time.time()
+            except OSError:
+                break
+            if verify_attempts < 3:
+                slot = Path.home() / ".local" / "state" / "omp-voice" / "tts-playing" / f"{pid}.json"
+                try:
+                    data = json.loads(slot.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and data.get("afplay_pid") and not data.get("ended_at"):
+                        if playback_slot is None:
+                            playback_slot = data
+                            t_playback = time.time()
+                        result = acoustic_verify(pid, timeout=30, verify_seq=verify_attempts)
+                        verify_attempts += 1
+                        prev = evidence.get("acoustic_verify")
+                        if prev is None or result.get("correlation", 0) > prev.get("correlation", 0):
+                            evidence["acoustic_verify"] = result
+                        if result.get("ok"):
+                            break
+                except (OSError, ValueError):
+                    pass
+            if "771" in reply.lower() and evidence.get("acoustic_verify", {}).get("ok"):
+                break
+        evidence["playback_slot"] = playback_slot
+        evidence["latency"] = {
+            "injection_to_transcript_s": round(t_transcript - t_start, 1) if t_transcript else None,
+            "injection_to_reply_s": round(t_reply - t_start, 1) if t_reply else None,
+            "injection_to_playback_s": round(t_playback - t_start, 1) if t_playback else None,
+            "reply_to_playback_s": round(t_playback - t_reply, 1) if t_playback and t_reply else None,
+        }
+
+        # Drain the session pty to capture the assistant reply text.
+        reply_clean = strip_ansi(reply)
+        evidence["assistant_reply_excerpt"] = reply_clean[-1200:]
+        transcript = (row or {}).get("latest_text", "")
+        evidence["three_way"] = {
+            "A_prompt": phrase,
+            "B_handys_transcript": transcript,
+            "C_assistant_reply_present": "LOOP-771" in reply_clean or "loop" in reply_clean.lower(),
+            "prompt_vs_transcript": compare_texts(phrase, transcript),
+        }
+        controller_log = ctrl_log.read_text(encoding="utf-8", errors="replace") if ctrl_log.exists() else ""
+        evidence["turns_dispatched"] = controller_log.count("Delivery ")
+    finally:
+        if test_controller and test_controller.poll() is None:
+            test_controller.terminate()
+            deadline = time.time() + 15
+            while time.time() < deadline and test_controller.poll() is None:
+                time.sleep(0.5)
+            if test_controller.poll() is None:
+                test_controller.kill()
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        if master is not None:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        run(["/bin/launchctl", "load", str(LAUNCHD_PLIST)], timeout=20)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            snap = controller_snapshot()
+            if snap.get("pid_alive"):
+                break
+            time.sleep(1)
+        evidence["controller_restored"] = controller_snapshot().get("pid_alive", False)
+    ok = bool(evidence.get("handy_finalized") and evidence.get("playback_slot") and evidence.get("acoustic_verify", {}).get("ok") and evidence.get("three_way", {}).get("C_assistant_reply_present"))
+    evidence["verdict"] = "physical loop verified" if ok else "physical loop INCOMPLETE"
+    path = save_evidence("loop", evidence)
+    print(json.dumps(evidence, indent=2))
+    print(f"evidence: {path}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="voice-doctor", description="Voice stack environment doctor")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("status")
+    sub.add_parser("doctor")
+    sub.add_parser("diagnose", help="alias for doctor")
+    p_restart = sub.add_parser("restart")
+    p_restart.add_argument("service", choices=["controller", "handy", "voicebox"])
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("service", choices=["handy", "voicebox", "integration"])
+    sub.add_parser("loop")
+    args = parser.parse_args()
+    if args.command == "status":
+        return status(args)
+    if args.command in ("doctor", "diagnose"):
+        return doctor(args)
+    if args.command == "restart":
+        return {"controller": restart_controller, "handy": restart_handy, "voicebox": restart_voicebox}[args.service](args)
+    if args.command == "verify":
+        return {"handy": verify_handy, "voicebox": verify_voicebox, "integration": loop}[args.service](args)
+    if args.command == "loop":
+        return loop(args)
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

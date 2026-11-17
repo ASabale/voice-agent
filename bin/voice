@@ -1,0 +1,4 @@
+#!/bin/sh
+# Operational front end: voice status | doctor | restart <svc> | verify <svc> | loop
+ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+exec "$ROOT/voice-doctor" "$@"
