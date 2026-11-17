@@ -853,3 +853,79 @@ def test_rising_ambient_noise_alone_neither_holds_nor_ducks(monkeypatch, tmp_pat
     assert mic.ambient_short <= 100.0
     assert mic.echo_full_gain > 150
     assert volume["volume"] == 70
+
+
+def test_partial_recognition_kicks_before_the_clip_flushes(monkeypatch) -> None:
+    """Spec §8: eight frames of confirmed voice start Whisper while capture continues.
+
+    The 16-frame flush contract is untouched — the full clip still gets its
+    own decision; the partial only buys an early stop.
+    """
+    monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "stop_playback", lambda reason: (_ for _ in ()).throw(AssertionError("stop_playback")))
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    for name in ("silence_speech", "kill_tts_clips", "handy_start_recording", "dispatch_transcript", "play_cue", "write_status"):
+        monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
+
+    mic = controller.MicState()
+    mic.last_manual_check = 1e12
+    mic.enter_dictating = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("enter"))  # type: ignore[method-assign]
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    _feed(mic, _wav("hold-on-say.wav"), jobs, VAD())
+    assert mic.whisper_pending is not None
+    assert mic.whisper_pending["kind"] == "tts_barge_partial"
+    assert mic.tts_barge_partial_kicked is True
+    assert mic.tts_barge_next is not None  # the full clip waits for its own pass
+
+
+def test_partial_stop_halts_without_the_full_clip(monkeypatch, tmp_path) -> None:
+    """A verbatim stop in the partial clip stops playback immediately (§8 target)."""
+    stops: list[str] = []
+    monkeypatch.setenv("OMP_VOICE_BARGE_TRACE", "1")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(
+        controller,
+        "stop_playback",
+        lambda reason: (stops.append(reason), controller.time.monotonic())[1],
+    )
+    monkeypatch.setattr(controller, "restore_output_volume", lambda _mic: True)
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+
+    now = controller.time.monotonic()
+    mic = controller.MicState()
+    mic.state = "IDLE"
+    mic.tts_barge_held = True
+    mic.tts_barge_voice = True
+    mic.barge_onset_mono = now - 0.4
+    mic.barge_stages = {"gate": now - 0.6, "hold": now - 0.4, "duck": now - 0.25, "capture": now - 0.4, "partial": now - 0.1}
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    assert mic.apply_whisper("tts_barge_partial", "Hey Jarvis stop", None, None, jobs) is True
+    assert len(stops) == 1
+    assert "partial" in stops[0]
+    assert mic.tts_barge_held is False
+    assert mic.tts_barge_waiting is False
+    assert mic.barge_stages == {}
+    events = [json.loads(line) for line in (tmp_path / "barge-trace.jsonl").read_text().splitlines()]
+    latency = next(e for e in events if e["stage"] == "latency")
+    assert latency["gate_to_stop_s"] > 0
+    assert latency["partial_to_decision_s"] >= 0
+
+
+def test_partial_non_stop_keeps_the_hold_and_queues_the_full_clip(monkeypatch) -> None:
+    """A partial that is not a stop is not a decision: the hold stays, the full
+    clip gets its Whisper pass, and the speaker is never restored early."""
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    mic = controller.MicState()
+    mic.state = "IDLE"
+    mic.tts_barge_held = True
+    mic.tts_barge_voice = True
+    mic.tts_barge_next = (np.zeros(16, dtype=np.float32), "Hey Jarvis. stop.")
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    assert mic.apply_whisper("tts_barge_partial", "hello there", None, None, jobs) is True
+    assert mic.tts_barge_held is True
+    assert mic.tts_barge_next is None
+    assert mic.whisper_pending is not None
+    assert mic.whisper_pending["kind"] == "tts_barge"

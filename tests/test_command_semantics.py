@@ -40,8 +40,11 @@ def test_stop_and_hold_cut_playback_pause_and_resume_do_not(monkeypatch) -> None
         monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
 
     assert _barge("Stop.") is True
+    assert _barge("hey jarvis stop") is True
+    assert _barge("jarvis stop") is True
     assert _barge("hold on a second") is True
     assert _barge("pause") is False
+    assert _barge("the jarvis stop") is False
     assert _barge("the pause command") is False
     assert _barge("resume") is False
 
