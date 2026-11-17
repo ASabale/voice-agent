@@ -41,6 +41,25 @@ def volume() -> int | None:
         return None
 
 
+def playing() -> bool:
+    """True if any session has a live afplay clip (flat status.json has no such key)."""
+    slots = Path(os.path.expanduser("~/.local/state/omp-voice/tts-playing"))
+    for path in slots.glob("*.json"):
+        try:
+            slot = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid = slot.get("afplay_pid")
+        if not pid or slot.get("ended_at"):
+            continue
+        try:
+            if subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def main() -> int:
     bridge = os.environ.get("VOICE_BRIDGE_PORT")
     if not bridge:
@@ -89,19 +108,18 @@ def main() -> int:
 
     # Reply generation plus playback is slow on the single-slot local engine.
     print("[cal] waiting for playback to start")
-    playing = False
+    is_playing = False
     for _ in range(120):
-        s = status()
-        if s.get("tts_playing"):
-            playing = True
+        if playing():
+            is_playing = True
             break
         time.sleep(1)
-    if not playing:
+    if not is_playing:
         print("[cal] no playback detected; recording ambient only", file=sys.stderr)
 
     print("[cal] playback sampling 45 s")
     for _ in range(45):
-        sample("playback" if playing else "post")
+        sample("playback" if is_playing else "post")
         time.sleep(1)
 
     for _ in range(15):

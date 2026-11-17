@@ -156,6 +156,27 @@ AMBIENT_SPEECH_VAD_GUARD = 0.35
 AMBIENT_TRANSIENT_FACTOR = 4.0
 ECHO_ALPHA = 0.25
 DUCK_AMBIENT_DOMINANCE = 1.0   # when bleed <= ambient, deep ducking has no measured benefit
+# Explicit duck bounds (spec §3): measured bleed response on this machine is
+# visible at 30-70% attenuation; below 10% the volume change is inaudible and
+# pointless, and ducking under a fifth of the current level risks destroying
+# intelligibility with no measured echo benefit.
+DUCK_MIN_ATTENUATION = 0.10
+DUCK_MAX_ATTENUATION = 0.80
+# Frame attribution (spec §2B/C): the render reference knows what the speaker
+# is emitting at every frame; a measured coupling gain turns that into the
+# expected bleed at the microphone. A frame only counts as near-end speech
+# when its energy exceeds that expectation by more than the ambient level.
+AEC_CORRELATION_GUARD = 0.55   # the existing filter-guard value, shared verbatim
+AEC_ATTRIBUTION_LAG_MS = 1000  # attribution correlation scans wider than the filter guard
+ECHO_REF_ACTIVE_RMS = 60.0     # a reference block counts as emitting above this rms
+ECHO_RATIO_WINDOW = 60         # frames behind the median coupling estimate (~1.5 s)
+ECHO_RATIO_MIN_SAMPLES = 6     # before this many samples, the legacy gate still applies
+# Dictation trust (spec §2C): when Handy drops a row, the local Whisper fallback
+# is dispatched only if the chunk carries frames attributed to near-end speech.
+# Whisper tiny invents "Thank you.", "Okay.", "Good, good." on pure noise and on
+# speaker bleed; those invented sentences were being posted as dictation.
+DICT_HUMAN_MIN_FRAMES = 5      # 80 ms frames: ~0.4 s of attributed speech
+NEAR_END_MARGIN_RMS = 40.0     # same transient floor the ambient guard uses
 PASTE_KEY_SETTLE_SECONDS = 0.12
 # Chrome handles the Cmd+V paste asynchronously: restoring the clipboard too
 # soon makes the browser paste the pre-injection clipboard instead. Measured
@@ -818,18 +839,47 @@ def _guard_reference(
     captured_at: float,
     n: int,
     playback_rate: float,
+    lag_samples: int | None = None,
 ) -> np.ndarray:
     """Render samples around the mic block, widened by the flight-lag window."""
+    lag = AEC_GUARD_LAG_SAMPLES if lag_samples is None else int(lag_samples)
     rate = float(playback_rate) or 1.0
-    lead = AEC_GUARD_LAG_SAMPLES / (MIC_RENDER_RATE * rate)
+    lead = lag / (MIC_RENDER_RATE * rate)
     return render_block_at(
         render,
         started_at,
         captured_at + lead,
-        n + 2 * AEC_GUARD_LAG_SAMPLES,
+        n + 2 * lag,
         rate,
         paused_playback_seconds(captured_at),
     )
+
+
+def echo_correlation(mic: np.ndarray, reference: np.ndarray) -> float:
+    """Best normalized cross-correlation of the mic block with any lagged
+    window of the render reference, 0.0 when the reference is silent.
+
+    Sample resolution matters: a noise-like echo only matches the reference at
+    its exact offset. Measured separation on this machine: a real echo path
+    matches at 0.62-1.0, unrelated speech at 0.46 or below.
+    """
+    mic_f = mic.astype(np.float64)
+    mic_energy = float(mic_f @ mic_f)
+    ref = reference.astype(np.float64)
+    if mic_energy == 0.0 or not ref.any():
+        return 0.0
+    n = len(mic_f)
+    if n == 0 or len(ref) < n:
+        return 0.0
+    size = 1 << (len(ref) + n - 1).bit_length()
+    corr = np.fft.irfft(np.fft.rfft(ref, size) * np.conj(np.fft.rfft(mic_f, size)), size)
+    prefix = np.cumsum(ref * ref)
+    spans = len(ref) - n + 1
+    energies = prefix[n - 1 : n - 1 + spans] - np.concatenate(([0.0], prefix[: spans - 1]))
+    live = energies > 0.0
+    if not live.any():
+        return 0.0
+    return float(np.max(np.abs(corr[:spans][live]) / np.sqrt(mic_energy * energies[live])))
 
 
 def echo_over_cancels(mic: np.ndarray, cleaned: np.ndarray, reference: np.ndarray) -> bool:
@@ -842,33 +892,18 @@ def echo_over_cancels(mic: np.ndarray, cleaned: np.ndarray, reference: np.ndarra
     reference's statistics alone removes the person instead of the echo, and
     the raw frame is the honest one.
     """
-    mic_f = mic.astype(np.float64)
-    mic_energy = float(mic_f @ mic_f)
+    mic_energy = float(np.dot(mic.astype(np.float64), mic.astype(np.float64)))
     clean_f = cleaned.astype(np.float64)
     if mic_energy == 0.0 or float(clean_f @ clean_f) >= 0.25 * mic_energy:
         return False
-    ref = reference.astype(np.float64)
-    if not ref.any():
+    if not reference.any():
         return True
-    n = len(mic_f)
-    if n == 0 or len(ref) < n:
+    n = len(mic)
+    if n == 0 or len(reference) < n:
         return True
-    # Linear cross-correlation at every sample lag: c[j] is the dot product of
-    # the mic block with ref[j : j + n]. Sample resolution matters because a
-    # noise-like echo only matches the reference at its exact offset.
-    size = 1 << (len(ref) + n - 1).bit_length()
-    corr = np.fft.irfft(np.fft.rfft(ref, size) * np.conj(np.fft.rfft(mic_f, size)), size)
-    prefix = np.cumsum(ref * ref)
-    spans = len(ref) - n + 1
-    energies = prefix[n - 1 : n - 1 + spans] - np.concatenate(([0.0], prefix[: spans - 1]))
-    live = energies > 0.0
-    if not live.any():
-        return True
-    # Measured separation on this machine: a real echo path matches a lagged
-    # render window at 0.62-1.0, unrelated speech at 0.46 or below. A fit that
-    # crushes a block with no such match is removing the person, not the echo.
-    best = float(np.max(np.abs(corr[:spans][live]) / np.sqrt(mic_energy * energies[live])))
-    return best < 0.55
+    # A fit that crushes a block with no echo-like match is removing the
+    # person, not the echo.
+    return echo_correlation(mic, reference) < AEC_CORRELATION_GUARD
 
 
 def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) -> np.ndarray:
@@ -876,21 +911,29 @@ def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) ->
 
     No reference means the block is unchanged. Idle audio is not filtered.
     """
+    global _last_ref_rms, _last_echo_corr, _last_mic_rms
     parsed = _render_parsed
     samples = _render_samples
+    mic = np.asarray(frame, dtype=np.int16).reshape(-1)
+    _last_mic_rms = float(np.sqrt(np.mean(mic.astype(np.float64) ** 2)))
     if not parsed or samples is None or not parsed.get("aligned"):
+        _last_ref_rms = 0.0
+        _last_echo_corr = 0.0
         return frame
     started = parsed.get("started_at")
     if not isinstance(started, float):
+        _last_ref_rms = 0.0
+        _last_echo_corr = 0.0
         return frame
     processor = playback_echo_canceller(_render_file_key)
     if processor is None:
+        _last_ref_rms = 0.0
+        _last_echo_corr = 0.0
         return apply_render_subtraction(frame, captured_at)
     when = time.time() if captured_at is None else captured_at
     rate = parsed.get("playback_rate")
     if isinstance(rate, bool) or not isinstance(rate, (int, float)):
         rate = 1.0
-    mic = np.asarray(frame, dtype=np.int16).reshape(-1)
     reverse = render_block_at(
         samples,
         started,
@@ -898,6 +941,16 @@ def cancel_playback_echo(frame: np.ndarray, captured_at: float | None = None) ->
         len(mic),
         float(rate),
         paused_playback_seconds(when),
+    )
+    # Attribution signals for the estimator, measured on the full-gain
+    # reference: what the speaker is emitting this frame, and how strongly the
+    # raw mic block matches the reference at any plausible flight lag. The
+    # attribution window is wider than the filter guard because the measured
+    # echo lags the render cursor by 400-600 ms on this machine.
+    _last_ref_rms = float(np.sqrt(np.mean(reverse.astype(np.float64) ** 2)))
+    _last_echo_corr = echo_correlation(
+        mic,
+        _guard_reference(samples, started, when, len(mic), float(rate), AEC_ATTRIBUTION_LAG_MS * MIC_RENDER_RATE // 1000),
     )
     if _duck_ratio != 1.0:
         # The speaker is physically at duck volume; feeding the full-amplitude
@@ -942,6 +995,11 @@ _render_paused_seconds = 0.0
 # the adaptive filter diverges and eats near-end speech (VA-BARGE-AEC).
 _duck_ratio = 1.0
 _acoustic_snapshot: dict = {}
+# Per-frame render activity and echo correlation, recorded by the canceller
+# for the three-source estimator (spec §2B).
+_last_ref_rms = 0.0
+_last_echo_corr = 0.0
+_last_mic_rms = 0.0
 
 
 def refresh_render_reference(now: float | None = None) -> dict:
@@ -1850,6 +1908,13 @@ def duck_output_volume(state: "MicState") -> None:
         return
     current = output_volume()
     if current is None or current <= target_pct:
+        return
+    # Explicit bounds (spec §3): an attenuation below DUCK_MIN_ATTENUATION is
+    # inaudible and pointless, and ducking below DUCK_MAX_ATTENUATION of the
+    # current level risks intelligibility with no measured echo benefit.
+    target_pct = max(target_pct, int(current * (1.0 - DUCK_MAX_ATTENUATION) + 1e-9))
+    if current - target_pct < current * DUCK_MIN_ATTENUATION:
+        log(f"duck skipped: {current} -> {target_pct} is under the minimum attenuation")
         return
     # Adaptive depth (spec §3): the environment decides how far to duck.
     # While the echo estimate sits at or below the measured ambient level,
@@ -3258,13 +3323,21 @@ class MicState:
     # laptop speakers sits well above that floor; a wake-word hit on the TTS audio does not.
     tts_rms_floor: deque[float] = field(default_factory=lambda: deque(maxlen=25))
     # Three-source estimates: quiet frames when nothing plays set the ambient
-    # level; quiet frames while VoiceBox plays set the echo level, re-scaled to
-    # full gain so ducking never lowers the estimate.
+    # level; the render reference gives the speaker's exact emission per frame,
+    # and the median raw-energy/reference ratio over echo-correlated frames
+    # calibrates the speaker-microphone coupling gain. Ducking rescales the
+    # expectation so the estimate never collapses (spec §2B).
     ambient_short: float = 0.0
     ambient_long: float = 0.0
     ambient_spread: float = 0.0
     echo_full_gain: float = 0.0
     near_end_last: float = 0.0
+    echo_ratios: deque[float] = field(default_factory=lambda: deque(maxlen=ECHO_RATIO_WINDOW))
+    echo_ref_avg: float = 0.0
+    # Per-chunk attribution counters (spec §2C): frames counted as speaker
+    # bleed versus near-end speech while dictating.
+    dict_human_frames: int = 0
+    dict_echo_frames: int = 0
     tts_stop_frames: list[np.ndarray] = field(default_factory=list)
     tts_barge_held: bool = False
     tts_barge_partial_kicked: bool = False
@@ -3481,6 +3554,8 @@ class MicState:
         self.speech_seen_in_chunk = False
         self.chunk_started_at = time.monotonic()
         self.last_speech_at = self.chunk_started_at
+        self.dict_human_frames = 0
+        self.dict_echo_frames = 0
         self.score_wake_blocked_until = 0.0
         self.cooldown_until = self.chunk_started_at + ENTER_DICTATION_COOLDOWN_SECONDS
         self.turn_seq += 1
@@ -3734,27 +3809,74 @@ class MicState:
         """Split the mic mixture into ambient, speaker echo, and near-end speech.
 
         Ambient learns only from quiet, low-VAD, non-transient frames when
-        nothing is playing; speech and playback never contaminate it. Echo
-        learns from quiet playback frames and is re-scaled by the duck ratio,
-        so ducking cannot collapse the echo estimate (spec §2B). Frames the
-        VAD calls speech are attributed to the human, not to either floor.
+        nothing is playing; speech and playback never contaminate it. While
+        VoiceBox plays, the render reference gives the speaker's exact emission
+        for each block. A block that correlates with that reference at a
+        plausible flight lag is our own bleed: it calibrates the echo level,
+        re-scaled to full gain so ducking never collapses it (spec §2B). A
+        block that does not correlate is the human, attributed only when its
+        energy exceeds the expected bleed plus ambient by more than ambient
+        (spec §2C: SNR over ambient, never a fixed absolute floor).
         """
         global _acoustic_snapshot
         if self.tts_active:
-            expected = self.echo_full_gain * _duck_ratio + self.ambient_short
-            excess = rms - expected
-            if vad_score >= 0.55 and excess > self.ambient_short:
-                # Energy clearly above the expected bleed+ambient mixture is
-                # the human, not the speaker (spec §2C: SNR vs ambient).
-                self.near_end_last = excess
-            elif excess <= AMBIENT_TRANSIENT_FACTOR * max(self.echo_full_gain, 40.0):
-                norm = max(0.0, rms - self.ambient_short)
-                norm = norm / _duck_ratio if _duck_ratio > 0.0 else norm
-                self.echo_full_gain = (
-                    norm
-                    if self.echo_full_gain == 0.0
-                    else (1.0 - ECHO_ALPHA) * self.echo_full_gain + ECHO_ALPHA * norm
-                )
+            if _last_ref_rms >= ECHO_REF_ACTIVE_RMS:
+                # The render reference gives the speaker's exact emission for
+                # this block. Blocks that correlate with it at a plausible
+                # flight lag are bleed: their raw energy, normalized by the
+                # duck ratio and the reference level, estimates the speaker-
+                # microphone coupling gain. A ratio far above the running
+                # median is a human riding on the bleed, not more bleed, so it
+                # never enters the gain estimate. Once the gain is known, a
+                # block is near-end speech only when its energy exceeds the
+                # expected bleed plus ambient by more than ambient (spec §2C:
+                # SNR over ambient, never a fixed absolute floor).
+                if _last_echo_corr >= AEC_CORRELATION_GUARD:
+                    ratio = (
+                        max(0.0, _last_mic_rms - self.ambient_short)
+                        / (_last_ref_rms * max(_duck_ratio, 0.01))
+                    )
+                    if self.echo_ratios:
+                        median = sorted(self.echo_ratios)[len(self.echo_ratios) // 2]
+                        if ratio <= 1.5 * median:
+                            self.echo_ratios.append(ratio)
+                    else:
+                        self.echo_ratios.append(ratio)
+                if self.echo_ratios:
+                    gain = sorted(self.echo_ratios)[len(self.echo_ratios) // 2]
+                    self.echo_ref_avg = (
+                        _last_ref_rms
+                        if self.echo_ref_avg == 0.0
+                        else (1.0 - ECHO_ALPHA) * self.echo_ref_avg + ECHO_ALPHA * _last_ref_rms
+                    )
+                    self.echo_full_gain = gain * self.echo_ref_avg
+                    expected = gain * _last_ref_rms * _duck_ratio + self.ambient_short
+                    excess = _last_mic_rms - expected
+                    self.near_end_last = (
+                        excess
+                        if vad_score >= 0.55 and excess > max(self.ambient_short, NEAR_END_MARGIN_RMS)
+                        else 0.0
+                    )
+                else:
+                    # The reference is emitting but nothing correlates with it
+                    # and no gain is calibrated yet: treat every block as
+                    # possible bleed until a gain is measured.
+                    self.near_end_last = 0.0
+            else:
+                expected = self.echo_full_gain * _duck_ratio + self.ambient_short
+                excess = rms - expected
+                if vad_score >= 0.55 and excess > self.ambient_short:
+                    # Energy clearly above the expected bleed+ambient mixture is
+                    # the human, not the speaker (spec §2C: SNR vs ambient).
+                    self.near_end_last = excess
+                elif excess <= AMBIENT_TRANSIENT_FACTOR * max(self.echo_full_gain, 40.0):
+                    norm = max(0.0, rms - self.ambient_short)
+                    norm = norm / _duck_ratio if _duck_ratio > 0.0 else norm
+                    self.echo_full_gain = (
+                        norm
+                        if self.echo_full_gain == 0.0
+                        else (1.0 - ECHO_ALPHA) * self.echo_full_gain + ECHO_ALPHA * norm
+                    )
         elif vad_score < AMBIENT_SPEECH_VAD_GUARD and rms <= AMBIENT_TRANSIENT_FACTOR * max(self.ambient_short, 40.0):
             if self.ambient_short == 0.0:
                 self.ambient_short = self.ambient_long = rms
@@ -3767,6 +3889,7 @@ class MicState:
     def acoustic_fields(self) -> dict:
         """Telemetry for the three estimators, in the §10 measurement format."""
         confidence = 1.0 - min(1.0, self.ambient_spread / max(self.ambient_short, 1.0))
+        expected_mix = self.echo_full_gain * _duck_ratio + self.ambient_short
         return {
             "ambient_rms": round(self.ambient_short, 1),
             "ambient_long_rms": round(self.ambient_long, 1),
@@ -3774,7 +3897,37 @@ class MicState:
             "echo_rms_full_gain": round(self.echo_full_gain, 1),
             "echo_rms_current": round(self.echo_full_gain * _duck_ratio, 1),
             "near_end_rms": round(self.near_end_last, 1),
+            "near_end_snr": round(self.near_end_last / max(expected_mix, 1.0), 2),
         }
+
+    def count_dictation_frame(self, rms: float, vad_score: float) -> None:
+        """Attribute one audible dictation frame to echo, human, or neither (spec §2C).
+
+        A frame sitting at the duck-adjusted bleed level is the speaker; a frame
+        rising above bleed plus ambient is the person; frames with no VAD
+        evidence are the noise that makes Whisper tiny hallucinate, and count as
+        neither.
+        """
+        if not self.tts_active:
+            # Nothing is playing: only VAD-confirmed voice is speech. Loud room
+            # noise with no VAD support never enters the human count.
+            if vad_score >= AMBIENT_SPEECH_VAD_GUARD:
+                self.dict_human_frames += 1
+            return
+        if vad_score < AMBIENT_SPEECH_VAD_GUARD:
+            return
+        if self.echo_full_gain > 0.0:
+            expected = self.echo_full_gain * max(_duck_ratio, 0.01) + self.ambient_short
+            if rms > expected:
+                self.dict_human_frames += 1
+            else:
+                self.dict_echo_frames += 1
+        elif _last_echo_corr >= AEC_CORRELATION_GUARD:
+            # The reference is emitting and this frame correlates with it, but
+            # no gain is calibrated yet: assume bleed until proven otherwise.
+            self.dict_echo_frames += 1
+        else:
+            self.dict_human_frames += 1
 
     def handle_idle_frame(self, frame, now, rms, vad_score, is_speech, dev_name, oww, vad, wake_word, wake_threshold, jobs) -> bool:
         """One IDLE mic frame. True means skip the rest of this iteration."""
@@ -3872,10 +4025,25 @@ class MicState:
                 # and starts it again, which is the echo. A pause now needs
                 # three frames well above that bleed. Those frames are the
                 # person, so they must not become the next floor.
+                # Once the coupling gain is calibrated, the render reference
+                # says exactly what the speaker is emitting; only frames whose
+                # energy exceeds the expected bleed carry the hold. Until
+                # calibration, or without a reference, the energy gate stands.
                 # No cooldown here: a person saying "stop" again right after a
                 # rejected hold must be heard. Bleed sits below the gate, so
                 # the resume attack cannot open a hold on its own.
-                hot = vad_score >= 0.55 and rms >= gate
+                calibrated = (
+                    _last_ref_rms >= ECHO_REF_ACTIVE_RMS
+                    and len(self.echo_ratios) >= ECHO_RATIO_MIN_SAMPLES
+                )
+                hot = (
+                    vad_score >= 0.55
+                    and rms >= gate
+                    and (
+                        not calibrated
+                        or self.near_end_last > max(self.ambient_short, NEAR_END_MARGIN_RMS)
+                    )
+                )
                 self.tts_loud_run = self.tts_loud_run + 1 if hot else 0
                 if self.tts_loud_run == 1:
                     self.barge_gate_mono = time.monotonic()
@@ -4200,6 +4368,7 @@ class MicState:
         # frames, the 5s clock starts, and the rest of the sentence is cut.
         heard_speech = is_speech or (self.on_headphones and (vad_score >= 0.15 or rms >= 30.0))
         if heard_speech:
+            self.count_dictation_frame(rms, vad_score)
             if not self.speech_seen_in_chunk:
                 log(f"Speech started in chunk (vad={vad_score:.2f}, rms={rms:.0f})")
             self.speech_seen_in_chunk = True
@@ -4266,6 +4435,13 @@ class MicState:
                         # Handy was closed or its recording was cancelled. Keep any words we already
                         # buffered, then go idle. Do not toggle Handy back on.
                         fallback_txt = self.transcribe_local_fallback(jobs, self.dict_speech_frames)
+                        if fallback_txt and self.dict_human_frames < DICT_HUMAN_MIN_FRAMES:
+                            log(
+                                f"Discarded local Whisper transcript {fallback_txt!r}: "
+                                f"{self.dict_human_frames} human-attributed frames, "
+                                f"{self.dict_echo_frames} echo frames"
+                            )
+                            fallback_txt = ""
                         if fallback_txt:
                             log(f"Handy row missing (stopped externally); kept local transcript: {fallback_txt!r}")
                             self.retract_partial()
@@ -4699,6 +4875,12 @@ def run_daemon(
                             stderr=subprocess.DEVNULL,
                             check=False,
                         )
+                        # A different microphone means a different coupling to
+                        # the speakers: the measured gain is invalid (spec §4).
+                        mic.echo_ratios.clear()
+                        mic.echo_ref_avg = 0.0
+                        mic.echo_full_gain = 0.0
+                        mic.near_end_last = 0.0
                         break
                     if kind != "frame" or pcm_block is None:
                         continue
