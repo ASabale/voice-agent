@@ -6,6 +6,7 @@ loud frame, so the old path resumed before recognition.
 
 import importlib.machinery
 import importlib.util
+import json
 import queue
 import sys
 import wave
@@ -132,16 +133,19 @@ def test_holds_duck_the_speaker_and_release_restores_it(monkeypatch, tmp_path) -
     current = {"volume": 70}
 
     class _Res:
-        stdout = "70"
+        stdout = ""
         returncode = 0
 
     def fake_run(_cmd: list[str], **_kw: object) -> object:
         script = _cmd[2]
         osascript.append(script)
+        res = _Res()
         if "output volume of" in script:
-            return _Res()
-        current["volume"] = int(script.rsplit(" ", 1)[1])
-        return _Res()
+            res.stdout = str(current["volume"])
+        else:
+            current["volume"] = int(script.rsplit(" ", 1)[1])
+            res.stdout = ""
+        return res
 
     monkeypatch.setattr(controller.subprocess, "run", fake_run)
     monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
@@ -171,10 +175,12 @@ def test_holds_duck_the_speaker_and_release_restores_it(monkeypatch, tmp_path) -
     mic2.enter_dictating = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("enter"))  # type: ignore[method-assign]
     _feed(mic2, _wav("hold-on-say.wav"), jobs2, VAD())
     assert mic2.tts_duck_restore == 70
+    assert current["volume"] == 20
     ramp = [int(s.rsplit(" ", 1)[1]) for s in osascript if "set volume output volume " in s and "output volume of" not in s]
     assert 20 in ramp and ramp[-1] == 20 and len(ramp) > 1  # stepped, not a single jump
     mic2.apply_whisper("tts_barge", "Hold on a second.", None, VAD(), jobs2)
     assert mic2.tts_duck_restore is None
+    assert current["volume"] == 70  # verified by read-back
     assert any("set volume output volume 70" in s for s in osascript)
 
 
@@ -237,14 +243,11 @@ def test_a_stuck_duck_is_restored_by_the_watchdog(monkeypatch, tmp_path) -> None
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
     osascript: list[str] = []
-
-    class _Res:
-        stdout = "70"
-        returncode = 0
+    volume = {"volume": 70}
 
     def fake_run(_cmd: list[str], **_kw: object) -> object:
         osascript.append(_cmd[2])
-        return _Res()
+        return _volume_res(_cmd, volume)
 
     monkeypatch.setattr(controller.subprocess, "run", fake_run)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
@@ -306,20 +309,6 @@ def test_duck_off_marker_keeps_speaker_bursts_audible(monkeypatch, tmp_path) -> 
     controller.duck_output_volume(state2)
     assert state2.tts_duck_restore is None
     assert not osascript
-
-
-def _volume_res(cmd: list[str], volume: dict) -> object:
-    class _Res:
-        pass
-    script = cmd[2]
-    res = _Res()
-    if "output volume of" in script:
-        res.stdout = str(volume["volume"])
-    else:
-        res.stdout = ""
-        volume["volume"] = int(script.rsplit(" ", 1)[1])
-    res.returncode = 0
-    return res
 
 
 def test_duck_scales_the_echo_reference(monkeypatch, tmp_path) -> None:
@@ -573,3 +562,161 @@ def test_a_squashing_canceller_cannot_erase_the_stop(monkeypatch) -> None:
     assert len(stops) == 1
     assert "Stop." in stops[0]
     assert resumes == 0
+
+
+def _fake_volume(volume: dict, fail_reads: list[int], fail_writes: list[int]):
+    def fake_run(cmd: list[str], **_kw: object) -> object:
+        class _Res:
+            pass
+
+        script = cmd[2]
+        res = _Res()
+        res.returncode = 0
+        if "output volume of" in script:
+            if fail_reads[0] > 0:
+                fail_reads[0] -= 1
+                res.stdout = ""  # output_volume() -> None
+            else:
+                res.stdout = str(volume["volume"])
+        else:
+            res.stdout = ""
+            if fail_writes[0] > 0:
+                fail_writes[0] -= 1
+            else:
+                volume["volume"] = int(script.rsplit(" ", 1)[1])
+        return res
+
+    return fake_run
+
+
+def test_failed_restore_stays_pending_and_retries(monkeypatch, tmp_path) -> None:
+    """§7: a restore attempt is not a restore. The transaction stays pending."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    volume = {"volume": 20}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[10])
+    )
+
+    mic = controller.MicState()
+    mic.tts_duck_restore = 70
+    mic.tts_duck_target = 20
+    mic.tts_duck_state = "ducked"
+
+    ok = controller.restore_output_volume(mic, now=100.0)
+    assert ok is False
+    assert mic.tts_duck_state == "restore_pending"
+    assert mic.tts_duck_restore == 70  # state NOT cleared merely because an attempt ran
+    assert (tmp_path / "duck-state.json").exists()
+
+    # Bounded backoff: an immediate retry is gated, no osascript traffic.
+    assert controller.restore_output_volume(mic, now=101.0) is False
+    assert volume["volume"] == 20
+
+    # After the backoff the pending restore completes, write succeeding,
+    # and is verified by read-back.
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    assert controller.restore_output_volume(mic, now=103.0) is True
+    assert volume["volume"] == 70
+    assert mic.tts_duck_state == "normal"
+    assert mic.tts_duck_restore is None
+    assert not (tmp_path / "duck-state.json").exists()
+
+
+def test_failed_probe_read_defers_restore_not_blind_write(monkeypatch, tmp_path) -> None:
+    """A volume probe failure never blindly writes; the transaction stays pending."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    volume = {"volume": 20}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[2], fail_writes=[0])
+    )
+    mic = controller.MicState()
+    mic.tts_duck_restore = 70
+    mic.tts_duck_target = 20
+    assert controller.restore_output_volume(mic, now=50.0) is False
+    assert mic.tts_duck_state == "restore_pending"
+    assert mic.tts_duck_retry_at == 52.0  # base backoff
+    assert volume["volume"] == 20  # nothing written while the probe was failing
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    assert controller.restore_output_volume(mic, now=53.0) is True
+    assert volume["volume"] == 70
+
+
+def test_user_volume_change_is_not_overwritten(monkeypatch, tmp_path) -> None:
+    """§7: if someone changed the volume during the duck, keep their setting."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    volume = {"volume": 70}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    mic = controller.MicState()
+    controller.duck_output_volume(mic)
+    assert volume["volume"] == 20
+    volume["volume"] = 45  # user adjusts mid-duck
+    assert controller.restore_output_volume(mic, now=10.0) is True
+    assert volume["volume"] == 45
+    assert mic.tts_duck_state == "normal"
+    assert mic.tts_duck_restore is None
+    assert abs(controller._duck_ratio - 45 / 70) < 1e-9  # reference matches the physical speaker
+
+
+def test_restart_reconciles_an_outstanding_duck(monkeypatch, tmp_path) -> None:
+    """§7.10: a controller that died mid-duck leaves a transaction; the next start fixes it."""
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    (tmp_path / "duck-state.json").write_text(
+        json.dumps({"original": 70, "target": 20, "state": "ducked"})
+    )
+    volume = {"volume": 20}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    controller.reconcile_duck_state()
+    assert volume["volume"] == 70
+    assert not (tmp_path / "duck-state.json").exists()
+
+
+def test_restart_keeps_transaction_when_probe_fails(monkeypatch, tmp_path) -> None:
+    """The startup reconcile must not delete evidence it could not verify."""
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    (tmp_path / "duck-state.json").write_text(
+        json.dumps({"original": 70, "target": 20, "state": "ducked"})
+    )
+    volume = {"volume": 20}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[1], fail_writes=[0])
+    )
+    controller.reconcile_duck_state()
+    assert (tmp_path / "duck-state.json").exists()
+    assert volume["volume"] == 20
+
+
+def test_repeated_interruption_cycles_stay_stable(monkeypatch, tmp_path) -> None:
+    """§11: three duck/restore cycles end with verified original volume every time."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    volume = {"volume": 70}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    mic = controller.MicState()
+    for _ in range(3):
+        controller.duck_output_volume(mic)
+        assert volume["volume"] == 20
+        assert controller._duck_ratio == 20 / 70
+        assert controller.restore_output_volume(mic, now=float("inf")) is True
+        assert volume["volume"] == 70
+        assert controller._duck_ratio == 1.0
+    assert mic.tts_duck_state == "normal"
+    assert not (tmp_path / "duck-state.json").exists()

@@ -144,6 +144,8 @@ DUCK_MIN_RMS_FACTOR = 1.5      # duck only above 1.5x the hold gate, not just at
 DUCK_RAMP_STEPS = 4            # smooth 70 -> 20 over four volume writes
 DUCK_RAMP_STEP_DELAY_SECONDS = 0.05
 DUCK_MAX_STUCK_SECONDS = 8.0   # watchdog: a stuck hold never leaves the speaker ducked
+DUCK_RETRY_BASE_SECONDS = 2.0  # first backoff after a failed restore attempt
+DUCK_RETRY_MAX_SECONDS = 16.0  # ceiling on the restore retry backoff
 PASTE_KEY_SETTLE_SECONDS = 0.12
 # Chrome handles the Cmd+V paste asynchronously: restoring the clipboard too
 # soon makes the browser paste the pre-injection clipboard instead. Measured
@@ -1784,6 +1786,34 @@ def _ramp_output_volume(start_pct: int, target_pct: int) -> None:
             time.sleep(DUCK_RAMP_STEP_DELAY_SECONDS)
 
 
+def _duck_transaction_path() -> Path:
+    """On-disk record of an outstanding duck so a restart can reconcile it."""
+    return STATE_DIR / "duck-state.json"
+
+
+def _save_duck_transaction(state: "MicState") -> None:
+    try:
+        _duck_transaction_path().write_text(
+            json.dumps(
+                {
+                    "original": state.tts_duck_restore,
+                    "target": state.tts_duck_target,
+                    "state": state.tts_duck_state,
+                    "ducked_at": state.tts_duck_at,
+                }
+            )
+        )
+    except Exception as exc:
+        log_once("duck-persist", f"could not persist duck transaction: {exc}")
+
+
+def _clear_duck_transaction() -> None:
+    try:
+        _duck_transaction_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def duck_output_volume(state: "MicState") -> None:
     """Lower the system output volume while a barge hold is open.
 
@@ -1808,29 +1838,105 @@ def duck_output_volume(state: "MicState") -> None:
         return
     _ramp_output_volume(current, target_pct)
     state.tts_duck_restore = current
+    state.tts_duck_target = target_pct
+    state.tts_duck_state = "ducked"
+    state.tts_duck_attempts = 0
+    state.tts_duck_retry_at = 0.0
     state.tts_duck_at = time.monotonic()
     global _duck_ratio
     _duck_ratio = target_pct / current if current > 0 else 1.0
+    _save_duck_transaction(state)
     log(f"ducked output volume {current} -> {target_pct}")
     barge_note(state, "duck", from_volume=current, to_volume=target_pct)
 
 
-def restore_output_volume(state: "MicState") -> None:
-    """Put back the volume duck_output_volume captured. Idempotent."""
+def restore_output_volume(state: "MicState", now: float | None = None) -> bool:
+    """Bring the volume back to the pre-duck value and verify it by reading.
+
+    Idempotent and retryable: a failed attempt leaves the transaction pending
+    with a bounded backoff rather than clearing the state, so the main loop
+    can reconcile it later. A volume set by someone else mid-duck is honoured
+    instead of overwritten. Returns True only once the restored volume is
+    actually verified.
+    """
     if state.tts_duck_restore is None:
-        return
+        return True
+    now = time.monotonic() if now is None else now
+    if now < state.tts_duck_retry_at:
+        return False
     previous = state.tts_duck_restore
-    state.tts_duck_restore = None
-    state.tts_duck_at = None
-    global _duck_ratio
-    _duck_ratio = 1.0
+    target = state.tts_duck_target if state.tts_duck_target is not None else 0
     current = output_volume()
-    if current is None or current == previous:
-        _run_osascript(f"set volume output volume {previous}")
-    else:
+    if current is None:
+        state.tts_duck_state = "restore_pending"
+        state.tts_duck_attempts += 1
+        state.tts_duck_retry_at = now + min(
+            DUCK_RETRY_MAX_SECONDS, DUCK_RETRY_BASE_SECONDS * 2 ** (state.tts_duck_attempts - 1)
+        )
+        log(f"volume restore unverified: probe failed, retry in {state.tts_duck_retry_at - now:.1f}s")
+        _save_duck_transaction(state)
+        return False
+    if abs(current - previous) <= 1:
+        expected = previous  # already back; verify once
+    elif current <= target + 1:
         _ramp_output_volume(current, previous)
-    log(f"restored output volume {previous}")
-    barge_note(state, "duck_restore", to_volume=previous)
+        expected = previous
+    else:
+        # Someone changed the output volume between the duck and this restore:
+        # honour that setting instead of blindly overwriting the pre-duck value.
+        log(f"output volume {current} differs from duck baseline {previous}; keeping user setting")
+        expected = current
+    verified = output_volume()
+    if verified is None or abs(verified - expected) > 1:
+        state.tts_duck_state = "restore_pending"
+        state.tts_duck_attempts += 1
+        state.tts_duck_retry_at = now + min(
+            DUCK_RETRY_MAX_SECONDS, DUCK_RETRY_BASE_SECONDS * 2 ** (state.tts_duck_attempts - 1)
+        )
+        log(
+            f"volume restore unverified (read {verified}, expected {expected}); "
+            f"retry in {state.tts_duck_retry_at - now:.1f}s"
+        )
+        _save_duck_transaction(state)
+        return False
+    state.tts_duck_restore = None
+    state.tts_duck_target = None
+    state.tts_duck_state = "normal"
+    state.tts_duck_attempts = 0
+    state.tts_duck_retry_at = 0.0
+    global _duck_ratio
+    _duck_ratio = verified / previous if previous > 0 else 1.0
+    log(f"restored output volume {verified}")
+    barge_note(state, "duck_restore", to_volume=verified)
+    _clear_duck_transaction()
+    return True
+
+
+def reconcile_duck_state() -> None:
+    """Recover a duck left outstanding by a previous controller process."""
+    path = _duck_transaction_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    original = data.get("original")
+    target = data.get("target")
+    if not isinstance(original, int) or not 0 <= original <= 100:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+    current = output_volume()
+    if current is None:
+        return  # leave the transaction on disk; the next start retries
+    if abs(current - original) <= 1:
+        path.unlink(missing_ok=True)
+        return
+    if isinstance(target, int) and current <= target + 1:
+        _ramp_output_volume(current, original)
+        log(f"recovered duck state from a previous run: volume {current} -> {original}")
+    path.unlink(missing_ok=True)
 
 
 def handy_process_running() -> bool:
@@ -3127,6 +3233,10 @@ class MicState:
     # System output volume captured when a barge hold ducks the speaker.
     tts_duck_restore: int | None = None
     tts_duck_at: float | None = None
+    tts_duck_target: int | None = None
+    tts_duck_state: str = "normal"  # normal | ducked | restore_pending
+    tts_duck_retry_at: float = 0.0
+    tts_duck_attempts: int = 0
     tts_barge_skip: int = 0
     tts_barge_loud: int = 0
     tts_barge_next: tuple | None = None
@@ -4337,6 +4447,9 @@ def run_daemon(
             job["slot"].put(text)
 
     mic = MicState()
+    # A controller that died mid-duck leaves the machine ducked with nobody
+    # to restore it; recover that before the first frame is ever captured.
+    reconcile_duck_state()
     mic.last_history_id, _ = latest_history_row()
     mic.fn_was_down = fn_held()
 
@@ -4413,6 +4526,11 @@ def run_daemon(
                         break
                     if kind != "frame" or pcm_block is None:
                         continue
+                    # A restore that failed (osascript flake, unverified write)
+                    # stays pending; this retries it with bounded backoff while
+                    # the controller keeps running.
+                    if mic.tts_duck_state == "restore_pending":
+                        restore_output_volume(mic)
                     handle_captured_frame(
                         mic,
                         mic_block_samples(pcm_block)[:, 0],
