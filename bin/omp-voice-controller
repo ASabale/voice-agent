@@ -146,6 +146,16 @@ DUCK_RAMP_STEP_DELAY_SECONDS = 0.05
 DUCK_MAX_STUCK_SECONDS = 8.0   # watchdog: a stuck hold never leaves the speaker ducked
 DUCK_RETRY_BASE_SECONDS = 2.0  # first backoff after a failed restore attempt
 DUCK_RETRY_MAX_SECONDS = 16.0  # ceiling on the restore retry backoff
+# Three-source estimation (spec §2): ambient, speaker echo, and near-end
+# speech are tracked separately so ducking is a measured decision. The
+# transient factor rejects spikes more than 4x the current estimate; the
+# VAD guard stops human speech from being learned as room noise.
+AMBIENT_ALPHA_SHORT = 0.20     # fast EMA for gradual room changes
+AMBIENT_ALPHA_LONG = 0.02      # slow EMA for drift and confidence
+AMBIENT_SPEECH_VAD_GUARD = 0.35
+AMBIENT_TRANSIENT_FACTOR = 4.0
+ECHO_ALPHA = 0.25
+DUCK_AMBIENT_DOMINANCE = 1.0   # when bleed <= ambient, deep ducking has no measured benefit
 PASTE_KEY_SETTLE_SECONDS = 0.12
 # Chrome handles the Cmd+V paste asynchronously: restoring the clipboard too
 # soon makes the browser paste the pre-injection clipboard instead. Measured
@@ -931,6 +941,7 @@ _render_paused_seconds = 0.0
 # is open. The canceller reference must match the physical echo amplitude, or
 # the adaptive filter diverges and eats near-end speech (VA-BARGE-AEC).
 _duck_ratio = 1.0
+_acoustic_snapshot: dict = {}
 
 
 def refresh_render_reference(now: float | None = None) -> dict:
@@ -1251,6 +1262,9 @@ def publish_capture_totals() -> None:
     for key, value in aec.items():
         if data.get(key) != value:
             changed = True
+    for key, value in _acoustic_snapshot.items():
+        if data.get(key) != value:
+            changed = True
     if not changed:
         return
     note = None
@@ -1268,6 +1282,7 @@ def publish_capture_totals() -> None:
     data["mic_invalid"] = invalid
     data.update(render)
     data.update(aec)
+    data.update(_acoustic_snapshot)
     tmp = STATUS_FILE.with_suffix(".capture.tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(STATUS_FILE)
@@ -1836,6 +1851,13 @@ def duck_output_volume(state: "MicState") -> None:
     current = output_volume()
     if current is None or current <= target_pct:
         return
+    # Adaptive depth (spec §3): the environment decides how far to duck.
+    # While the echo estimate sits at or below the measured ambient level,
+    # room noise, not speaker bleed, limits what the mic hears, and a deep
+    # duck has no measured benefit — duck only halfway toward the anchor.
+    # Before either estimate exists, fall back to the anchor percentage.
+    if state.echo_full_gain > 0.0 and state.echo_full_gain <= DUCK_AMBIENT_DOMINANCE * max(state.ambient_short, 40.0):
+        target_pct = max(target_pct, (current + target_pct) // 2)
     _ramp_output_volume(current, target_pct)
     state.tts_duck_restore = current
     state.tts_duck_target = target_pct
@@ -3226,6 +3248,14 @@ class MicState:
     # Rolling speaker-bleed floor while VoiceBox plays (~2.0s). A person talking over the
     # laptop speakers sits well above that floor; a wake-word hit on the TTS audio does not.
     tts_rms_floor: deque[float] = field(default_factory=lambda: deque(maxlen=25))
+    # Three-source estimates: quiet frames when nothing plays set the ambient
+    # level; quiet frames while VoiceBox plays set the echo level, re-scaled to
+    # full gain so ducking never lowers the estimate.
+    ambient_short: float = 0.0
+    ambient_long: float = 0.0
+    ambient_spread: float = 0.0
+    echo_full_gain: float = 0.0
+    near_end_last: float = 0.0
     tts_stop_frames: list[np.ndarray] = field(default_factory=list)
     tts_barge_held: bool = False
     tts_barge_voice: bool = False
@@ -3628,8 +3658,54 @@ class MicState:
             self.show_partial(heard)
         return False
 
+    def update_acoustic_estimates(self, rms: float, vad_score: float) -> None:
+        """Split the mic mixture into ambient, speaker echo, and near-end speech.
+
+        Ambient learns only from quiet, low-VAD, non-transient frames when
+        nothing is playing; speech and playback never contaminate it. Echo
+        learns from quiet playback frames and is re-scaled by the duck ratio,
+        so ducking cannot collapse the echo estimate (spec §2B). Frames the
+        VAD calls speech are attributed to the human, not to either floor.
+        """
+        global _acoustic_snapshot
+        if self.tts_active:
+            if vad_score >= 0.55:
+                self.near_end_last = max(
+                    0.0, rms - self.echo_full_gain * _duck_ratio - self.ambient_short
+                )
+                return
+            bleed = max(0.0, rms - self.ambient_short)
+            if bleed <= AMBIENT_TRANSIENT_FACTOR * max(self.echo_full_gain, 40.0):
+                norm = bleed / _duck_ratio if _duck_ratio > 0.0 else bleed
+                self.echo_full_gain = (
+                    norm
+                    if self.echo_full_gain == 0.0
+                    else (1.0 - ECHO_ALPHA) * self.echo_full_gain + ECHO_ALPHA * norm
+                )
+        elif vad_score < AMBIENT_SPEECH_VAD_GUARD and rms <= AMBIENT_TRANSIENT_FACTOR * max(self.ambient_short, 40.0):
+            if self.ambient_short == 0.0:
+                self.ambient_short = self.ambient_long = rms
+            else:
+                self.ambient_short += AMBIENT_ALPHA_SHORT * (rms - self.ambient_short)
+                self.ambient_long += AMBIENT_ALPHA_LONG * (rms - self.ambient_long)
+            self.ambient_spread = 0.5 * self.ambient_spread + 0.5 * abs(rms - self.ambient_short)
+        _acoustic_snapshot = self.acoustic_fields()
+
+    def acoustic_fields(self) -> dict:
+        """Telemetry for the three estimators, in the §10 measurement format."""
+        confidence = 1.0 - min(1.0, self.ambient_spread / max(self.ambient_short, 1.0))
+        return {
+            "ambient_rms": round(self.ambient_short, 1),
+            "ambient_long_rms": round(self.ambient_long, 1),
+            "ambient_confidence": round(confidence, 2),
+            "echo_rms_full_gain": round(self.echo_full_gain, 1),
+            "echo_rms_current": round(self.echo_full_gain * _duck_ratio, 1),
+            "near_end_rms": round(self.near_end_last, 1),
+        }
+
     def handle_idle_frame(self, frame, now, rms, vad_score, is_speech, dev_name, oww, vad, wake_word, wake_threshold, jobs) -> bool:
         """One IDLE mic frame. True means skip the rest of this iteration."""
+        self.update_acoustic_estimates(rms, vad_score)
         global _handy_on_light
         self.release_idle_utterance(jobs)
         sync_speech_tier(now)
@@ -4494,7 +4570,7 @@ def run_daemon(
             word in dev_name.lower() for word in ("buds", "airpod", "headphone", "headset", "beats")
         )
         log(f"Opening microphone input stream on '{dev_name}' (CoreAudio id={active_ca_dev})")
-        write_status(mic.state, {"wake_word": wake_word, "pause_seconds": pause_seconds, "mic": dev_name})
+        write_status(mic.state, {"wake_word": wake_word, "pause_seconds": pause_seconds, "mic": dev_name, **mic.acoustic_fields()})
         last_dev_check = time.monotonic()
 
         try:

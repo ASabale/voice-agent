@@ -720,3 +720,136 @@ def test_repeated_interruption_cycles_stay_stable(monkeypatch, tmp_path) -> None
         assert controller._duck_ratio == 1.0
     assert mic.tts_duck_state == "normal"
     assert not (tmp_path / "duck-state.json").exists()
+
+
+class _QuietVad:
+    def predict(self, _frame: object) -> float:
+        return 0.1
+
+
+class _SpeechVad:
+    def predict(self, _frame: object) -> float:
+        return 0.8
+
+
+def test_ambient_estimate_tracks_rising_then_falling_noise() -> None:
+    """§2A/§11: the ambient estimator follows gradual room changes both ways."""
+    mic = controller.MicState()
+    for level in (60, 90, 140, 200, 300, 400):
+        for _ in range(20):
+            mic.update_acoustic_estimates(float(level), 0.1)
+    assert 340 <= mic.ambient_short <= 400
+    assert 150 <= mic.ambient_long <= 400  # slow EMA trails the fast one
+    for level in (300, 200, 140, 90, 60):
+        for _ in range(20):
+            mic.update_acoustic_estimates(float(level), 0.1)
+    assert 50 <= mic.ambient_short <= 90
+    assert mic.ambient_long > mic.ambient_short  # long estimate is still coming down
+    assert mic.acoustic_fields()["ambient_confidence"] > 0.0
+
+
+def test_ambient_estimate_rejects_transients_and_speech(monkeypatch) -> None:
+    """§2A: a door slam or a spoken sentence must not raise the room baseline."""
+    mic = controller.MicState()
+    for _ in range(10):
+        mic.update_acoustic_estimates(60.0, 0.1)
+    baseline = mic.ambient_short
+    mic.update_acoustic_estimates(1762.0, 0.1)  # transient spike, 4x guard
+    mic.update_acoustic_estimates(2500.0, 0.8)  # human speech
+    assert mic.ambient_short == baseline
+    assert mic.echo_full_gain == 0.0
+
+
+def test_echo_estimate_survives_ducking_without_collapsing() -> None:
+    """§2B: bleed measured during a duck is re-normalized to full gain.
+
+    Same physical relationship as the live measurement (idle ambient ~90 rms,
+    speaker bleed ~175 rms): at 20% volume the mic hears ambient + 0.286*echo,
+    and the echo estimate still reads the full-gain bleed.
+    """
+    mic = controller.MicState()
+    mic.tts_active = True
+    mic.ambient_short = mic.ambient_long = 90.0
+    for _ in range(12):
+        mic.update_acoustic_estimates(175.0, 0.1)
+    assert 60 <= mic.echo_full_gain <= 110
+    echo = mic.echo_full_gain
+    controller._duck_ratio = 0.286
+    for _ in range(12):
+        mic.update_acoustic_estimates(90.0 + echo * 0.286, 0.1)
+    assert abs(mic.echo_full_gain - echo) / echo < 0.25  # did not collapse
+    mic.update_acoustic_estimates(3000.0, 0.8)  # human burst
+    assert mic.near_end_last > 2500  # attributed to the person, not the floors
+    controller._duck_ratio = 1.0
+
+
+def test_ambient_dominated_room_ducks_shallower(monkeypatch, tmp_path) -> None:
+    """§3: when room noise, not bleed, limits the mic, duck only halfway."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    volume = {"volume": 70}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    mic = controller.MicState()
+    mic.tts_active = True
+    mic.ambient_short = 400.0
+    mic.echo_full_gain = 175.0  # bleed is quieter than the room
+    controller.duck_output_volume(mic)
+    assert volume["volume"] == 45  # (70+20)//2, not the 20 anchor
+    assert mic.tts_duck_restore == 70
+    assert controller._duck_ratio == 45 / 70
+    assert controller.restore_output_volume(mic, now=float("inf")) is True
+    assert volume["volume"] == 70
+
+    mic2 = controller.MicState()
+    mic2.tts_active = True
+    mic2.ambient_short = 90.0
+    mic2.echo_full_gain = 400.0  # bleed dominates: full anchor duck
+    controller.duck_output_volume(mic2)
+    assert volume["volume"] == 20
+    assert controller._duck_ratio == 20 / 70
+    assert controller.restore_output_volume(mic2, now=float("inf")) is True
+    assert volume["volume"] == 70
+
+
+def test_rising_ambient_noise_alone_neither_holds_nor_ducks(monkeypatch, tmp_path) -> None:
+    """§11: environmental noise ramping to 400 rms opens nothing and ducks nothing.
+
+    The gate rides on the floor, which follows the noise; VAD stays quiet, so
+    no hold opens and the volume is never touched.
+    """
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
+    volume = {"volume": 70}
+    writes: list[str] = []
+
+    def fake_run(cmd: list[str], **_kw: object) -> object:
+        if "set volume" in cmd[2]:
+            writes.append(cmd[2])
+        return _volume_res(cmd, volume)
+
+    monkeypatch.setattr(controller.subprocess, "run", fake_run)
+    mic = controller.MicState()
+    mic.last_manual_check = 1e12
+    jobs: queue.Queue = queue.Queue(maxsize=1)
+    for level in (100, 150, 200, 250, 300, 350, 400):
+        frame = np.full(1280, level, dtype=np.int16)
+        controller.handle_captured_frame(
+            mic, frame, controller.time.time(), "fixture", _OwwStub(), _QuietVad(),
+            0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
+        )
+    assert not mic.tts_barge_held
+    assert mic.tts_duck_restore is None
+    assert not writes
+    # The first pre-playback frame seeds ambient; playback noise never feeds it
+    # (spec §2A protection), it is attributed to the echo path instead.
+    assert mic.ambient_short <= 100.0
+    assert mic.echo_full_gain > 150
+    assert volume["volume"] == 70
