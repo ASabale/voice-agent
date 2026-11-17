@@ -929,3 +929,55 @@ def test_partial_non_stop_keeps_the_hold_and_queues_the_full_clip(monkeypatch) -
     assert mic.tts_barge_next is None
     assert mic.whisper_pending is not None
     assert mic.whisper_pending["kind"] == "tts_barge"
+
+
+def test_dictation_frames_are_attributed_to_bleed_or_person() -> None:
+    """§2C: frames at the expected bleed level never count as human speech.
+
+    The live "Thank you." spam came from Whisper tiny transcribing pure bleed
+    and room noise; the chunk gate counts attribution frames instead of
+    trusting the transcript text.
+    """
+    mic = controller.MicState()
+    mic.tts_active = True
+    mic.ambient_short = mic.ambient_long = 90.0
+    mic.echo_full_gain = 175.0
+    controller._duck_ratio = 1.0
+    for _ in range(10):
+        mic.count_dictation_frame(175.0, 0.9)   # bleed exactly at the expectation
+        mic.count_dictation_frame(1600.0, 0.1)  # loud noise with no VAD support
+    for _ in range(5):
+        mic.count_dictation_frame(3000.0, 0.8)  # the person riding over the bleed
+    assert mic.dict_echo_frames == 10
+    assert mic.dict_human_frames == 5
+    controller._duck_ratio = 0.286
+    mic.count_dictation_frame(90.0 + 175.0 * 0.286, 0.9)  # ducked bleed is still bleed
+    assert mic.dict_human_frames == 5
+    controller._duck_ratio = 1.0
+    idle = controller.MicState()
+    for _ in range(10):
+        idle.count_dictation_frame(1600.0, 0.12)  # no-TTS room noise
+    assert idle.dict_human_frames == 0
+
+
+def test_duck_is_clamped_to_explicit_attenuation_bounds(monkeypatch, tmp_path) -> None:
+    """§3: a duck never goes below 20% of the level nor under 10% attenuation."""
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "2")
+    monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    volume = {"volume": 20}
+    monkeypatch.setattr(
+        controller.subprocess, "run", _fake_volume(volume, fail_reads=[0], fail_writes=[0])
+    )
+    mic = controller.MicState()
+    mic.tts_active = True
+    controller.duck_output_volume(mic)
+    assert volume["volume"] == 4  # anchor 2 clamped to 20% of 20 (DUCK_MAX_ATTENUATION)
+    assert controller.restore_output_volume(mic, now=float("inf")) is True
+    assert volume["volume"] == 20
+
+    monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "46")
+    mic2 = controller.MicState()
+    controller.duck_output_volume(mic2)
+    assert volume["volume"] == 20  # 46 is only 7% attenuation: the duck is skipped
+    assert mic2.tts_duck_restore is None

@@ -1330,3 +1330,81 @@ def test_barge_stop_latency_spans_hold_onset_to_death_confirmation(monkeypatch: 
     mic.apply_whisper("tts_barge", "Stop.", _Reset(), None, queue.Queue())
     assert mic.stop_latency_s == 0.579
     assert mic.turn_metrics()["stop_latency_s"] == 0.579
+
+
+def _flush_mic(mic: controller.MicState) -> None:
+    now = 100.0
+    mic.state = "DICTATING"
+    mic.speech_seen_in_chunk = True
+    mic.chunk_started_at = now
+    mic.last_handy_ui_check = now
+    mic.last_speech_at = now - 10
+    mic.dict_speech_frames = [np.zeros(1280, dtype=np.int16) for _ in range(10)]
+    mic.handle_dictating_frame(
+        np.zeros(1280, dtype=np.int16),
+        now,
+        1600.0,
+        0.12,
+        False,
+        _Reset(),
+        _Reset(),
+        5.0,
+        15.0,
+        queue.Queue(),
+    )
+
+
+def _install_fallback(monkeypatch: pytest.MonkeyPatch, posted: list[str]) -> None:
+    _install(monkeypatch, running=True)
+
+    def dispatch(text: str) -> dict[str, str]:
+        posted.append(text)
+        return {"action": "appended"}
+
+    monkeypatch.setattr(controller, "dispatch_transcript", dispatch)
+    monkeypatch.setattr(controller, "wait_for_new_history_row", lambda _prev, timeout_sec=2.2: None)
+    monkeypatch.setattr(controller, "handy_stop_recording", lambda: True)
+    monkeypatch.setattr(controller, "latest_history_row", lambda: (0, ""))
+    monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
+    monkeypatch.setattr(controller, "write_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    monkeypatch.setattr(
+        controller.MicState,
+        "transcribe_local_fallback",
+        lambda _self, _jobs, _frames: "Thank you.",
+    )
+    for name in (
+        "silence_speech",
+        "stop_playback",
+        "handy_cancel",
+        "pause_tts_clips",
+        "kill_tts_clips",
+        "bridge_request",
+        "handy_start_recording",
+    ):
+        monkeypatch.setattr(
+            controller,
+            name,
+            lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)),
+        )
+
+
+def test_echo_only_chunk_discards_the_local_whisper_hallucination(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§2C: a chunk with no human-attributed frames never dispatches a fallback."""
+    posted: list[str] = []
+    _install_fallback(monkeypatch, posted)
+    mic = controller.MicState()
+    _flush_mic(mic)
+    assert posted == []
+    assert mic.state == "IDLE"
+
+
+def test_attributed_chunk_keeps_the_local_fallback_transcript(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Five near-end frames of real speech let the fallback through."""
+    posted: list[str] = []
+    _install_fallback(monkeypatch, posted)
+    mic = controller.MicState()
+    mic.dict_human_frames = controller.DICT_HUMAN_MIN_FRAMES
+    _flush_mic(mic)
+    assert posted == ["Thank you."]
+    assert mic.state == "IDLE"
