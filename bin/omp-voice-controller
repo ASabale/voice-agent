@@ -3669,14 +3669,15 @@ class MicState:
         """
         global _acoustic_snapshot
         if self.tts_active:
-            if vad_score >= 0.55:
-                self.near_end_last = max(
-                    0.0, rms - self.echo_full_gain * _duck_ratio - self.ambient_short
-                )
-                return
-            bleed = max(0.0, rms - self.ambient_short)
-            if bleed <= AMBIENT_TRANSIENT_FACTOR * max(self.echo_full_gain, 40.0):
-                norm = bleed / _duck_ratio if _duck_ratio > 0.0 else bleed
+            expected = self.echo_full_gain * _duck_ratio + self.ambient_short
+            excess = rms - expected
+            if vad_score >= 0.55 and excess > self.ambient_short:
+                # Energy clearly above the expected bleed+ambient mixture is
+                # the human, not the speaker (spec §2C: SNR vs ambient).
+                self.near_end_last = excess
+            elif excess <= AMBIENT_TRANSIENT_FACTOR * max(self.echo_full_gain, 40.0):
+                norm = max(0.0, rms - self.ambient_short)
+                norm = norm / _duck_ratio if _duck_ratio > 0.0 else norm
                 self.echo_full_gain = (
                     norm
                     if self.echo_full_gain == 0.0
