@@ -1865,6 +1865,7 @@ def duck_output_volume(state: "MicState") -> None:
     state.tts_duck_attempts = 0
     state.tts_duck_retry_at = 0.0
     state.tts_duck_at = time.monotonic()
+    state.barge_stages["duck"] = state.tts_duck_at
     global _duck_ratio
     _duck_ratio = target_pct / current if current > 0 else 1.0
     _save_duck_transaction(state)
@@ -2434,15 +2435,23 @@ _BARGE_TAILS = (
 )
 
 
+_WAKE_WORDS = ("hey", "jarvis")
+
+
 def _is_playback_barge(tokens: list[str]) -> bool:
     """A short barge over our own TTS. Not a sentence that merely ends in stop.
 
     The Whisper clip mixes the burst with reply bleed, so the interrupt phrase
     can be flanked by a word or two of hallucinated transcript. The phrase
-    itself still has to appear verbatim: "hold on" plus an optional
-    a/one second/sec, and nothing else after it.
+    itself still has to appear verbatim: an optional wake prefix, then "stop",
+    or "hold on" plus an optional a/one second/sec, and nothing else.
     """
     if tokens and all(token == "stop" for token in tokens):
+        return True
+    body = list(tokens)
+    while body and body[0] in _WAKE_WORDS:
+        body.pop(0)
+    if body and all(token == "stop" for token in body):
         return True
     for i in range(len(tokens) - 1):
         if tokens[i] == "hold" and tokens[i + 1] == "on" and tokens[i + 2:] in _BARGE_TAILS:
@@ -3258,6 +3267,9 @@ class MicState:
     near_end_last: float = 0.0
     tts_stop_frames: list[np.ndarray] = field(default_factory=list)
     tts_barge_held: bool = False
+    tts_barge_partial_kicked: bool = False
+    barge_gate_mono: float = 0.0   # first frame that crossed the hold gate
+    barge_stages: dict[str, float] = field(default_factory=dict)  # spec §8 latency chain
     tts_barge_voice: bool = False
     tts_barge_quiet: int = 0
     # System output volume captured when a barge hold ducks the speaker.
@@ -3478,6 +3490,29 @@ class MicState:
         self.dispatch_s = None
         write_status(self.state, {"chunk_started_at": time.time(), "trigger": reason, "turn": self.turn_metrics()})
 
+    def note_barge_latency(self, died_at: float | None) -> None:
+        """Per-stage interruption latency (spec §8): gate -> hold -> duck ->
+        capture -> partial -> flush -> decision -> audible stop."""
+        stages = self.barge_stages
+        event: dict[str, float] = {}
+        prev_name: str | None = None
+        prev_t: float | None = None
+        for name in ("gate", "hold", "duck", "capture", "partial", "flush", "decision"):
+            t = stages.get(name)
+            if t is None:
+                continue
+            if prev_t is not None:
+                event[f"{prev_name}_to_{name}_s"] = round(t - prev_t, 3)
+            prev_name, prev_t = name, t
+        if died_at is not None:
+            if prev_t is not None:
+                event[f"{prev_name}_to_stop_s"] = round(died_at - prev_t, 3)
+            if stages.get("gate") is not None:
+                event["gate_to_stop_s"] = round(died_at - stages["gate"], 3)
+        if event:
+            barge_note(self, "latency", **event)
+        self.barge_stages = {}
+
     def note_barge_release(self) -> None:
         """A hold that was not a stop. Restores volume and starts the duck
         cooldown; detection itself stays open so a repeated "stop" is heard."""
@@ -3590,11 +3625,47 @@ class MicState:
 
     def apply_whisper(self, heard_kind: str, heard: str, oww, vad, jobs=None) -> bool:
         """Handle one finished Whisper clip. True means skip the rest of this iteration."""
+        if heard_kind == "tts_barge_partial" and self.state == "IDLE":
+            # The eight-frame partial pass. Only a verbatim stop is a
+            # decision; anything else keeps the hold open so the full clip
+            # still gets its turn.
+            stop_tokens = _command_tokens(heard)
+            self.barge_stages["decision"] = time.monotonic()
+            barge_note(self, "whisper_partial", text=heard, barge=_is_playback_barge(stop_tokens))
+            if _is_playback_barge(stop_tokens):
+                self.tts_barge_held = False
+                self.tts_barge_waiting = False
+                self.tts_barge_next = None
+                self.tts_stop_frames.clear()
+                died_at = stop_playback(f"Heard {heard!r} (partial) over TTS -> stopping speech, not opening Handy")
+                restore_output_volume(self)
+                latency = (
+                    round(died_at - self.barge_onset_mono, 3)
+                    if died_at is not None and self.barge_onset_mono
+                    else None
+                )
+                if latency is not None:
+                    self.stop_latency_s = latency
+                barge_note(self, "stop_playback", latency_s=latency, text=heard, partial=True)
+                self.note_barge_latency(died_at)
+                self.tts_loud_run = 0
+                self.tts_rms_floor.clear()
+                self.tts_active = False
+                return True
+            nxt = self.tts_barge_next
+            if nxt is not None and jobs is not None:
+                audio, prompt = nxt
+                self.tts_barge_next = None
+                if self.kick_whisper(jobs, "tts_barge", audio, prompt):
+                    return True
+                self.tts_barge_next = nxt
+            return True
         if heard_kind == "tts_barge" and self.state == "IDLE":
             # A sentence that ends in "stop" is the bed, not a barge. The
             # burst may be heard once or several times; every token has to
             # be the word stop. "Hold on a second" is the same barge.
             stop_tokens = _command_tokens(heard)
+            self.barge_stages["decision"] = time.monotonic()
             barge_note(self, "whisper", text=heard, barge=_is_playback_barge(stop_tokens))
             if _is_playback_barge(stop_tokens):
                 self.tts_barge_held = False
@@ -3611,6 +3682,7 @@ class MicState:
                 if latency is not None:
                     self.stop_latency_s = latency
                 barge_note(self, "stop_playback", latency_s=latency, text=heard)
+                self.note_barge_latency(died_at)
                 self.tts_loud_run = 0
                 self.tts_rms_floor.clear()
                 self.tts_active = False
@@ -3805,6 +3877,9 @@ class MicState:
                 # the resume attack cannot open a hold on its own.
                 hot = vad_score >= 0.55 and rms >= gate
                 self.tts_loud_run = self.tts_loud_run + 1 if hot else 0
+                if self.tts_loud_run == 1:
+                    self.barge_gate_mono = time.monotonic()
+                    self.barge_stages = {"gate": self.barge_gate_mono}
                 user_voice = self.tts_loud_run >= 3
                 clip_limit = 16
                 clip_floor = 80.0
@@ -3841,10 +3916,14 @@ class MicState:
                 self.tts_barge_quiet = 0
                 self.tts_barge_skip = 2
                 self.tts_barge_loud = 0
+                self.tts_barge_partial_kicked = False
                 just_held = True
                 self.tts_stop_frames = list(self.tts_pre_roll) or [frame.copy()]
                 self.tts_pre_roll.clear()
                 self.barge_onset_mono = time.monotonic()
+                self.barge_stages.setdefault("gate", self.barge_onset_mono)
+                self.barge_stages["hold"] = self.barge_onset_mono
+                self.barge_stages["capture"] = self.barge_onset_mono
                 log(
                     f"TTS barge hold rms={rms:.0f} vad={vad_score:.2f} floor={floor:.0f} "
                     f"hot={self.tts_loud_run} frames={len(self.tts_stop_frames)}"
@@ -3886,6 +3965,25 @@ class MicState:
                 self.tts_stop_silence = 0
                 self.tts_stop_frames.append(frame.copy())
                 flush_clip = len(self.tts_stop_frames) >= clip_limit
+                # Spec §8: overlap capture and recognition. Eight frames (~0.64 s)
+                # of confirmed voice start a Whisper pass while the 16-frame flush
+                # contract keeps collecting. A partial "stop" ends playback before
+                # the full clip is even written; a partial non-stop leaves the hold
+                # intact so the full clip still gets its decision.
+                if (
+                    self.tts_barge_voice
+                    and not self.tts_barge_partial_kicked
+                    and len(self.tts_stop_frames) >= 8
+                    and self.whisper_pending is None
+                ):
+                    partial = clip_for_whisper(
+                        np.concatenate(self.tts_stop_frames[:8]).astype(np.float32) / 32768.0,
+                        6.0,
+                    )
+                    if self.kick_whisper(jobs, "tts_barge_partial", partial, "Hey Jarvis. stop."):
+                        self.tts_barge_partial_kicked = True
+                        self.barge_stages["partial"] = time.monotonic()
+                        barge_note(self, "partial_asr", frames=8)
             elif self.tts_stop_frames:
                 self.tts_stop_silence += 1
                 flush_clip = self.tts_stop_silence >= 4
@@ -3944,6 +4042,7 @@ class MicState:
                         quiet=self.tts_barge_quiet,
                     )
                     if 2 <= n_frames <= 16 and peak >= clip_floor:
+                        self.barge_stages["flush"] = time.monotonic()
                         audio_f32 = clip_for_whisper(clip.astype(np.float32) / 32768.0, 6.0)
                         self.tts_barge_waiting = True
                         if not self.kick_whisper(jobs, "tts_barge", audio_f32, "Hey Jarvis. stop."):
