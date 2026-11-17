@@ -25,6 +25,8 @@
     <string>1</string>
     <key>OMP_VOICE_DUCK_VOLUME</key>
     <string>20</string>
+    <key>OMP_VOICE_STREAM_PLAYER</key>
+    <string>1</string>
   </dict>
   <key>KeepAlive</key>
   <true/>

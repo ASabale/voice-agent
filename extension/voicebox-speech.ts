@@ -931,7 +931,14 @@ async function play(
     }
     return;
   }
-  const child = spawn("afplay", args, { stdio: "ignore" });
+  const streamPlayer = process.env.OMP_VOICE_STREAM_PLAYER === "1";
+  const child = spawn(
+    streamPlayer ? "voice-play" : "afplay",
+    streamPlayer
+      ? [clip.wav, "--speed", String(session.playbackRate)]
+      : args,
+    { stdio: "ignore" },
+  );
   if (epoch !== session.speechEpoch) {
     try {
       child.kill("SIGKILL");

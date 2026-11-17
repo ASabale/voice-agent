@@ -20,6 +20,12 @@ if [ -n "${1:-}" ]; then
 fi
 ln -sfn "$ROOT/bin/omp-voice-controller" "$HOME/.local/bin/omp-voice-controller"
 ln -sfn "$ROOT/bin/omp-handy-hook" "$HOME/.local/bin/omp-handy-hook"
+ln -sfn "$ROOT/bin/voice-doctor" "$HOME/.local/bin/voice-doctor"
+ln -sfn "$ROOT/bin/voice" "$HOME/.local/bin/voice"
+# voice-play needs sounddevice, which lives in the omp-voice venv, not system
+# python3; wrap it so the extension's bare `voice-play` spawn resolves.
+printf '#!/bin/sh\nexec "%s/.local/share/omp-voice/venv/bin/python3" "%s/bin/voice-play" "$@"\n' "$HOME" "$ROOT" > "$HOME/.local/bin/voice-play"
+chmod +x "$HOME/.local/bin/voice-play"
 ln -sfn "$ROOT/extension/voicebox-speech.ts" "$HOME/.omp/agent/extensions/voicebox-speech.ts"
 ln -sfn "$ROOT/grammar.json" "$HOME/.local/share/omp-voice/grammar.json"
 ln -sfn "$ROOT/skills/conversational-collaboration" "$HOME/.omp/agent/managed-skills/conversational-collaboration"

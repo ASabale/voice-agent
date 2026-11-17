@@ -1873,6 +1873,7 @@ def _save_duck_transaction(state: "MicState") -> None:
                     "target": state.tts_duck_target,
                     "state": state.tts_duck_state,
                     "ducked_at": state.tts_duck_at,
+                    "stream_gain": state.tts_stream_gain,
                 }
             )
         )
@@ -1887,15 +1888,41 @@ def _clear_duck_transaction() -> None:
         pass
 
 
+def stream_player_enabled() -> bool:
+    """True when VoiceBox clips play through `voice-play`, the gain-controlled
+    player. macOS exposes no per-process output volume, so per-stream gain in
+    our own player is the only way to duck the reply without touching YouTube
+    or any other application's level."""
+    return os.environ.get("OMP_VOICE_STREAM_PLAYER", "").strip() == "1"
+
+
+def _stream_gain_path() -> Path:
+    return STATE_DIR / "stream-gain.json"
+
+
+def write_stream_gain(gain: float) -> bool:
+    gain = max(0.0, min(1.0, gain))
+    try:
+        _stream_gain_path().write_text(json.dumps({"gain": gain}), encoding="utf-8")
+        return True
+    except Exception as exc:
+        log_once("stream-gain", f"could not write stream gain: {exc}")
+        return False
+
+
 def duck_output_volume(state: "MicState") -> None:
-    """Lower the system output volume while a barge hold is open.
+    """Attenuate the assistant reply while a barge hold is open.
 
     The held clip is the evidence Whisper judges; a ducked speaker makes it
-    mostly the person instead of the reply. The original volume is restored on
-    release or stop. No-op when OMP_VOICE_DUCK_VOLUME is unset.
+    mostly the person instead of the reply. With the `voice-play` player the
+    gain file attenuates only the VoiceBox stream; otherwise the macOS master
+    volume is used, which also silences unrelated applications. The original
+    level is restored on release or stop. No-op when OMP_VOICE_DUCK_VOLUME is
+    unset.
     """
+    global _duck_ratio
     target = os.environ.get("OMP_VOICE_DUCK_VOLUME", "")
-    if not target or state.tts_duck_restore is not None:
+    if not target or state.tts_duck_restore is not None or state.tts_stream_gain is not None:
         return
     # A synthetic burst is speaker audio too, so ducking would mute it along
     # with the reply. Harnesses that interrupt through the speakers write this
@@ -1905,6 +1932,29 @@ def duck_output_volume(state: "MicState") -> None:
     try:
         target_pct = max(0, min(100, int(target)))
     except ValueError:
+        return
+    if stream_player_enabled():
+        # Stream gain is relative to full clip level; the adaptive and bounds
+        # rules carry over with the master volume out of the picture.
+        gain = target_pct / 100.0
+        if 1.0 - gain < DUCK_MIN_ATTENUATION:
+            log(f"stream duck skipped: gain {gain} is under the minimum attenuation")
+            return
+        if state.echo_full_gain > 0.0 and state.echo_full_gain <= DUCK_AMBIENT_DOMINANCE * max(state.ambient_short, 40.0):
+            gain = (1.0 + gain) / 2.0
+        if not write_stream_gain(gain):
+            return
+        state.tts_stream_gain = gain
+        state.tts_duck_target = target_pct
+        state.tts_duck_state = "ducked"
+        state.tts_duck_attempts = 0
+        state.tts_duck_retry_at = 0.0
+        state.tts_duck_at = time.monotonic()
+        state.barge_stages["duck"] = state.tts_duck_at
+        _duck_ratio = gain
+        _save_duck_transaction(state)
+        log(f"ducked VoiceBox stream gain 1.0 -> {gain:.2f} (master volume untouched)")
+        barge_note(state, "duck", to_volume=int(gain * 100))
         return
     current = output_volume()
     if current is None or current <= target_pct:
@@ -1931,7 +1981,6 @@ def duck_output_volume(state: "MicState") -> None:
     state.tts_duck_retry_at = 0.0
     state.tts_duck_at = time.monotonic()
     state.barge_stages["duck"] = state.tts_duck_at
-    global _duck_ratio
     _duck_ratio = target_pct / current if current > 0 else 1.0
     _save_duck_transaction(state)
     log(f"ducked output volume {current} -> {target_pct}")
@@ -1947,9 +1996,33 @@ def restore_output_volume(state: "MicState", now: float | None = None) -> bool:
     instead of overwritten. Returns True only once the restored volume is
     actually verified.
     """
+    global _duck_ratio
+    now = time.monotonic() if now is None else now
+    if state.tts_stream_gain is not None:
+        # Stream duck: the gain file is the whole state; writing 1.0 back is
+        # the verification (the player reads it every chunk).
+        if now < state.tts_duck_retry_at:
+            return False
+        if not write_stream_gain(1.0):
+            state.tts_duck_attempts += 1
+            state.tts_duck_retry_at = now + min(
+                DUCK_RETRY_MAX_SECONDS, DUCK_RETRY_BASE_SECONDS * 2 ** (state.tts_duck_attempts - 1)
+            )
+            log("stream gain restore failed; retry with backoff")
+            _save_duck_transaction(state)
+            return False
+        state.tts_stream_gain = None
+        state.tts_duck_target = None
+        state.tts_duck_state = "normal"
+        state.tts_duck_attempts = 0
+        state.tts_duck_retry_at = 0.0
+        _duck_ratio = 1.0
+        log("restored VoiceBox stream gain to 1.0")
+        barge_note(state, "duck_restore", to_volume=100)
+        _clear_duck_transaction()
+        return True
     if state.tts_duck_restore is None:
         return True
-    now = time.monotonic() if now is None else now
     if now < state.tts_duck_retry_at:
         return False
     previous = state.tts_duck_restore
@@ -1992,7 +2065,6 @@ def restore_output_volume(state: "MicState", now: float | None = None) -> bool:
     state.tts_duck_state = "normal"
     state.tts_duck_attempts = 0
     state.tts_duck_retry_at = 0.0
-    global _duck_ratio
     _duck_ratio = verified / previous if previous > 0 else 1.0
     log(f"restored output volume {verified}")
     barge_note(state, "duck_restore", to_volume=verified)
@@ -2009,6 +2081,13 @@ def reconcile_duck_state() -> None:
         return
     original = data.get("original")
     target = data.get("target")
+    if isinstance(data.get("stream_gain"), (int, float)):
+        # A stream duck outlived its controller: put the gain back and drop
+        # the transaction. No master volume is involved.
+        write_stream_gain(1.0)
+        path.unlink(missing_ok=True)
+        log("recovered stream duck from a previous run: gain back to 1.0")
+        return
     if not isinstance(original, int) or not 0 <= original <= 100:
         try:
             path.unlink(missing_ok=True)
@@ -2600,7 +2679,7 @@ def _omp_vb_pids() -> list[str]:
     return [
         line.split(None, 1)[0]
         for line in listing.splitlines()
-        if "afplay" in line and needle in line
+        if ("afplay" in line or "voice-play" in line) and needle in line
     ]
 
 
@@ -3350,6 +3429,9 @@ class MicState:
     tts_duck_at: float | None = None
     tts_duck_target: int | None = None
     tts_duck_state: str = "normal"  # normal | ducked | restore_pending
+    # Per-stream ducking (voice-play player): current VoiceBox stream gain,
+    # None when the stream is at full gain.
+    tts_stream_gain: float | None = None
     tts_duck_retry_at: float = 0.0
     tts_duck_attempts: int = 0
     tts_barge_skip: int = 0
@@ -4066,7 +4148,7 @@ class MicState:
                 # leave the speaker ducked indefinitely. Restoring here lets a
                 # still-loud burst duck again on its next hot frames.
                 if (
-                    self.tts_duck_restore is not None
+                    (self.tts_duck_restore is not None or self.tts_stream_gain is not None)
                     and self.tts_duck_at is not None
                     and time.monotonic() - self.tts_duck_at > DUCK_MAX_STUCK_SECONDS
                 ):
@@ -4238,6 +4320,7 @@ class MicState:
                 # frames set the floor collapses the gate and invites hold
                 # flicker as soon as the volume comes back.
                 and self.tts_duck_restore is None
+                and self.tts_stream_gain is None
             ):
                 self.tts_rms_floor.append(rms)
             return True
