@@ -4423,6 +4423,132 @@ class FixtureAudioSource:
         return frame
 
 
+# --- The user is talking: the extension must not start a clip ----------------
+
+_listening_written = 0.0
+
+
+def publish_listening(mic: "MicState") -> None:
+    """Tell the extension the mic belongs to the user right now.
+
+    Killing a clip after it starts still lets Handy hear its first words
+    (live 2026-11-21: a reply mixed into a dictated transcript). The extension
+    reads listening.json before spawning the player and holds the clip back.
+    Written at most every 0.3 s while dictating or while fn is held.
+    """
+    global _listening_written
+    talking = mic.state == "DICTATING" or mic.fn_was_down
+    now = time.time()
+    if not talking or now - _listening_written < 0.3:
+        return
+    _listening_written = now
+    try:
+        (STATE_DIR / "listening.json").write_text(json.dumps({"until": now + 1.0}), encoding="utf-8")
+    except OSError as exc:
+        log_once("listening", f"could not write listening.json: {exc}")
+
+
+# --- Memory limits for VoiceBox and Handy ------------------------------------
+# VoiceBox reached 37-61 GB on 2026-11-21 after a 1.7B model load next to the
+# 46 GB Strata engine. Limits are env-overridable; restarts only happen while
+# nothing is speaking and the user is not dictating.
+VOICEBOX_MAX_GB = float(os.environ.get("OMP_VOICE_VOICEBOX_MAX_GB", "12"))
+HANDY_MAX_GB = float(os.environ.get("OMP_VOICE_HANDY_MAX_GB", "2"))
+MEMORY_GUARD_INTERVAL_SECONDS = 30.0
+MEMORY_GUARD_RESTART_BACKOFF_SECONDS = 300.0
+VOICEBOX_APP_DIR = "/Applications/Voicebox.app/Contents/MacOS/"
+
+
+def process_footprint_gb(pid: int) -> float | None:
+    """phys_footprint in GB (counts MLX/Metal memory that RSS misses)."""
+    try:
+        out = subprocess.run(
+            ["/usr/bin/footprint", "-p", str(pid)], capture_output=True, text=True, timeout=10.0, check=False
+        ).stdout
+    except Exception:
+        return None
+    m = re.search(r"Footprint:\s+([\d.]+)\s*(GB|MB|KB)", out)
+    if not m:
+        return None
+    return float(m[1]) * {"GB": 1.0, "MB": 1 / 1024, "KB": 1 / 1048576}[m[2]]
+
+
+def _pids_matching(pattern: str) -> list[int]:
+    try:
+        out = subprocess.run(["/usr/bin/pgrep", "-f", pattern], capture_output=True, text=True, timeout=3.0).stdout
+    except Exception:
+        return []
+    return [int(p) for p in out.split() if p.isdigit()]
+
+
+def voicebox_footprint_gb() -> float:
+    """Sum over the app and every voicebox-server process (two servers were seen live)."""
+    return sum(process_footprint_gb(pid) or 0.0 for pid in _pids_matching(VOICEBOX_APP_DIR))
+
+
+def handy_footprint_gb() -> float:
+    return sum(process_footprint_gb(pid) or 0.0 for pid in _pids_matching("/Applications/Handy.app/Contents/MacOS/handy"))
+
+
+def restart_voicebox() -> None:
+    pids = _pids_matching(VOICEBOX_APP_DIR)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        time.sleep(3.0)
+        pids = _pids_matching(VOICEBOX_APP_DIR)
+        if not pids:
+            break
+    subprocess.run(["/usr/bin/open", "-g", "-a", "Voicebox"], check=False, timeout=10.0)
+
+
+def restart_handy() -> None:
+    for pid in _pids_matching("/Applications/Handy.app/Contents/MacOS/handy"):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(2.0)
+    subprocess.run(["/usr/bin/open", "-g", "-a", "Handy"], check=False, timeout=10.0)
+
+
+def memory_guard_step(mic: "MicState", now: float, last_restart: dict) -> None:
+    """One check. Over-limit apps restart only when it is safe to.
+
+    VoiceBox: safe when nothing is speaking and the user is not dictating;
+    past twice the limit the reply is silenced first, because the machine is
+    about to swap. Handy: only while IDLE with fn up (never mid-recording).
+    """
+    busy = mic.state == "DICTATING" or mic.fn_was_down
+    vb = voicebox_footprint_gb()
+    if vb > VOICEBOX_MAX_GB and now - last_restart.get("voicebox", -1e9) > MEMORY_GUARD_RESTART_BACKOFF_SECONDS:
+        critical = vb > 2 * VOICEBOX_MAX_GB
+        if critical or (not busy and not is_voicebox_speaking()):
+            if critical and is_voicebox_speaking():
+                silence_speech(False)
+            log(f"memory guard: VoiceBox at {vb:.1f} GB > {VOICEBOX_MAX_GB:.0f} GB -> restarting it")
+            last_restart["voicebox"] = now
+            restart_voicebox()
+    hd = handy_footprint_gb()
+    if hd > HANDY_MAX_GB and not busy and now - last_restart.get("handy", -1e9) > MEMORY_GUARD_RESTART_BACKOFF_SECONDS:
+        log(f"memory guard: Handy at {hd:.1f} GB > {HANDY_MAX_GB:.0f} GB -> restarting it")
+        last_restart["handy"] = now
+        restart_handy()
+
+
+def memory_guard_loop(mic: "MicState") -> None:
+    last_restart: dict = {}
+    while _daemon_running.is_set():
+        try:
+            memory_guard_step(mic, time.monotonic(), last_restart)
+        except Exception as exc:
+            log_once("memory-guard", f"memory guard check failed: {exc}")
+        time.sleep(MEMORY_GUARD_INTERVAL_SECONDS)
+
+
 def handle_captured_frame(
     mic: MicState,
     frame: np.ndarray,
@@ -4442,6 +4568,7 @@ def handle_captured_frame(
     raw = np.asarray(frame)
     mic.raw_frame = raw
     frame = cancel_playback_echo(raw, captured_at)
+    publish_listening(mic)
     now = time.monotonic()
     if now < mic.cooldown_until:
         # The tail of "cancel that" must not open a new utterance. A wake
@@ -4618,6 +4745,8 @@ def run_daemon(
     if not handy_file_mode():
         ensure_handy_model(handy_settings_changed)
     threading.Thread(target=watch_submitted_messages, daemon=True).start()
+    if not handy_file_mode():
+        threading.Thread(target=memory_guard_loop, args=(mic,), daemon=True).start()
     threading.Thread(target=_whisper_worker, daemon=True).start()
     write_status(mic.state, {"wake_word": wake_word, "pause_seconds": pause_seconds})
     log(

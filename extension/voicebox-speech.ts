@@ -905,6 +905,19 @@ export async function generate(
   }
 }
 
+// The controller refreshes listening.json while Handy records (wake dictation
+// or fn held). Starting a clip then puts the reply into the user's transcript.
+function userIsTalking(): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(os.homedir(), ".local", "state", "omp-voice", "listening.json"), "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    const until = parsed && typeof parsed === "object" && "until" in parsed ? Number(parsed.until) : 0;
+    return Date.now() / 1000 < until;
+  } catch {
+    return false;
+  }
+}
+
 async function play(
   clip: { wav: string; sentence: string; clip: number; reference?: { sample_rate: number; channels: number; frames: number; wav: string } | null },
   epoch: number,
@@ -919,7 +932,8 @@ async function play(
   }
   session.isSpeaking = true;
   const { promise, resolve } = Promise.withResolvers<void>();
-  if (epoch !== session.speechEpoch) {
+  if (epoch !== session.speechEpoch || userIsTalking()) {
+    if (epoch === session.speechEpoch) logSpeech("dropped", clip.sentence, { reason: "listening" });
     session.isSpeaking = false;
     try {
       fs.unlinkSync(clip.wav);
