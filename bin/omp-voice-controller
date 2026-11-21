@@ -3236,6 +3236,7 @@ class MicState:
     tts_duck_at: float | None = None
     tts_duck_target: int | None = None
     raw_oww: object | None = None
+    last_tts_seen: float = -1e9
     raw_frame: np.ndarray | None = None
     tts_duck_state: str = "normal"  # normal | ducked | restore_pending
     # Per-stream ducking (voice-play player): current VoiceBox stream gain,
@@ -3727,6 +3728,8 @@ class MicState:
             was_speaking = self.tts_active
             self.last_tts_check = now
             self.tts_active = is_voicebox_speaking()
+            if self.tts_active:
+                self.last_tts_seen = now
             if self.tts_active != was_speaking:
                 barge_note(self, "speaking", speaking=self.tts_active)
         # Handy starts recording on fn. That used to keep the reply that was
@@ -4452,7 +4455,12 @@ def publish_listening(mic: "MicState") -> None:
 # VoiceBox reached 37-61 GB on 2026-11-21 after a 1.7B model load next to the
 # 46 GB Strata engine. Limits are env-overridable; restarts only happen while
 # nothing is speaking and the user is not dictating.
-VOICEBOX_MAX_GB = float(os.environ.get("OMP_VOICE_VOICEBOX_MAX_GB", "12"))
+# Measured 2026-11-21 on 0.6B: ~3 GB idle after load, peaks ~10 GB in a burst
+# of replies, then VoiceBox returns it on its own. 6 GB keeps it near the
+# floor; the restart waits for VOICEBOX_QUIET_SECONDS without playback so it
+# never lands between the sentences of one reply.
+VOICEBOX_MAX_GB = float(os.environ.get("OMP_VOICE_VOICEBOX_MAX_GB", "6"))
+VOICEBOX_QUIET_SECONDS = 20.0
 HANDY_MAX_GB = float(os.environ.get("OMP_VOICE_HANDY_MAX_GB", "2"))
 MEMORY_GUARD_INTERVAL_SECONDS = 30.0
 MEMORY_GUARD_RESTART_BACKOFF_SECONDS = 300.0
@@ -4505,6 +4513,32 @@ def restart_voicebox() -> None:
     subprocess.run(["/usr/bin/open", "-g", "-a", "Voicebox"], check=False, timeout=10.0)
 
 
+def warm_voicebox() -> None:
+    """Load 0.6B with the user's profile so the next reply is not a cold start.
+
+    A request without model_size makes VoiceBox load its 1.7B default next to
+    0.6B (37-61 GB live), so the warm-up always names 0.6B.
+    """
+    base = "http://127.0.0.1:17493"
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(f"{base}/health", timeout=2.0).read()
+            break
+        except Exception:
+            time.sleep(2.0)
+    try:
+        name = (STATE_DIR / "profile").read_text(encoding="utf-8").strip() or "Akshay"
+        profiles = json.loads(urllib.request.urlopen(f"{base}/profiles", timeout=5.0).read())
+        pid = next(p["id"] for p in profiles if p.get("name") == name)
+        body = json.dumps({"text": "Ready.", "profile_id": pid, "language": "en", "model_size": "0.6B"}).encode()
+        req = urllib.request.Request(f"{base}/generate/stream", data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=120.0).read()
+        log("memory guard: VoiceBox warmed on 0.6B")
+    except Exception as exc:
+        log(f"memory guard: VoiceBox warm-up failed: {exc}")
+
+
 def restart_handy() -> None:
     for pid in _pids_matching("/Applications/Handy.app/Contents/MacOS/handy"):
         try:
@@ -4523,15 +4557,17 @@ def memory_guard_step(mic: "MicState", now: float, last_restart: dict) -> None:
     about to swap. Handy: only while IDLE with fn up (never mid-recording).
     """
     busy = mic.state == "DICTATING" or mic.fn_was_down
+    quiet = now - mic.last_tts_seen >= VOICEBOX_QUIET_SECONDS
     vb = voicebox_footprint_gb()
     if vb > VOICEBOX_MAX_GB and now - last_restart.get("voicebox", -1e9) > MEMORY_GUARD_RESTART_BACKOFF_SECONDS:
         critical = vb > 2 * VOICEBOX_MAX_GB
-        if critical or (not busy and not is_voicebox_speaking()):
+        if critical or (not busy and quiet and not is_voicebox_speaking()):
             if critical and is_voicebox_speaking():
                 silence_speech(False)
             log(f"memory guard: VoiceBox at {vb:.1f} GB > {VOICEBOX_MAX_GB:.0f} GB -> restarting it")
             last_restart["voicebox"] = now
             restart_voicebox()
+            warm_voicebox()
     hd = handy_footprint_gb()
     if hd > HANDY_MAX_GB and not busy and now - last_restart.get("handy", -1e9) > MEMORY_GUARD_RESTART_BACKOFF_SECONDS:
         log(f"memory guard: Handy at {hd:.1f} GB > {HANDY_MAX_GB:.0f} GB -> restarting it")
