@@ -2818,6 +2818,26 @@ def test_wake_over_tts_stops_on_the_raw_mic_score(monkeypatch: pytest.MonkeyPatc
     assert not run(0.08)  # loudest non-wake audio measured over a reply: no stop
 
 
+def test_reply_starting_during_dictation_is_silenced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live #1066: a reply resumed mid-dictation and Handy typed it as the user's words."""
+
+    class Silenced(Exception):
+        pass
+
+    def silence(abort_agent: bool) -> None:
+        raise Silenced(abort_agent)
+
+    monkeypatch.setattr(controller, "handy_file_mode", lambda: True)
+    monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
+    monkeypatch.setattr(controller, "silence_speech", silence)
+    mic = controller.MicState()
+    mic.state = "DICTATING"
+    frame = np.zeros(1280, dtype=np.int16)
+    with pytest.raises(Silenced) as hit:
+        mic.handle_dictating_frame(frame, 100.0, 0.0, 0.0, False, None, None, 5.0, 15.0, None)
+    assert hit.value.args == (False,)  # drop the speech, keep the agent's turn
+
+
 def test_idle_history_drops_a_row_recorded_over_playback(monkeypatch: pytest.MonkeyPatch) -> None:
     # A row at or below fn_ignore_through was captured while the speakers were on.
     posted: list[str] = []

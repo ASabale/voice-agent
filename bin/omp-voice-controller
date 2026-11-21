@@ -3758,6 +3758,12 @@ class MicState:
                 self.fn_cut_busy = False
 
             threading.Thread(target=cut_playback_then_listen, daemon=True).start()
+        elif fn_down and self.fn_was_down and self.tts_active and not self.fn_cut_busy:
+            # A reply that starts while fn is already held would be recorded
+            # into the take: silence it, keep the recording going.
+            self.tts_active = False
+            log("VoiceBox started while fn held -> silencing it")
+            silence_speech(False)
         self.fn_was_down = fn_down
 
         # While VoiceBox is playing, ignore the wake word. A reply that
@@ -4088,6 +4094,15 @@ class MicState:
             log("fn released during dictation -> closing Handy and returning to IDLE")
             self.finish_fn_take(oww, vad)
             return True
+        # VoiceBox must never speak while Handy records: a reply that starts
+        # mid-dictation is the speaker typing into the user's text box
+        # (live 2026-11-21, #1066). Kill it here rather than trusting the
+        # bridge, which can be unregistered.
+        if (now - self.last_tts_mute) >= 0.25:
+            self.last_tts_mute = now
+            if is_voicebox_speaking():
+                log("VoiceBox started during dictation -> silencing it")
+                silence_speech(False)
         if not handy_file_mode() and (now - self.chunk_started_at) > 1.5 and (now - self.last_handy_ui_check) >= 1.0:
             self.last_handy_ui_check = now
             # --start-hidden has no window until the overlay appears. A zero
