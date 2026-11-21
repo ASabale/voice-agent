@@ -30,3 +30,28 @@ def ensure_wake_models():
     missing = [name for name in _REQUIRED_ONNX if not (models_dir / name).exists()]
     if missing:
         raise RuntimeError(f"openWakeWord ONNX models still missing after download: {missing}")
+
+
+@pytest.fixture(autouse=True)
+def isolated_state_dir(monkeypatch, tmp_path):
+    """Tests must not read the live ~/.local/state/omp-voice.
+
+    Every test module loads its own copy of the controller. Without this, a
+    reply the live omp session is speaking (tts-playing slots) turns on real
+    echo cancellation and the speaking probe inside unrelated tests.
+    """
+    import sys
+
+    state = tmp_path / "omp-voice-state"
+    state.mkdir()
+    for module in list(sys.modules.values()):
+        if hasattr(module, "STATE_DIR") and hasattr(module, "refresh_render_reference"):
+            monkeypatch.setattr(module, "STATE_DIR", state)
+            for name, leaf in (
+                ("SESSION_DIR", "sessions"),
+                ("PID_FILE", "controller.pid"),
+                ("STATUS_FILE", "status.json"),
+                ("LOG_FILE", "controller.log"),
+                ("TTS_STATE_FILE", "tts-playing.json"),
+            ):
+                monkeypatch.setattr(module, name, state / leaf)

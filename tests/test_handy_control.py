@@ -454,7 +454,7 @@ def test_chunk_restart_timing_follows_the_frame_clock_not_wall_monotonic(monkeyp
     monkeypatch.setattr(
         controller,
         "time",
-        types.SimpleNamespace(monotonic=lambda: 85.0, sleep=lambda _s: None, strftime=time.strftime),
+        types.SimpleNamespace(monotonic=lambda: 85.0, time=time.time, sleep=lambda _s: None, strftime=time.strftime),
     )
     monkeypatch.setattr(controller.sqlite3, "connect", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("history.db")))
     monkeypatch.setattr(controller, "dispatch_transcript", dispatch)

@@ -2766,8 +2766,8 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
     assert idle.state == "IDLE"
 
     repeat = press(True, [True], was_down=True)
-    assert calls == []
-    assert repeat.tts_active is True
+    assert calls == [("silence", False)]  # a reply under a held fn is silenced, the take keeps going
+    assert repeat.tts_active is False
 
     released = press(True, [True, False])
     assert ("silence", True) in calls
