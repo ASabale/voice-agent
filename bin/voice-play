@@ -61,6 +61,49 @@ def _parse_wav(data: bytes) -> tuple[int, int, np.ndarray] | None:
     return rate, channels, samples
 
 
+def time_stretch(samples: np.ndarray, rate: int, speed: float) -> np.ndarray:
+    """Change tempo without changing pitch (WSOLA).
+
+    Plain resampling at the reply speed (1.18x) raised the cloned voice's
+    pitch by 18% and made it sound like a woman's voice (live 2026-11-21).
+    """
+    x = samples.astype(np.float32)
+    mono = x.mean(axis=1)
+    win = int(0.030 * rate)
+    hop_out = win // 2
+    hop_in = hop_out * speed
+    tol = int(0.010 * rate)
+    window = np.hanning(win).astype(np.float32)
+    n_frames = max(1, int((len(x) - win - tol) / hop_in))
+    out = np.zeros((n_frames * hop_out + win, x.shape[1]), dtype=np.float32)
+    norm = np.zeros(n_frames * hop_out + win, dtype=np.float32)
+    prev = 0
+    for k in range(n_frames):
+        nominal = int(k * hop_in)
+        lo, hi = max(0, nominal - tol), min(len(x) - win, nominal + tol)
+        if k == 0 or hi <= lo:
+            start = min(max(0, nominal), max(0, len(x) - win))
+        else:
+            # Pick the input offset that best continues the previous frame.
+            target = mono[prev + hop_out : prev + hop_out + win]
+            region = mono[lo : hi + win]
+            if len(target) < win:
+                start = lo
+            else:
+                corr = np.correlate(region, target, mode="valid")
+                start = lo + int(np.argmax(corr))
+        seg = x[start : start + win]
+        if len(seg) < win:
+            break
+        o = k * hop_out
+        out[o : o + win] += seg * window[:, None]
+        norm[o : o + win] += window
+        prev = start
+    norm[norm < 1e-3] = 1.0
+    out /= norm[:, None]
+    return np.clip(out, -32768, 32767).astype(np.int16)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="voice-play")
     parser.add_argument("wav", type=Path)
@@ -76,12 +119,7 @@ def main() -> int:
     rate, channels, samples = parsed
     speed = max(0.25, min(2.0, args.speed))
     if speed != 1.0:
-        # Linear resampling is plenty for speech and keeps the gain ramp
-        # applied to the samples the speakers actually emit.
-        n_out = max(1, int(len(samples) / speed))
-        idx = np.linspace(0.0, len(samples) - 1.0, n_out)
-        grid = np.arange(len(samples), dtype=np.float64)
-        samples = np.stack([np.interp(idx, grid, samples[:, c]) for c in range(channels)], axis=1).astype(np.int16)
+        samples = time_stretch(samples, rate, speed)
     chunk = max(1, int(rate * args.chunk_ms / 1000))
 
     stop = {"flag": False}
