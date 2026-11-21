@@ -3556,6 +3556,13 @@ class MicState:
                 return True
             idle_cmd = idle_command(heard)
             if idle_cmd and idle_cmd["action"] == "sent":
+                target = resolve_delivery()
+                if target.get("mode") == "bridge" and not bridge_draft(bridge_base(target)).strip():
+                    # A lone "send that" with nothing drafted is the tail of a
+                    # take that never reached the draft (live 2026-11-21 15:53).
+                    log(f"Standalone send phrase in IDLE ({heard!r}) ignored: draft is empty")
+                    self.cooldown_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
+                    return False
                 log(f"Standalone send phrase in IDLE ({heard!r}) -> submitting draft")
                 outcome = dispatch_transcript("send prompt")
                 if outcome.get("action") == "sent":
@@ -3751,8 +3758,20 @@ class MicState:
                     self.fn_ignore_through = max(self.fn_ignore_through, row_id)
                     time.sleep(0.05)
                 if fn_held():
+                    before_take = latest_history_row()[0]
                     handy_start_recording(allow_launch=False)
                     log("fn barge-in: speakers stopped, recording restarted without the reply")
+                    # This take was started by a toggle, so Handy's own
+                    # push-to-talk release does not end it (live 15:53: the
+                    # take was dropped with no transcript). Stop it on release;
+                    # the idle history poll then delivers the new row.
+                    while fn_held():
+                        time.sleep(0.03)
+                    # If Handy ended the take itself, a toggle would open a new
+                    # recording; wait briefly for its row first (as finish_fn_take).
+                    if wait_for_new_history_row(before_take, timeout_sec=1.5) is None and handy_window_open():
+                        handy_stop_recording()
+                        log("fn released after barge-in -> stopped Handy for transcription")
                 else:
                     log("fn barge-in: speakers stopped")
                 self.fn_cut_busy = False

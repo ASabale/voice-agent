@@ -2737,6 +2737,9 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
         "handy_start_recording",
         lambda allow_launch=False, fresh=False: calls.append(("start", allow_launch, fresh)),
     )
+    window = {"open": True}
+    monkeypatch.setattr(controller, "handy_window_open", lambda: window["open"])
+    monkeypatch.setattr(controller, "handy_stop_recording", lambda: calls.append(("stop",)))
     for name in ("dispatch_transcript", "play_cue", "write_status", "stop_playback", "pause_tts_clips"):
         monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
 
@@ -2779,10 +2782,34 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
     assert released.fn_ignore_through == 11
     assert released.state == "IDLE"
 
-    still = press(True, [True, True])
+    # Live 15:53: the toggle-restarted take must be stopped on fn release,
+    # or Handy drops it with no transcript.
+    still = press(True, [True, True, True, False])
     assert ("start", False, False) in calls
+    assert calls[-1] == ("stop",)
     assert still.fn_cut_busy is False
     assert still.state == "IDLE"
+
+    # Handy already closed the take itself: no toggle, which would start a new one.
+    window["open"] = False
+    press(True, [True, True, True, False])
+    assert ("stop",) not in calls
+
+
+def test_standalone_send_with_an_empty_draft_does_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live 15:53: a lost take's trailing "Send that." submitted an empty draft."""
+    sent: list[str] = []
+    draft = {"text": ""}
+    monkeypatch.setattr(controller, "resolve_delivery", lambda: {"mode": "bridge", "port": 1})
+    monkeypatch.setattr(controller, "bridge_draft", lambda _base: draft["text"])
+    monkeypatch.setattr(controller, "dispatch_transcript", lambda text: sent.append(text) or {"action": "sent"})
+    monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
+    mic = controller.MicState()
+    mic.apply_whisper("idle_verify", "Send that.", None, None)
+    assert sent == []
+    draft["text"] = "fix the bridge"
+    mic.apply_whisper("idle_verify", "Send that.", None, None)
+    assert sent == ["send prompt"]
 
 
 def test_wake_over_tts_stops_on_the_raw_mic_score(monkeypatch: pytest.MonkeyPatch) -> None:
