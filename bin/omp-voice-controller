@@ -111,6 +111,11 @@ REVERB_TAIL_GUARD_SECONDS = 0.60
 WAKE_COOLDOWN_SECONDS = 0.6
 # After the user closes Handy's window, a weak score must not open it again.
 DISMISS_WAKE_SECONDS = 45.0
+# Over a reply, "Hey Jarvis" scores 0.26-0.99 on the raw or the echo-cancelled
+# mic, while YouTube, chatter and the reply itself stay under 0.08 (live probe
+# 2026-11-21). The canceller can strip the same-voice wake phrase, so both are
+# scored and the higher one is compared against this lower threshold.
+TTS_WAKE_THRESHOLD = 0.25
 ENTER_DICTATION_COOLDOWN_SECONDS = 0.25
 IDLE_TIMEOUT_COOLDOWN_SECONDS = 0.5
 SILENCE_PAUSE_SECONDS = 5.0
@@ -3230,6 +3235,8 @@ class MicState:
     # Set while a barge hold ducks the VoiceBox stream (see tts_stream_gain).
     tts_duck_at: float | None = None
     tts_duck_target: int | None = None
+    raw_oww: object | None = None
+    raw_frame: np.ndarray | None = None
     tts_duck_state: str = "normal"  # normal | ducked | restore_pending
     # Per-stream ducking (voice-play player): current VoiceBox stream gain,
     # None when the stream is at full gain.
@@ -3771,10 +3778,15 @@ class MicState:
             # wake phrase scrubbed (forSpeech), so the speaker never says it;
             # tiny.en on bleed+voice misheard real stops (live 2026-11-21).
             wake_score = float(oww.predict(frame).get(wake_word, 0.0) or 0.0)
+            if self.raw_oww is not None and self.raw_frame is not None:
+                raw_score = float(self.raw_oww.predict(self.raw_frame).get(wake_word, 0.0) or 0.0)
+                wake_score = max(wake_score, raw_score)
             if wake_score >= 0.2:
                 log(f"Wake score over TTS {wake_score:.2f} rms={rms:.0f}")
-            if wake_score >= wake_threshold and now >= self.score_wake_blocked_until:
+            if wake_score >= min(wake_threshold, TTS_WAKE_THRESHOLD) and now >= self.score_wake_blocked_until:
                 oww.reset()
+                if self.raw_oww is not None:
+                    self.raw_oww.reset()
                 self.barge_stop(f"Wake word over TTS (score={wake_score:.2f}) -> stopping speech", "hey jarvis", wake_score=wake_score)
                 self.score_wake_blocked_until = time.monotonic() + DISMISS_WAKE_SECONDS
                 return True
@@ -4393,7 +4405,9 @@ def handle_captured_frame(
 ) -> None:
     """One captured block. The microphone and the fixture source both call this."""
     refresh_render_reference()
-    frame = cancel_playback_echo(np.asarray(frame), captured_at)
+    raw = np.asarray(frame)
+    mic.raw_frame = raw
+    frame = cancel_playback_echo(raw, captured_at)
     now = time.monotonic()
     if now < mic.cooldown_until:
         # The tail of "cancel that" must not open a new utterance. A wake
@@ -4558,6 +4572,8 @@ def run_daemon(
             job["slot"].put(text)
 
     mic = MicState()
+    # Second wake model for the unprocessed mic during replies (TTS_WAKE_THRESHOLD).
+    mic.raw_oww = Model(wakeword_models=[wake_word], inference_framework="onnx")
     # A controller that died mid-duck leaves the machine ducked with nobody
     # to restore it; recover that before the first frame is ever captured.
     reconcile_duck_state()

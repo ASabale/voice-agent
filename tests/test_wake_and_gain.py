@@ -2785,6 +2785,39 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
     assert still.state == "IDLE"
 
 
+def test_wake_over_tts_stops_on_the_raw_mic_score(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live probe 2026-11-21: the canceller strips a same-voice "Hey Jarvis"
+    (0.48 raw -> 0.05 cleaned), so a raw score above TTS_WAKE_THRESHOLD must stop the reply."""
+    stops: list[str] = []
+    monkeypatch.setattr(controller, "fn_held", lambda: False)
+    monkeypatch.setattr(controller.MicState, "barge_stop", lambda self, msg, *_a, **_k: stops.append(msg))
+
+    class _Model:
+        def __init__(self, score: float) -> None:
+            self.score = score
+
+        def predict(self, _frame: np.ndarray) -> dict[str, float]:
+            return {"hey_jarvis": self.score}
+
+        def reset(self) -> None:
+            return None
+
+    def run(raw_score: float) -> list[str]:
+        stops.clear()
+        mic = controller.MicState()
+        mic.tts_active = True
+        mic.last_manual_check = 1e12
+        mic.last_tts_check = 1e12
+        mic.raw_oww = _Model(raw_score)
+        mic.raw_frame = np.zeros(1280, dtype=np.int16)
+        frame = np.zeros(1280, dtype=np.int16)
+        mic.handle_idle_frame(frame, 0.0, 0.0, 0.0, False, "test", _Model(0.05), None, "hey_jarvis", 0.5, __import__("queue").Queue())
+        return list(stops)
+
+    assert run(0.30)  # wake phrase over the reply: stop
+    assert not run(0.08)  # loudest non-wake audio measured over a reply: no stop
+
+
 def test_idle_history_drops_a_row_recorded_over_playback(monkeypatch: pytest.MonkeyPatch) -> None:
     # A row at or below fn_ignore_through was captured while the speakers were on.
     posted: list[str] = []
