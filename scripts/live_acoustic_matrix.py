@@ -15,12 +15,17 @@ def osa(s: str) -> str:
     return subprocess.run(["osascript", "-e", s], capture_output=True, text=True).stdout.strip()
 
 
+# Loudness is varied per clip (afplay -v), never via the system volume.
+CLIP_GAIN = 0.5
+
+
 def set_volume(v: int) -> None:
-    osa(f"set volume output volume {v}")
+    global CLIP_GAIN
+    CLIP_GAIN = v / 100.0
 
 
 def play(name: str) -> None:
-    subprocess.run(["afplay", str(D / f"{name}.wav")], check=False)
+    subprocess.run(["afplay", "-v", str(CLIP_GAIN), str(D / f"{name}.wav")], check=False)
 
 
 def mark() -> int:
@@ -120,6 +125,4 @@ if __name__ == "__main__":
     elif mode == "ambient":
         out["rounds"] = [ambient_round(v, ["yt_talk", "chatter", "yt_jarvis"]) for v in (25, 50, 80)]
     out["mem_after"] = mem()
-    out["volume_restored"] = 56
-    set_volume(56)
     print(json.dumps(out, indent=1))

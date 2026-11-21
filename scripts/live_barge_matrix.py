@@ -116,7 +116,6 @@ def log_since(m):
 
 
 def trial(proc, rec, master, disturbance, volume):
-    osa(f"set volume output volume {volume}")
     post(rec["port"], PROMPT)
     post(rec["port"], "send prompt")
     asked = time.time()
@@ -127,7 +126,8 @@ def trial(proc, rec, master, disturbance, volume):
     time.sleep(2.0)
     m = log_mark()
     played_at = time.time()
-    subprocess.run(["afplay", str(D / f"{disturbance}.wav")], check=False)
+    # Disturbance loudness varies per clip; the system volume is never touched.
+    subprocess.run(["afplay", "-v", str(volume / 100.0), str(D / f"{disturbance}.wav")], check=False)
     # Watch 6 s after the disturbance ends.
     stopped_at = None
     t_end = time.time() + 6
@@ -171,6 +171,5 @@ if __name__ == "__main__":
             out["trials"].append(res)
             print(json.dumps(res), flush=True)
     finally:
-        osa("set volume output volume 56")
         os.killpg(proc.pid, signal.SIGTERM)
     (D / "barge.json").write_text(json.dumps(out, indent=1))
