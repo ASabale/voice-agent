@@ -48,7 +48,6 @@ import fcntl
 import json
 import math
 import re
-import select
 import signal
 import stat
 import sqlite3
@@ -141,8 +140,6 @@ UNMUTE_SECOND_DELAY_SECONDS = 0.65
 # hard jump.
 DUCK_MIN_HOT_FRAMES = 5        # 80 ms frames: ~0.4 s of continuous hot audio
 DUCK_MIN_RMS_FACTOR = 1.5      # duck only above 1.5x the hold gate, not just at it
-DUCK_RAMP_STEPS = 4            # smooth 70 -> 20 over four volume writes
-DUCK_RAMP_STEP_DELAY_SECONDS = 0.05
 DUCK_MAX_STUCK_SECONDS = 8.0   # watchdog: a stuck hold never leaves the speaker ducked
 DUCK_RETRY_BASE_SECONDS = 2.0  # first backoff after a failed restore attempt
 DUCK_RETRY_MAX_SECONDS = 16.0  # ceiling on the restore retry backoff
@@ -189,7 +186,6 @@ MIC_FRAME_WAIT_CAP_SECONDS = 0.5
 # The flush path waits on the Whisper worker synchronously; these bounds keep
 # that wait inside the mic queue buffer (MIC_QUEUE_BLOCKS, below) so frames
 # arriving during the stall are never dropped.
-CLOSING_PARTIAL_WAIT_SECONDS = 6.0
 LOCAL_FALLBACK_WAIT_SECONDS = 12.0
 WATCH_POLL_SECONDS = 0.4
 STRATA_RETRY_SECONDS = 5.0
@@ -205,7 +201,6 @@ _logged_once: set[str] = set()
 _cue_procs: list[subprocess.Popen] = []
 _cue_lock = threading.Lock()
 _daemon_running = threading.Event()
-_strata_loaded = threading.Event()
 _pid_lock_handle: object | None = None
 
 SOUND_WAKE = "/Applications/Handy.app/Contents/Resources/resources/marimba_start.wav"
@@ -243,6 +238,17 @@ def _load_macos_frameworks() -> tuple[ctypes.CDLL, ctypes.CDLL]:
         graphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
         graphics.CGEventSourceFlagsState.argtypes = [ctypes.c_uint32]
         graphics.CGEventSourceFlagsState.restype = ctypes.c_uint64
+        # Non-variadic scroll constructor: ctypes cannot pass variadic
+        # arguments correctly on Apple Silicon.
+        graphics.CGEventCreateScrollWheelEvent2.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+        ]
+        graphics.CGEventCreateScrollWheelEvent2.restype = ctypes.c_void_p
+        graphics.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        graphics.CFRelease = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        ).CFRelease
+        graphics.CFRelease.argtypes = [ctypes.c_void_p]
         _coreaudio = audio
         _coregraphics = graphics
     return _coreaudio, _coregraphics
@@ -1443,7 +1449,7 @@ def choose_delivery(
         return {"mode": "bridge", "pid": session["pid"], "port": port, "focused_text": text_role}
 
     def paste(pid: int | None = None) -> dict:
-        return {"mode": "paste", "pid": pid, "port": None, "focused_text": text_role}
+        return {"mode": "paste", "pid": pid, "port": None, "focused_text": text_role, "app": focus.get("app") if focus else None}
 
     if text_role:
         matches = [session for session in usable if tty and session["tty"] == tty]
@@ -1831,34 +1837,6 @@ def unmute_async() -> None:
         log_once("unmute", f"unmute_async failed: {exc}")
 
 
-def output_volume() -> int | None:
-    """Current system output volume percent, or None when the probe fails."""
-    try:
-        res = subprocess.run(
-            ["/usr/bin/osascript", "-e", "output volume of (get volume settings)"],
-            capture_output=True,
-            text=True,
-            timeout=OSASKA_PROBE_TIMEOUT_SECONDS,
-            check=False,
-        )
-        value = int((res.stdout or "").strip())
-        return value if 0 <= value <= 100 else None
-    except Exception as exc:
-        log_once("volume-probe", f"output_volume failed: {exc}")
-        return None
-
-
-def _ramp_output_volume(start_pct: int, target_pct: int) -> None:
-    """Move the output volume in DUCK_RAMP_STEPS writes instead of one jump."""
-    if start_pct == target_pct:
-        return
-    for i in range(1, DUCK_RAMP_STEPS + 1):
-        step_pct = start_pct + (target_pct - start_pct) * i // DUCK_RAMP_STEPS
-        _run_osascript(f"set volume output volume {step_pct}")
-        if i < DUCK_RAMP_STEPS:
-            time.sleep(DUCK_RAMP_STEP_DELAY_SECONDS)
-
-
 def _duck_transaction_path() -> Path:
     """On-disk record of an outstanding duck so a restart can reconcile it."""
     return STATE_DIR / "duck-state.json"
@@ -1869,7 +1847,6 @@ def _save_duck_transaction(state: "MicState") -> None:
         _duck_transaction_path().write_text(
             json.dumps(
                 {
-                    "original": state.tts_duck_restore,
                     "target": state.tts_duck_target,
                     "state": state.tts_duck_state,
                     "ducked_at": state.tts_duck_at,
@@ -1888,14 +1865,6 @@ def _clear_duck_transaction() -> None:
         pass
 
 
-def stream_player_enabled() -> bool:
-    """True when VoiceBox clips play through `voice-play`, the gain-controlled
-    player. macOS exposes no per-process output volume, so per-stream gain in
-    our own player is the only way to duck the reply without touching YouTube
-    or any other application's level."""
-    return os.environ.get("OMP_VOICE_STREAM_PLAYER", "").strip() == "1"
-
-
 def _stream_gain_path() -> Path:
     return STATE_DIR / "stream-gain.json"
 
@@ -1911,18 +1880,15 @@ def write_stream_gain(gain: float) -> bool:
 
 
 def duck_output_volume(state: "MicState") -> None:
-    """Attenuate the assistant reply while a barge hold is open.
+    """Attenuate only the VoiceBox reply while a barge hold is open.
 
-    The held clip is the evidence Whisper judges; a ducked speaker makes it
-    mostly the person instead of the reply. With the `voice-play` player the
-    gain file attenuates only the VoiceBox stream; otherwise the macOS master
-    volume is used, which also silences unrelated applications. The original
-    level is restored on release or stop. No-op when OMP_VOICE_DUCK_VOLUME is
-    unset.
+    Replies play through `voice-play`, which reads the stream gain file, so
+    YouTube and every other app keep their level. The macOS master volume is
+    never written. No-op when OMP_VOICE_DUCK_VOLUME is unset.
     """
     global _duck_ratio
     target = os.environ.get("OMP_VOICE_DUCK_VOLUME", "")
-    if not target or state.tts_duck_restore is not None or state.tts_stream_gain is not None:
+    if not target or state.tts_stream_gain is not None:
         return
     # A synthetic burst is speaker audio too, so ducking would mute it along
     # with the reply. Harnesses that interrupt through the speakers write this
@@ -1933,177 +1899,68 @@ def duck_output_volume(state: "MicState") -> None:
         target_pct = max(0, min(100, int(target)))
     except ValueError:
         return
-    if stream_player_enabled():
-        # Stream gain is relative to full clip level; the adaptive and bounds
-        # rules carry over with the master volume out of the picture.
-        gain = target_pct / 100.0
-        if 1.0 - gain < DUCK_MIN_ATTENUATION:
-            log(f"stream duck skipped: gain {gain} is under the minimum attenuation")
-            return
-        if state.echo_full_gain > 0.0 and state.echo_full_gain <= DUCK_AMBIENT_DOMINANCE * max(state.ambient_short, 40.0):
-            gain = (1.0 + gain) / 2.0
-        if not write_stream_gain(gain):
-            return
-        state.tts_stream_gain = gain
-        state.tts_duck_target = target_pct
-        state.tts_duck_state = "ducked"
-        state.tts_duck_attempts = 0
-        state.tts_duck_retry_at = 0.0
-        state.tts_duck_at = time.monotonic()
-        state.barge_stages["duck"] = state.tts_duck_at
-        _duck_ratio = gain
-        _save_duck_transaction(state)
-        log(f"ducked VoiceBox stream gain 1.0 -> {gain:.2f} (master volume untouched)")
-        barge_note(state, "duck", to_volume=int(gain * 100))
+    gain = target_pct / 100.0
+    if 1.0 - gain < DUCK_MIN_ATTENUATION:
+        log(f"stream duck skipped: gain {gain} is under the minimum attenuation")
         return
-    current = output_volume()
-    if current is None or current <= target_pct:
-        return
-    # Explicit bounds (spec §3): an attenuation below DUCK_MIN_ATTENUATION is
-    # inaudible and pointless, and ducking below DUCK_MAX_ATTENUATION of the
-    # current level risks intelligibility with no measured echo benefit.
-    target_pct = max(target_pct, int(current * (1.0 - DUCK_MAX_ATTENUATION) + 1e-9))
-    if current - target_pct < current * DUCK_MIN_ATTENUATION:
-        log(f"duck skipped: {current} -> {target_pct} is under the minimum attenuation")
-        return
-    # Adaptive depth (spec §3): the environment decides how far to duck.
-    # While the echo estimate sits at or below the measured ambient level,
-    # room noise, not speaker bleed, limits what the mic hears, and a deep
-    # duck has no measured benefit — duck only halfway toward the anchor.
-    # Before either estimate exists, fall back to the anchor percentage.
     if state.echo_full_gain > 0.0 and state.echo_full_gain <= DUCK_AMBIENT_DOMINANCE * max(state.ambient_short, 40.0):
-        target_pct = max(target_pct, (current + target_pct) // 2)
-    _ramp_output_volume(current, target_pct)
-    state.tts_duck_restore = current
+        gain = (1.0 + gain) / 2.0
+    if not write_stream_gain(gain):
+        return
+    state.tts_stream_gain = gain
     state.tts_duck_target = target_pct
     state.tts_duck_state = "ducked"
     state.tts_duck_attempts = 0
     state.tts_duck_retry_at = 0.0
     state.tts_duck_at = time.monotonic()
     state.barge_stages["duck"] = state.tts_duck_at
-    _duck_ratio = target_pct / current if current > 0 else 1.0
+    _duck_ratio = gain
     _save_duck_transaction(state)
-    log(f"ducked output volume {current} -> {target_pct}")
-    barge_note(state, "duck", from_volume=current, to_volume=target_pct)
+    log(f"ducked VoiceBox stream gain 1.0 -> {gain:.2f} (master volume untouched)")
+    barge_note(state, "duck", to_volume=int(gain * 100))
 
 
 def restore_output_volume(state: "MicState", now: float | None = None) -> bool:
-    """Bring the volume back to the pre-duck value and verify it by reading.
+    """Put the VoiceBox stream gain back to 1.0.
 
-    Idempotent and retryable: a failed attempt leaves the transaction pending
-    with a bounded backoff rather than clearing the state, so the main loop
-    can reconcile it later. A volume set by someone else mid-duck is honoured
-    instead of overwritten. Returns True only once the restored volume is
-    actually verified.
+    Retryable: a failed write leaves the transaction pending with a bounded
+    backoff. Returns True once the gain file reads full volume again.
     """
     global _duck_ratio
     now = time.monotonic() if now is None else now
-    if state.tts_stream_gain is not None:
-        # Stream duck: the gain file is the whole state; writing 1.0 back is
-        # the verification (the player reads it every chunk).
-        if now < state.tts_duck_retry_at:
-            return False
-        if not write_stream_gain(1.0):
-            state.tts_duck_attempts += 1
-            state.tts_duck_retry_at = now + min(
-                DUCK_RETRY_MAX_SECONDS, DUCK_RETRY_BASE_SECONDS * 2 ** (state.tts_duck_attempts - 1)
-            )
-            log("stream gain restore failed; retry with backoff")
-            _save_duck_transaction(state)
-            return False
-        state.tts_stream_gain = None
-        state.tts_duck_target = None
-        state.tts_duck_state = "normal"
-        state.tts_duck_attempts = 0
-        state.tts_duck_retry_at = 0.0
-        _duck_ratio = 1.0
-        log("restored VoiceBox stream gain to 1.0")
-        barge_note(state, "duck_restore", to_volume=100)
-        _clear_duck_transaction()
-        return True
-    if state.tts_duck_restore is None:
+    if state.tts_stream_gain is None:
         return True
     if now < state.tts_duck_retry_at:
         return False
-    previous = state.tts_duck_restore
-    target = state.tts_duck_target if state.tts_duck_target is not None else 0
-    current = output_volume()
-    if current is None:
+    if not write_stream_gain(1.0):
         state.tts_duck_state = "restore_pending"
         state.tts_duck_attempts += 1
         state.tts_duck_retry_at = now + min(
             DUCK_RETRY_MAX_SECONDS, DUCK_RETRY_BASE_SECONDS * 2 ** (state.tts_duck_attempts - 1)
         )
-        log(f"volume restore unverified: probe failed, retry in {state.tts_duck_retry_at - now:.1f}s")
+        log("stream gain restore failed; retry with backoff")
         _save_duck_transaction(state)
         return False
-    if abs(current - previous) <= 1:
-        expected = previous  # already back; verify once
-    elif current <= target + 1:
-        _ramp_output_volume(current, previous)
-        expected = previous
-    else:
-        # Someone changed the output volume between the duck and this restore:
-        # honour that setting instead of blindly overwriting the pre-duck value.
-        log(f"output volume {current} differs from duck baseline {previous}; keeping user setting")
-        expected = current
-    verified = output_volume()
-    if verified is None or abs(verified - expected) > 1:
-        state.tts_duck_state = "restore_pending"
-        state.tts_duck_attempts += 1
-        state.tts_duck_retry_at = now + min(
-            DUCK_RETRY_MAX_SECONDS, DUCK_RETRY_BASE_SECONDS * 2 ** (state.tts_duck_attempts - 1)
-        )
-        log(
-            f"volume restore unverified (read {verified}, expected {expected}); "
-            f"retry in {state.tts_duck_retry_at - now:.1f}s"
-        )
-        _save_duck_transaction(state)
-        return False
-    state.tts_duck_restore = None
+    state.tts_stream_gain = None
     state.tts_duck_target = None
     state.tts_duck_state = "normal"
     state.tts_duck_attempts = 0
     state.tts_duck_retry_at = 0.0
-    _duck_ratio = verified / previous if previous > 0 else 1.0
-    log(f"restored output volume {verified}")
-    barge_note(state, "duck_restore", to_volume=verified)
+    _duck_ratio = 1.0
+    log("restored VoiceBox stream gain to 1.0")
+    barge_note(state, "duck_restore", to_volume=100)
     _clear_duck_transaction()
     return True
 
 
 def reconcile_duck_state() -> None:
-    """Recover a duck left outstanding by a previous controller process."""
+    """Recover a stream duck left outstanding by a previous controller process."""
     path = _duck_transaction_path()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+    if not path.exists():
         return
-    original = data.get("original")
-    target = data.get("target")
-    if isinstance(data.get("stream_gain"), (int, float)):
-        # A stream duck outlived its controller: put the gain back and drop
-        # the transaction. No master volume is involved.
-        write_stream_gain(1.0)
+    if write_stream_gain(1.0):
         path.unlink(missing_ok=True)
         log("recovered stream duck from a previous run: gain back to 1.0")
-        return
-    if not isinstance(original, int) or not 0 <= original <= 100:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return
-    current = output_volume()
-    if current is None:
-        return  # leave the transaction on disk; the next start retries
-    if abs(current - original) <= 1:
-        path.unlink(missing_ok=True)
-        return
-    if isinstance(target, int) and current <= target + 1:
-        _ramp_output_volume(current, original)
-        log(f"recovered duck state from a previous run: volume {current} -> {original}")
-    path.unlink(missing_ok=True)
 
 
 def handy_process_running() -> bool:
@@ -2192,85 +2049,11 @@ def handy_cancel(allow_launch: bool = False) -> bool:
     return handy_exec("--cancel", allow_launch=allow_launch)
 
 
-HANDY_MODEL_QUALITY = "handy-computer/Qwen3-ASR-1.7B-gguf/Qwen3-ASR-1.7B-Q8_0.gguf"
-HANDY_MODEL_LIGHT = "handy-computer/Qwen3-ASR-0.6B-gguf/Qwen3-ASR-0.6B-Q8_0.gguf"
-STRATA_STATE = Path.home() / ".local/state/strata/omp-autostart.json"
-# threading.Event, not a bare bool: _watch_strata writes it from a background
-# thread while the mic loop reads it. All access goes through the event.
-_handy_on_light = False
-_voicebox_want: bool | None = None
-_voicebox_ok = False
-_voicebox_retry_at = 0.0
-VOICEBOX_HEALTH_RETRY_SECONDS = 5.0
-
-
-def sync_speech_tier(now: float) -> None:
-    """Keep Handy on the Strata tier. Ask VoiceBox again 5 s after a refusal.
-
-    File mode must not get here: apply_handy_model kills the shared Handy app.
-
-    A down VoiceBox used to invert the Handy flag, so the next mic frame tried
-    again. That was a health check and a log line about twelve times a second.
-    """
-    if handy_file_mode():
-        return
-    global _voicebox_want, _voicebox_ok, _voicebox_retry_at
-    strata_running = _strata_loaded.is_set()
-    if strata_running != _handy_on_light:
-        apply_handy_model(strata_running)
-    if strata_running != _voicebox_want:
-        _voicebox_want = strata_running
-        _voicebox_ok = False
-        _voicebox_retry_at = 0.0
-        _logged_once.discard("voicebox-health")
-    if _voicebox_ok or now < _voicebox_retry_at:
-        return
-    if apply_voicebox_model(strata_running):
-        _voicebox_ok = True
-        _logged_once.discard("voicebox-health")
-        return
-    _voicebox_retry_at = now + VOICEBOX_HEALTH_RETRY_SECONDS
-
-
-def strata_loaded() -> bool:
-    """True only while the local Strata engine is the running model."""
-    try:
-        raw = json.loads(STRATA_STATE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return raw.get("engine") == "flash"
-
-
-def _set_strata_loaded(loaded: bool) -> None:
-    if loaded:
-        _strata_loaded.set()
-    else:
-        _strata_loaded.clear()
-
-
-def _watch_strata() -> None:
-    """Block on the state file. A start or stop is the only time this wakes."""
-    while _daemon_running.is_set():
-        _set_strata_loaded(strata_loaded())
-        try:
-            fd = os.open(STRATA_STATE, os.O_EVTONLY)
-        except OSError:
-            time.sleep(5)
-            continue
-        try:
-            kq = select.kqueue()
-            event = select.kevent(
-                fd,
-                filter=select.KQ_FILTER_VNODE,
-                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_ATTRIB | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE,
-            )
-            kq.control([event], 0)
-            kq.control(None, 1)
-        except OSError:
-            time.sleep(5)
-        finally:
-            os.close(fd)
+# One Handy model for the life of the controller. Swapping models on every
+# Strata load/unload killed Handy mid-dictation and made VoiceBox answer the
+# first request after each swap with HTTP 500. Qwen3.8 Flash-Next is the
+# resident worker, so the tiers never bought memory back in practice.
+HANDY_MODEL = "handy-computer/Qwen3-ASR-1.7B-gguf/Qwen3-ASR-1.7B-Q8_0.gguf"
 
 
 def handy_file_mode() -> bool:
@@ -2347,57 +2130,24 @@ def handy_model_id() -> str:
         return ""
 
 
-def apply_voicebox_model(strata_running: bool) -> bool:
-    """0.6B while Strata is resident. 1.7B on the GPU when it is not."""
-    size = "0.6B" if strata_running else "1.7B"
-    drop = "qwen-tts-1.7B" if strata_running else "qwen-tts-0.6B"
-    marker = STATE_DIR / "tts-model"
-    loaded = ""
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:17493/health", timeout=2) as res:
-            loaded = str(json.loads(res.read().decode()).get("model_size") or "")
-    except (OSError, ValueError, json.JSONDecodeError):
-        log_once("voicebox-health", "VoiceBox health unread; speech tier not changed")
-        return False
-    if loaded == size:
-        marker.write_text(size + "\n", encoding="utf-8")
-        return True
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(f"http://127.0.0.1:17493/models/{drop}/unload", method="POST"),
-            timeout=60,
-        )
-        urllib.request.urlopen(
-            urllib.request.Request(
-                f"http://127.0.0.1:17493/models/load?model_size={size}",
-                method="POST",
-            ),
-            timeout=180,
-        )
-    except (OSError, urllib.error.URLError) as exc:
-        log(f"VoiceBox model switch to {size} failed: {exc}")
-        return False
-    marker.write_text(size + "\n", encoding="utf-8")
-    log(f"VoiceBox model -> {size} ({'Strata loaded' if strata_running else 'Strata stopped'})")
-    return True
+def ensure_handy_model(settings_changed: bool = False) -> None:
+    """Select HANDY_MODEL once at controller start. Never called while dictating.
 
-
-def apply_handy_model(strata_running: bool) -> None:
-    """1.7B by default. 0.6B only while Strata is resident."""
-    global _handy_on_light
-    want = HANDY_MODEL_LIGHT if strata_running else HANDY_MODEL_QUALITY
-    if handy_model_id() == want:
-        _handy_on_light = strata_running
+    Handy reads settings_store.json only at launch, so any change made at
+    startup (model or overlay) needs one restart here.
+    """
+    if handy_model_id() != HANDY_MODEL:
+        try:
+            raw = json.loads(HANDY_SETTINGS.read_text(encoding="utf-8"))
+            raw.setdefault("settings", {})["selected_model"] = HANDY_MODEL
+            HANDY_SETTINGS.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            log(f"Could not set Handy model: {exc}")
+            return
+        settings_changed = True
+    if not settings_changed:
         return
-    try:
-        raw = json.loads(HANDY_SETTINGS.read_text(encoding="utf-8"))
-        raw.setdefault("settings", {})["selected_model"] = want
-        HANDY_SETTINGS.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        log(f"Could not set Handy model: {exc}")
-        return
-    _handy_on_light = strata_running
-    log(f"Handy model -> {want} ({'Strata loaded' if strata_running else 'Strata stopped'})")
+    log(f"Handy settings changed (model {HANDY_MODEL}); restarting Handy once to load them")
     subprocess.run(["/usr/bin/pkill", "-f", "Handy.app/Contents/MacOS/handy"], check=False)
     time.sleep(0.4)
     subprocess.Popen(
@@ -2633,30 +2383,6 @@ def match_command(raw: str, grammar: dict | None = None) -> dict | None:
         return None
     best.pop("span")
     return best
-
-
-def shield_live_command_word(shown: str) -> str:
-    """Keep a one-word command visible in the live field.
-
-    The bridge drops a final token of "pause" or "stop" and runs that command.
-    It also strips .,!?;: before that match, so "pause." is the same command.
-    A word joiner on the command word is not displayed and does not match the slot.
-    """
-    tokens = shown.split()
-    if not tokens:
-        return shown
-    last = tokens[-1]
-    core = re.sub(r"[.,!?;:]+$", "", last)
-    if not core:
-        return shown
-    trail = last[len(core) :]
-    matched = match_command(core)
-    if not matched or matched["prefix"] or len(matched["phrase"].split()) != 1:
-        return shown
-    if matched["phrase"] != core.lower():
-        return shown
-    tokens[-1] = core + "\u2060" + trail
-    return " ".join(tokens)
 
 
 def canonicalize_transcript(text: str) -> str:
@@ -2919,12 +2645,41 @@ def consume_preserved_for_send(original: str, *, editor_has_it: bool) -> str:
     return combined
 
 
-def paste_into_focus(original: str, preserved: str = "") -> dict:
+# Chunks this controller pasted into a non-omp text box, newest last, with the
+# app they went to. "Scratch that" and "clear draft" there have no editor API,
+# so they undo exactly these characters with backspace, and only while the same
+# app is still in front.
+_pasted_chunks: list[tuple[str | None, str]] = []
+
+
+def _backspace(count: int) -> None:
+    if count > 0:
+        _run_osascript(f'tell application "System Events" to repeat {count} times\nkey code 51\nend repeat')
+
+
+def _undo_pasted(app: str | None, action: str) -> int:
+    """Delete the last pasted chunk (scratch) or every chunk (clear) in `app`."""
+    if not _pasted_chunks or _pasted_chunks[-1][0] != app:
+        _pasted_chunks.clear()
+        return 0
+    if action == "scratched":
+        _, typed = _pasted_chunks.pop()
+        count = len(typed)
+    else:
+        count = sum(len(typed) for _, typed in _pasted_chunks)
+        _pasted_chunks.clear()
+    _backspace(count)
+    log(f"Focus {action}: removed {count} pasted chars from {app!r}")
+    return count
+
+
+def paste_into_focus(original: str, preserved: str = "", app: str | None = None) -> dict:
     plan = focused_paste_plan(original)
     if plan["action"] == "sent":
         text = with_preserved_draft(plan["text"], preserved)
         log(f"Submitted draft: {text!r}")
         landed = fallback_macos_inject(text, "sent")
+        _pasted_chunks.clear()
         if landed is False:
             log(f"Send into focus UNVERIFIED: keystroke sent but draft not seen in the field")
         return {
@@ -2935,6 +2690,8 @@ def paste_into_focus(original: str, preserved: str = "") -> dict:
             "verified": landed,
         }
     if plan["action"] != "appended":
+        if plan["action"] in ("scratched", "cleared"):
+            _undo_pasted(app, plan["action"])
         return {
             "action": plan["action"],
             "draft": "",
@@ -2945,6 +2702,10 @@ def paste_into_focus(original: str, preserved: str = "") -> dict:
     landed = fallback_macos_inject(typed, "appended")
     if landed is False:
         log(f"Paste into focus UNVERIFIED: {typed!r} never reached the field")
+    elif typed:
+        if _pasted_chunks and _pasted_chunks[-1][0] != app:
+            _pasted_chunks.clear()
+        _pasted_chunks.append((app, typed))
     return {"action": "appended", "draft": plan["text"], "via": "focus", "verified": landed}
 
 
@@ -3048,6 +2809,39 @@ def _hold_failed_send(prefix: str) -> dict:
     return {"action": "held", "draft": _visible_hold()}
 
 
+# "scroll up", "scroll down a lot", "hey jarvis scroll down": scrolls the
+# window under the pointer in any app. Lines per command, by size word.
+_SCROLL_RE = re.compile(
+    r"^(?:(?:hey|ok|okay)\s+)?(?:jarvis\s+)?(?:please\s+)?scroll\s+(up|down)(?:\s+(a\s+lot|more|a\s+little|a\s+bit|a\s+page))?$"
+)
+_SCROLL_LINES = {None: 8, "more": 15, "a lot": 30, "a page": 20, "a little": 3, "a bit": 3}
+
+
+def scroll_command(text: str) -> tuple[str, int] | None:
+    words = re.sub(r"[^a-z\s]", " ", text.lower())
+    m = _SCROLL_RE.match(" ".join(words.split()))
+    if not m:
+        return None
+    size = " ".join(m.group(2).split()) if m.group(2) else None
+    return m.group(1), _SCROLL_LINES[size]
+
+
+def scroll_focus(direction: str, lines: int) -> bool:
+    """Post line-unit scroll-wheel events (kCGHIDEventTap) at the pointer."""
+    try:
+        _, graphics = _load_macos_frameworks()
+        delta = lines if direction == "up" else -lines
+        event = graphics.CGEventCreateScrollWheelEvent2(None, 1, 1, delta, 0, 0)
+        if not event:
+            return False
+        graphics.CGEventPost(0, event)
+        graphics.CFRelease(event)
+        return True
+    except Exception as exc:
+        log(f"scroll failed: {exc}")
+        return False
+
+
 def dispatch_transcript(text: str) -> dict:
     """Paste into the focused text control, or send to the newest omp when focus is not text.
 
@@ -3057,6 +2851,11 @@ def dispatch_transcript(text: str) -> dict:
     original = " ".join(text.strip().split())
     if not original:
         return {"action": "noop", "draft": ""}
+    scroll = scroll_command(original)
+    if scroll:
+        ok = scroll_focus(*scroll)
+        log(f"Scrolled {scroll[0]} {scroll[1]} lines (ok={ok}) for {original!r}")
+        return {"action": "scrolled", "draft": ""}
 
     try:
         dest = resolve_delivery()
@@ -3089,13 +2888,13 @@ def dispatch_transcript(text: str) -> dict:
         if matched_now and matched_now["action"] == "sent":
             kept = PRESERVED_PAUSE
             original = consume_preserved_for_send(original, editor_has_it=False)
-            result = paste_into_focus(original)
+            result = paste_into_focus(original, app=dest.get("app"))
             if result.get("action") == "sent" and base and kept.strip():
                 draft = bridge_draft(base)
                 if " ".join(draft.split()).lower() == " ".join(kept.split()).lower():
                     bridge_request("/transcript", method="POST", body={"text": "clear draft"}, base=base)
             return result
-        return paste_into_focus(original)
+        return paste_into_focus(original, app=dest.get("app"))
 
     if matched_now and matched_now["action"] == "sent" and PRESERVED_PAUSE.strip():
         base_for_draft = bridge_base(dest) if dest.get("port") else session_bridge_base(dest)
@@ -3198,7 +2997,7 @@ def dispatch_transcript(text: str) -> dict:
         return {"action": "held", "draft": held}
 
     if dest.get("focused_text"):
-        return paste_into_focus(original)
+        return paste_into_focus(original, app=dest.get("app"))
 
     matched = match_command(cleaned)
     if matched and matched["action"] == "cancelled":
@@ -3225,10 +3024,10 @@ def dispatch_transcript(text: str) -> dict:
     return {"action": "appended", "draft": cleaned}
 
 
-def configure_handy_settings() -> None:
-    """Ensure Handy keeps its ASR model warm and uses standard ctrl_v paste."""
+def configure_handy_settings() -> bool:
+    """Ensure Handy keeps its ASR model warm and never pastes itself. True if the file changed."""
     if not HANDY_SETTINGS.exists():
-        return
+        return False
     try:
         raw = json.loads(HANDY_SETTINGS.read_text(encoding="utf-8"))
         settings = raw.get("settings", {})
@@ -3251,11 +3050,18 @@ def configure_handy_settings() -> None:
             # Release must end the take.
             settings["shortcut_activation"] = "push_to_talk"
             changed = True
+        if settings.get("overlay_style") != "minimal":
+            # The live overlay shows a rough streaming preview; the owner finds
+            # it distracting. Minimal still shows that Handy is recording.
+            settings["overlay_style"] = "minimal"
+            changed = True
         if changed:
             HANDY_SETTINGS.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-            log("Updated Handy settings (mute_while_recording=False, model_unload_timeout=hour1, paste_method=none)")
+            log("Updated Handy settings (mute_while_recording=False, model_unload_timeout=hour1, paste_method=none, overlay_style=minimal)")
+        return changed
     except Exception as exc:
         log(f"Warning: could not update Handy settings: {exc}")
+        return False
 
 
 def tts_wake_threshold() -> float:
@@ -3392,9 +3198,6 @@ class MicState:
     idle_silence_frames: int = 0
     checked_fast_cmd: bool = False
     pending_fast_flush: bool = False
-    partial_sent_frames: int = 0
-    partial_shown: str = ""
-    partial_base: str = ""
     on_headphones: bool = False
     whisper_pending: dict | None = None
     idle_verify_next: tuple | None = None
@@ -3424,8 +3227,7 @@ class MicState:
     barge_stages: dict[str, float] = field(default_factory=dict)  # spec §8 latency chain
     tts_barge_voice: bool = False
     tts_barge_quiet: int = 0
-    # System output volume captured when a barge hold ducks the speaker.
-    tts_duck_restore: int | None = None
+    # Set while a barge hold ducks the VoiceBox stream (see tts_stream_gain).
     tts_duck_at: float | None = None
     tts_duck_target: int | None = None
     tts_duck_state: str = "normal"  # normal | ducked | restore_pending
@@ -3469,7 +3271,7 @@ class MicState:
             "stop_latency_s": round(self.stop_latency_s, 3) if self.stop_latency_s > 0 else None,
         }
 
-    def kick_whisper(self, jobs: queue.Queue, kind: str, audio_f32: np.ndarray, prompt: str) -> bool:
+    def kick_whisper(self, jobs: queue.Queue, kind: str, audio_f32: np.ndarray, prompt: str | None) -> bool:
         """Queue one clip. Return False if a clip is already in flight (do not block the mic loop)."""
         if self.whisper_pending is not None:
             if kind == "tts_barge":
@@ -3518,53 +3320,6 @@ class MicState:
         self.idle_verify_next = (audio, prompt)
         return False
 
-    def show_closing_partial(self, jobs: queue.Queue) -> None:
-        """Write the latest words before the flush line.
-
-        Live partials are kicked only while speech frames are still arriving.
-        The last word often lands in the silence that starts the flush, so
-        the field would otherwise keep the older prefix. This runs on the
-        frame-consumer thread: it never blocks on a Whisper job that is
-        already in flight, and the wait for a free worker is bounded.
-        """
-        spoken = len(self.dict_speech_frames)
-        if spoken < 6 or spoken - self.partial_sent_frames < 4:
-            return
-        if self.whisper_pending is not None:
-            log("whisper busy; skipped closing partial")
-            return
-        window = self.dict_speech_frames[-75:]
-        try:
-            audio_i16 = np.concatenate(window)
-            if float(np.max(np.abs(audio_i16))) < 350.0:
-                return
-            audio_f32 = clip_for_whisper(audio_i16.astype(np.float32) / 32768.0, 5.0)
-            slot: queue.Queue = queue.Queue(maxsize=1)
-            jobs.put_nowait({"audio": audio_f32, "prompt": "A person dictating a sentence.", "slot": slot})
-            heard = str(slot.get(timeout=CLOSING_PARTIAL_WAIT_SECONDS))
-        except Exception:
-            return
-        if not heard.strip():
-            return
-        log(f"Partial transcript: {heard.strip()!r}")
-        self.show_partial(heard)
-        self.partial_sent_frames = spoken
-
-    def maybe_emit_partial(self, jobs: queue.Queue) -> None:
-        """Transcribe the open chunk while speech continues. Do not flush Handy."""
-        spoken = len(self.dict_speech_frames)
-        if spoken < 18 or spoken - self.partial_sent_frames < 18:
-            return
-        if self.whisper_pending is not None:
-            return
-        window = self.dict_speech_frames[-75:]
-        audio_i16 = np.concatenate(window)
-        if float(np.max(np.abs(audio_i16))) < 350.0:
-            return
-        audio_f32 = clip_for_whisper(audio_i16.astype(np.float32) / 32768.0, 5.0)
-        if self.kick_whisper(jobs, "partial", audio_f32, "A person dictating a sentence."):
-            self.partial_sent_frames = spoken
-
     def take_whisper(self) -> tuple[str, str] | None:
         if self.whisper_pending is None:
             return None
@@ -3607,7 +3362,6 @@ class MicState:
         self.idle_speech_frames.clear()
         self.dict_tail_frames.clear()
         self.dict_speech_frames.clear()
-        self.partial_sent_frames = 0
         self.checked_fast_cmd = False
         self.pending_fast_flush = False
         self.idle_in_speech = False
@@ -3631,8 +3385,6 @@ class MicState:
             ).start()
         self.forget_handy_window()
         self.state = "DICTATING"
-        self.partial_shown = ""
-        self.partial_base = ""
         self.speech_seen_in_chunk = False
         self.chunk_started_at = time.monotonic()
         self.last_speech_at = self.chunk_started_at
@@ -3716,69 +3468,30 @@ class MicState:
         vad.reset_states()
         self.dict_tail_frames.clear()
         self.dict_speech_frames.clear()
-        self.partial_sent_frames = 0
-        self.partial_shown = ""
-        self.partial_base = ""
         self.speech_seen_in_chunk = False
         self.cooldown_until = time.monotonic() + cooldown
         write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
 
-    def _partial_bridge(self) -> str | None:
-        try:
-            dest = resolve_delivery()
-        except Exception as exc:
-            log(f"Partial field lookup failed ({exc})")
-            return None
-        if dest.get("mode") != "bridge" or not dest.get("focused_text"):
-            log(f"Partial field skipped ({dest.get('mode')}, focused={dest.get('focused_text')})")
-            return None
-        return bridge_base(dest)
-
-    def show_partial(self, heard: str) -> None:
-        """Replace the live partial in the focused editor. One copy, not a growing stack."""
-        shown = " ".join(heard.strip().split())
-        matched = match_command(shown)
-        # A one-word command is also an ordinary last word ("pause").
-        # Leave it in the live field. A longer command ("send that") is still stripped.
-        if matched and len(matched["phrase"].split()) > 1:
-            shown = " ".join(matched["prefix"].split()).strip()
-        shown = shield_live_command_word(shown)
-        if not shown or shown == self.partial_shown:
-            return
-        base = self.partial_base or self._partial_bridge()
-        if not base:
-            return
-        if self.partial_shown:
-            undone = bridge_request("/transcript", method="POST", body={"text": "scratch that"}, base=base)
-            if not undone or undone.get("action") != "scratched":
-                log(f"Partial field scratch failed: {undone}")
-                return
-            self.partial_shown = ""
-        resp = bridge_request("/transcript", method="POST", body={"text": shown}, base=base)
-        if resp and resp.get("action") == "appended":
-            self.partial_shown = shown
-            self.partial_base = base
-            log(f"Partial written to focused field: {shown!r}")
-        else:
-            log(f"Partial field write failed: {resp}")
-
-    def retract_partial(self) -> None:
-        """Drop the live partial so the final Handy transcript is the only draft.
-
-        Handy steals focus while it flushes, so this uses the bridge that
-        wrote the partial instead of looking up focus again.
-        """
-        if not self.partial_shown or not self.partial_base:
-            return
-        undone = bridge_request(
-            "/transcript", method="POST", body={"text": "scratch that"}, base=self.partial_base
+    def barge_stop(self, message: str, heard: str, **note) -> None:
+        """Stop the reply now: kill playback, restore volume, record latency."""
+        self.tts_barge_held = False
+        self.tts_barge_waiting = False
+        self.tts_barge_next = None
+        self.tts_stop_frames.clear()
+        died_at = stop_playback(message)
+        restore_output_volume(self)
+        latency = (
+            round(died_at - self.barge_onset_mono, 3)
+            if died_at is not None and self.barge_onset_mono
+            else None
         )
-        if undone and undone.get("action") == "scratched":
-            log(f"Partial removed before final send: {self.partial_shown!r}")
-            self.partial_shown = ""
-            self.partial_base = ""
-        else:
-            log(f"Partial retract failed: {undone}")
+        if latency is not None:
+            self.stop_latency_s = latency
+        barge_note(self, "stop_playback", latency_s=latency, text=heard, **note)
+        self.note_barge_latency(died_at)
+        self.tts_loud_run = 0
+        self.tts_rms_floor.clear()
+        self.tts_active = False
 
     def apply_whisper(self, heard_kind: str, heard: str, oww, vad, jobs=None) -> bool:
         """Handle one finished Whisper clip. True means skip the rest of this iteration."""
@@ -3790,24 +3503,7 @@ class MicState:
             self.barge_stages["decision"] = time.monotonic()
             barge_note(self, "whisper_partial", text=heard, barge=_is_playback_barge(stop_tokens))
             if _is_playback_barge(stop_tokens):
-                self.tts_barge_held = False
-                self.tts_barge_waiting = False
-                self.tts_barge_next = None
-                self.tts_stop_frames.clear()
-                died_at = stop_playback(f"Heard {heard!r} (partial) over TTS -> stopping speech, not opening Handy")
-                restore_output_volume(self)
-                latency = (
-                    round(died_at - self.barge_onset_mono, 3)
-                    if died_at is not None and self.barge_onset_mono
-                    else None
-                )
-                if latency is not None:
-                    self.stop_latency_s = latency
-                barge_note(self, "stop_playback", latency_s=latency, text=heard, partial=True)
-                self.note_barge_latency(died_at)
-                self.tts_loud_run = 0
-                self.tts_rms_floor.clear()
-                self.tts_active = False
+                self.barge_stop(f"Heard {heard!r} (partial) over TTS -> stopping speech, not opening Handy", heard, partial=True)
                 return True
             nxt = self.tts_barge_next
             if nxt is not None and jobs is not None:
@@ -3825,24 +3521,7 @@ class MicState:
             self.barge_stages["decision"] = time.monotonic()
             barge_note(self, "whisper", text=heard, barge=_is_playback_barge(stop_tokens))
             if _is_playback_barge(stop_tokens):
-                self.tts_barge_held = False
-                self.tts_barge_waiting = False
-                self.tts_barge_next = None
-                # Boundary: barge hold opened -> clip process confirmed dead.
-                died_at = stop_playback(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy")
-                restore_output_volume(self)
-                latency = (
-                    round(died_at - self.barge_onset_mono, 3)
-                    if died_at is not None and self.barge_onset_mono
-                    else None
-                )
-                if latency is not None:
-                    self.stop_latency_s = latency
-                barge_note(self, "stop_playback", latency_s=latency, text=heard)
-                self.note_barge_latency(died_at)
-                self.tts_loud_run = 0
-                self.tts_rms_floor.clear()
-                self.tts_active = False
+                self.barge_stop(f"Heard {heard!r} over TTS -> stopping speech, not opening Handy", heard)
                 return True
             nxt = self.tts_barge_next
             self.tts_barge_next = None
@@ -3881,10 +3560,7 @@ class MicState:
                 play_cue(SOUND_CANCEL, wait=False)
                 self.cooldown_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
         elif heard_kind == "fast_cmd" and self.state == "DICTATING":
-            self.pending_fast_flush = bool(match_command(heard))
-        elif heard_kind == "partial" and self.state == "DICTATING" and heard.strip():
-            log(f"Partial transcript: {heard.strip()!r}")
-            self.show_partial(heard)
+            self.pending_fast_flush = bool(match_command(heard) or scroll_command(heard))
         return False
 
     def update_acoustic_estimates(self, rms: float, vad_score: float) -> None:
@@ -4014,9 +3690,7 @@ class MicState:
     def handle_idle_frame(self, frame, now, rms, vad_score, is_speech, dev_name, oww, vad, wake_word, wake_threshold, jobs) -> bool:
         """One IDLE mic frame. True means skip the rest of this iteration."""
         self.update_acoustic_estimates(rms, vad_score)
-        global _handy_on_light
         self.release_idle_utterance(jobs)
-        sync_speech_tier(now)
         if not handy_file_mode() and (now - self.last_manual_check) >= 1.0:
             self.last_manual_check = now
             manual_id, manual_txt = latest_history_row()
@@ -4093,7 +3767,17 @@ class MicState:
                 word in dev_name.lower()
                 for word in ("buds", "airpod", "headphone", "headset", "beats")
             )
-            oww.reset()
+            # "Hey Jarvis" over a reply means stop. The reply text has every
+            # wake phrase scrubbed (forSpeech), so the speaker never says it;
+            # tiny.en on bleed+voice misheard real stops (live 2026-11-21).
+            wake_score = float(oww.predict(frame).get(wake_word, 0.0) or 0.0)
+            if wake_score >= 0.2:
+                log(f"Wake score over TTS {wake_score:.2f} rms={rms:.0f}")
+            if wake_score >= wake_threshold and now >= self.score_wake_blocked_until:
+                oww.reset()
+                self.barge_stop(f"Wake word over TTS (score={wake_score:.2f}) -> stopping speech", "hey jarvis", wake_score=wake_score)
+                self.score_wake_blocked_until = time.monotonic() + DISMISS_WAKE_SECONDS
+                return True
             floor = sorted(self.tts_rms_floor)[len(self.tts_rms_floor) // 2] if self.tts_rms_floor else 0.0
             gate = max(320.0, floor * 2.4)
             if self.on_headphones:
@@ -4148,7 +3832,7 @@ class MicState:
                 # leave the speaker ducked indefinitely. Restoring here lets a
                 # still-loud burst duck again on its next hot frames.
                 if (
-                    (self.tts_duck_restore is not None or self.tts_stream_gain is not None)
+                    self.tts_stream_gain is not None
                     and self.tts_duck_at is not None
                     and time.monotonic() - self.tts_duck_at > DUCK_MAX_STUCK_SECONDS
                 ):
@@ -4319,7 +4003,6 @@ class MicState:
                 # While ducked the bleed is artificially quiet; letting those
                 # frames set the floor collapses the gate and invites hold
                 # flicker as soon as the volume comes back.
-                and self.tts_duck_restore is None
                 and self.tts_stream_gain is None
             ):
                 self.tts_rms_floor.append(rms)
@@ -4415,7 +4098,6 @@ class MicState:
             self.last_history_id = live_id
             log(f"Detected manual Handy transcription #{live_id} during DICTATING: {live_txt!r}")
             time.sleep(0.26)
-            self.retract_partial()
             outcome = dispatch_transcript(live_txt)
             action = outcome.get("action", "appended")
             verified = outcome.get("verified")
@@ -4460,7 +4142,6 @@ class MicState:
             self.dict_tail_frames.append(frame.copy())
             if len(self.dict_speech_frames) < 750:  # cap at ~60s
                 self.dict_speech_frames.append(frame.copy())
-            self.maybe_emit_partial(jobs)
         else:
             if self.speech_seen_in_chunk:
                 self.dict_tail_frames.append(frame.copy())
@@ -4481,12 +4162,11 @@ class MicState:
                     if not self.kick_whisper(jobs, 
                         "fast_cmd",
                         tail_f32,
-                        "send prompt, prompt this, submit prompt, pause listening, cancel that, scratch that, undo that, clear draft.",
+                        "send prompt, prompt this, submit prompt, pause listening, cancel that, scratch that, undo that, clear draft, scroll up, scroll down.",
                     ):
                         log("whisper busy; skipped fast-command tail")
 
                 if should_flush:
-                    self.show_closing_partial(jobs)
                     log(f"Pause of {silence_dur:.1f}s detected -> flushing chunk via Handy")
                     self.flush_mono = time.monotonic()
                     prev_id = self.last_history_id
@@ -4506,7 +4186,6 @@ class MicState:
                         log(f"Handy transcribed chunk #{self.last_history_id}: {transcript!r}")
                         # Wait 260ms so Handy's native Cmd+V paste (229ms) finishes before OMP deduplicates & updates editor
                         time.sleep(0.26)
-                        self.retract_partial()
                         dispatch_started = time.monotonic()
                         outcome = dispatch_transcript(transcript)
                         self.dispatch_s = time.monotonic() - dispatch_started
@@ -4527,7 +4206,6 @@ class MicState:
                             fallback_txt = ""
                         if fallback_txt:
                             log(f"Handy row missing (stopped externally); kept local transcript: {fallback_txt!r}")
-                            self.retract_partial()
                             dispatch_started = time.monotonic()
                             dispatch_transcript(fallback_txt)
                             self.dispatch_s = time.monotonic() - dispatch_started
@@ -4542,7 +4220,6 @@ class MicState:
                     )
 
                     self.dict_speech_frames.clear()
-                    self.partial_sent_frames = 0
                     if action == "sent":
                         self.transition_to_idle("sent", SOUND_SEND, oww, vad)
                         log("Prompt submitted -> returned to IDLE")
@@ -4589,7 +4266,6 @@ class MicState:
             else:
                 if (now - self.chunk_started_at) >= idle_timeout_seconds:
                     log(f"No speech for {idle_timeout_seconds:.0f}s in DICTATING -> cancelling Handy & returning to IDLE")
-                    self.retract_partial()
                     if not handy_file_mode():
                         handy_cancel()
                     self.transition_to_idle("idle_timeout", SOUND_PAUSE, oww, vad, cooldown=IDLE_TIMEOUT_COOLDOWN_SECONDS)
@@ -4792,7 +4468,7 @@ def load_fixture_listeners():
     whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
     jobs: queue.Queue = queue.Queue(maxsize=1)
 
-    def _whisper_text(audio_f32: np.ndarray, prompt: str) -> str:
+    def _whisper_text(audio_f32: np.ndarray, prompt: str | None) -> str:
         segments, _info = whisper.transcribe(
             audio_f32,
             language="en",
@@ -4839,7 +4515,7 @@ def run_daemon(
     from openwakeword.model import Model
     from openwakeword.vad import VAD
 
-    configure_handy_settings()
+    handy_settings_changed = configure_handy_settings()
     # Ensure macOS microphone input gain is at least 80% so across-the-room voice isn't attenuated
     subprocess.run(
         ["/usr/bin/osascript", "-e", "set volume input volume 85"],
@@ -4858,7 +4534,7 @@ def run_daemon(
     chunk_samples = 1280  # 80 ms frames
 
     whisper_jobs: queue.Queue = queue.Queue(maxsize=1)
-    def _whisper_text(audio_f32: np.ndarray, prompt: str) -> str:
+    def _whisper_text(audio_f32: np.ndarray, prompt: str | None) -> str:
         segments, _info = whisper.transcribe(
             audio_f32,
             language="en",
@@ -4888,14 +4564,11 @@ def run_daemon(
     mic.last_history_id, _ = latest_history_row()
     mic.fn_was_down = fn_held()
 
-    global _handy_on_light
     _daemon_running.set()
-    _set_strata_loaded(strata_loaded())
-    threading.Thread(target=_watch_strata, daemon=True).start()
+    if not handy_file_mode():
+        ensure_handy_model(handy_settings_changed)
     threading.Thread(target=watch_submitted_messages, daemon=True).start()
     threading.Thread(target=_whisper_worker, daemon=True).start()
-    apply_handy_model(_strata_loaded.is_set())
-    sync_speech_tier(time.monotonic())
     write_status(mic.state, {"wake_word": wake_word, "pause_seconds": pause_seconds})
     log(
         f"OMP Voice Controller ready in IDLE. Say 'Hey Jarvis' (or 'Jarvis') to start dictating; "

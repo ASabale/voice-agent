@@ -1,4 +1,4 @@
-"""A down VoiceBox must not be retried on every microphone frame."""
+"""Controller log rotation."""
 
 import importlib.machinery
 import importlib.util
@@ -12,65 +12,6 @@ assert _spec and _spec.loader
 controller = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = controller
 _spec.loader.exec_module(controller)
-
-
-def _reset(strata: bool) -> None:
-    controller._handy_on_light = False
-    controller._voicebox_want = None
-    controller._voicebox_ok = False
-    controller._voicebox_retry_at = 0.0
-    controller._logged_once.discard("voicebox-health")
-    if strata:
-        controller._strata_loaded.set()
-    else:
-        controller._strata_loaded.clear()
-
-
-def test_a_down_voicebox_is_not_retried_every_frame(monkeypatch) -> None:
-    health = {"n": 0}
-    handy = {"n": 0}
-
-    def fake_health(_strata: bool) -> bool:
-        health["n"] += 1
-        return False
-
-    def fake_handy(strata: bool) -> None:
-        handy["n"] += 1
-        controller._handy_on_light = strata
-
-    monkeypatch.setattr(controller, "apply_voicebox_model", fake_health)
-    monkeypatch.setattr(controller, "apply_handy_model", fake_handy)
-    _reset(True)
-    controller.sync_speech_tier(10.0)
-    controller.sync_speech_tier(10.08)
-    controller.sync_speech_tier(14.9)
-    assert health["n"] == 1
-    assert handy["n"] == 1
-    assert controller._handy_on_light is True
-    controller.sync_speech_tier(15.0)
-    assert health["n"] == 2
-    assert handy["n"] == 1
-    _reset(False)
-
-
-def test_a_confirmed_voicebox_is_not_polled_until_strata_changes(monkeypatch) -> None:
-    health = {"n": 0}
-
-    def fake_health(_strata: bool) -> bool:
-        health["n"] += 1
-        return True
-
-    monkeypatch.setattr(controller, "apply_voicebox_model", fake_health)
-    monkeypatch.setattr(controller, "apply_handy_model", lambda strata: None)
-    _reset(False)
-    controller._handy_on_light = False
-    controller.sync_speech_tier(20.0)
-    controller.sync_speech_tier(20.08)
-    assert health["n"] == 1
-    controller._strata_loaded.set()
-    controller.sync_speech_tier(20.1)
-    assert health["n"] == 2
-    _reset(False)
 
 
 def test_a_large_log_keeps_one_backup(tmp_path) -> None:

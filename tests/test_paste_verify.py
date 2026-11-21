@@ -138,6 +138,27 @@ def test_unknown_verdict_is_neither_claimed_nor_flagged(monkeypatch):
     assert not any("UNVERIFIED" in line for line in logs)
 
 
+def test_scratch_and_clear_remove_pasted_chunks_only_in_the_same_app(monkeypatch):
+    """Live 2026-11-21: "scratch that" in TextEdit reported scratched and left the text."""
+    monkeypatch.setattr(controller, "fallback_macos_inject", lambda _t, _a: True)
+    erased: list[int] = []
+    monkeypatch.setattr(controller, "_backspace", erased.append)
+    monkeypatch.setattr(controller, "_pasted_chunks", [])
+
+    controller.paste_into_focus("Add a unit test.", app="TextEdit")
+    controller.paste_into_focus("Update the readme.", app="TextEdit")
+    assert controller.paste_into_focus("scratch that", app="TextEdit")["action"] == "scratched"
+    assert erased == [len("Update the readme. ")]
+
+    controller.paste_into_focus("Also this.", app="TextEdit")
+    controller.paste_into_focus("clear draft", app="TextEdit")
+    assert erased[-1] == len("Add a unit test. ") + len("Also this. ")
+
+    controller.paste_into_focus("Typed in Chrome.", app="Google Chrome")
+    controller.paste_into_focus("scratch that", app="TextEdit")
+    assert len(erased) == 2
+
+
 def test_restore_happens_after_the_landing_read(monkeypatch):
     keystrokes: list[str] = []
     clipboard: list[bytes] = [b"old clipboard"]

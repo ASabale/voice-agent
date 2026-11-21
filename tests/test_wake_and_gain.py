@@ -177,13 +177,10 @@ def test_idle_frame_takes_the_wake_file_without_starting_handy(monkeypatch: pyte
         "dispatch_transcript",
         "pause_tts_clips",
         "resume_tts_clips",
-        "apply_handy_model",
-        "apply_voicebox_model",
         "stop_playback",
     ):
         monkeypatch.setattr(controller, name, boom(name))
     monkeypatch.setattr(controller, "fn_held", lambda: False)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
 
     from openwakeword.model import Model
@@ -239,7 +236,6 @@ def test_a_dismissed_handy_blocks_the_wake_file_until_the_window_expires(monkeyp
     ):
         monkeypatch.setattr(controller, name, boom(name))
     monkeypatch.setattr(controller, "fn_held", lambda: False)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
 
     from openwakeword.model import Model
@@ -300,12 +296,9 @@ def test_tts_barge_frames_queue_whisper_without_stopping_playback(monkeypatch: p
         "handy_cancel",
         "play_cue",
         "dispatch_transcript",
-        "apply_handy_model",
-        "apply_voicebox_model",
     ):
         monkeypatch.setattr(controller, name, boom(name))
     monkeypatch.setattr(controller, "fn_held", lambda: False)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
 
     base = _pcm16(_ROOT / "tests" / "fixtures" / "stop-say.wav")
     loud = [
@@ -323,6 +316,9 @@ def test_tts_barge_frames_queue_whisper_without_stopping_playback(monkeypatch: p
     frames.extend(np.zeros(1280, dtype=np.int16) for _ in range(6))
 
     class _Model:
+        def predict(self, _frame: np.ndarray) -> dict[str, float]:
+            return {"hey_jarvis": 0.0}
+
         def reset(self) -> None:
             return None
 
@@ -740,50 +736,6 @@ def test_dictation_idle_timeout_cancels_handy_without_calling_it(monkeypatch: py
     assert cancelled == 1
     assert cues == [controller.SOUND_PAUSE]
     assert expired.cooldown_until > controller.time.monotonic()
-
-
-def test_partial_text_is_rewritten_without_posting_to_the_live_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
-    # bridge_request posts /transcript. The live session is on port 62283.
-    posts: list[tuple[str, str, dict | None, str | None]] = []
-
-    def bridge(path: str, method: str = "GET", body: dict | None = None, timeout: float = 1, base: str | None = None):
-        assert base == "http://127.0.0.1:9"
-        assert path == "/transcript"
-        posts.append((method, path, body, base))
-        text = (body or {}).get("text")
-        if text == "scratch that":
-            return {"action": "scratched"}
-        return {"action": "appended"}
-
-    monkeypatch.setattr(controller, "bridge_request", bridge)
-    monkeypatch.setattr(controller, "resolve_delivery", lambda: (_ for _ in ()).throw(AssertionError("resolve_delivery")))
-
-    mic = controller.MicState()
-    mic.partial_base = "http://127.0.0.1:9"
-    mic.show_partial("hello there")
-    assert posts == [("POST", "/transcript", {"text": "hello there"}, "http://127.0.0.1:9")]
-    assert mic.partial_shown == "hello there"
-
-    mic.show_partial("hello there")
-    assert len(posts) == 1
-
-    mic.show_partial("send that")
-    assert mic.partial_shown == "hello there"
-    assert len(posts) == 1
-
-    mic.show_partial("hello send that")
-    assert [post[2] for post in posts[1:]] == [{"text": "scratch that"}, {"text": "hello"}]
-    assert mic.partial_shown == "hello"
-
-    mic.show_partial("please pause")
-    assert posts[-2][2] == {"text": "scratch that"}
-    assert posts[-1][2] == {"text": "please pause\u2060"}
-    assert mic.partial_shown == "please pause\u2060"
-
-    mic.retract_partial()
-    assert posts[-1][2] == {"text": "scratch that"}
-    assert mic.partial_shown == ""
-    assert mic.partial_base == ""
 
 
 def test_dispatch_rewrites_a_send_on_a_v2_bridge_without_posting_live(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2349,6 +2301,9 @@ def test_paste_delivery_types_a_plan_without_touching_the_focused_app(monkeypatc
         lambda: {"mode": "paste", "port": 9, "pid": 1, "focused_text": True},
     )
     monkeypatch.setattr(controller, "fallback_macos_inject", lambda text, action: injected.append((text, action)))
+    erased: list[int] = []
+    monkeypatch.setattr(controller, "_backspace", erased.append)
+    monkeypatch.setattr(controller, "_pasted_chunks", [])
     monkeypatch.setattr(
         controller.subprocess,
         "run",
@@ -2368,6 +2323,7 @@ def test_paste_delivery_types_a_plan_without_touching_the_focused_app(monkeypatc
     assert scratched["action"] == "scratched"
     assert scratched["via"] == "focus"
     assert len(injected) == 1
+    assert erased == [len("hello there ")]
 
     sent = controller.dispatch_transcript("ship all done")
     assert sent["action"] == "sent"
@@ -2748,159 +2704,6 @@ def test_headphones_keep_a_quiet_frame_and_wait_longer_to_flush(monkeypatch: pyt
     assert stops == 2
 
 
-def test_eighteen_loud_frames_queue_a_partial_without_flushing_handy(monkeypatch: pytest.MonkeyPatch) -> None:
-    # maybe_emit_partial transcribes the open chunk. It must not stop Handy.
-    import queue
-
-    monkeypatch.setattr(controller, "fn_held", lambda: False)
-    monkeypatch.setattr(controller, "latest_history_row", lambda: (0, ""))
-    monkeypatch.setattr(controller, "write_status", lambda *_a, **_k: None)
-    for name in (
-        "handy_stop_recording",
-        "handy_start_recording",
-        "handy_cancel",
-        "dispatch_transcript",
-        "silence_speech",
-        "stop_playback",
-        "bridge_request",
-        "play_cue",
-    ):
-        monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
-
-    def feed(level: int, count: int) -> tuple[controller.MicState, queue.Queue]:
-        mic = controller.MicState()
-        mic.state = "DICTATING"
-        now = 40.0
-        mic.chunk_started_at = now
-        mic.last_speech_at = now
-        mic.last_handy_ui_check = now
-        jobs: queue.Queue = queue.Queue(maxsize=1)
-        frame = np.full(1280, level, dtype=np.int16)
-        for _ in range(count):
-            mic.handle_dictating_frame(frame, now, 500.0, 0.9, True, _Reset(), _Reset(), 5.0, 15.0, jobs)
-        return mic, jobs
-
-    short, short_jobs = feed(400, 17)
-    assert short.state == "DICTATING"
-    assert short.whisper_pending is None
-    assert short_jobs.empty()
-
-    quiet, quiet_jobs = feed(100, 18)
-    assert quiet.state == "DICTATING"
-    assert quiet.whisper_pending is None
-    assert quiet_jobs.empty()
-
-    loud, loud_jobs = feed(400, 18)
-    assert loud.state == "DICTATING"
-    assert loud.whisper_pending is not None
-    assert loud.whisper_pending["kind"] == "partial"
-    assert loud.partial_sent_frames == 18
-    job = loud_jobs.get_nowait()
-    assert job["prompt"] == "A person dictating a sentence."
-
-    mic = loud
-    mic.handle_dictating_frame(
-        np.full(1280, 400, dtype=np.int16), 40.0, 500.0, 0.9, True, _Reset(), _Reset(), 5.0, 15.0, loud_jobs
-    )
-    assert mic.partial_sent_frames == 18
-    assert mic.state == "DICTATING"
-    assert loud_jobs.empty()
-
-
-def test_closing_partial_posts_six_loud_frames_and_not_a_short_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
-    # show_closing_partial blocks on the worker slot. The bridge post must not hit port 62283.
-    posts: list[dict | None] = []
-
-    def bridge(path: str, method: str = "GET", body: dict | None = None, timeout: float = 1, base: str | None = None):
-        assert base == "http://127.0.0.1:9"
-        posts.append(body)
-        text = (body or {}).get("text")
-        if text == "scratch that":
-            return {"action": "scratched"}
-        return {"action": "appended"}
-
-    class Jobs:
-        def __init__(self, answer: str | None) -> None:
-            self.answer = answer
-            self.prompts: list[str] = []
-
-        def put_nowait(self, item: dict) -> None:
-            self.prompts.append(item["prompt"])
-            if self.answer is None:
-                raise RuntimeError("worker down")
-            item["slot"].put(self.answer)
-
-    monkeypatch.setattr(controller, "bridge_request", bridge)
-    monkeypatch.setattr(controller, "resolve_delivery", lambda: (_ for _ in ()).throw(AssertionError("resolve_delivery")))
-
-    def frames(count: int, level: int) -> controller.MicState:
-        mic = controller.MicState()
-        mic.state = "DICTATING"
-        mic.partial_base = "http://127.0.0.1:9"
-        mic.dict_speech_frames = [np.full(1280, level, dtype=np.int16) for _ in range(count)]
-        return mic
-
-    short = frames(5, 400)
-    short.show_closing_partial(Jobs("hello there"))  # type: ignore[arg-type]
-    assert posts == []
-
-    quiet = frames(6, 100)
-    quiet_jobs = Jobs("hello there")
-    quiet.show_closing_partial(quiet_jobs)  # type: ignore[arg-type]
-    assert quiet_jobs.prompts == []
-    assert posts == []
-
-    gap = frames(6, 400)
-    gap.partial_sent_frames = 3
-    gap.show_closing_partial(Jobs("hello there"))  # type: ignore[arg-type]
-    assert posts == []
-
-    ready = frames(6, 400)
-    ready_jobs = Jobs("hello there")
-    ready.show_closing_partial(ready_jobs)  # type: ignore[arg-type]
-    assert ready_jobs.prompts == ["A person dictating a sentence."]
-    assert posts == [{"text": "hello there"}]
-    assert ready.partial_shown == "hello there"
-    assert ready.partial_sent_frames == 6
-
-    # A partial already in flight must not stall the frame consumer.
-    busy = frames(6, 400)
-    busy.whisper_pending = {"kind": "partial", "slot": queue.Queue(maxsize=1)}
-    busy_jobs = Jobs("hello there")
-    busy.show_closing_partial(busy_jobs)  # type: ignore[arg-type]
-    assert busy_jobs.prompts == []
-    assert len(posts) == 1
-
-    # A free worker that never answers must return within the bound, without
-    # leaving a pending slot that blocks later jobs.
-    monkeypatch.setattr(controller, "CLOSING_PARTIAL_WAIT_SECONDS", 0.2)
-    slow = frames(6, 400)
-    slow_jobs: queue.Queue = queue.Queue(maxsize=1)
-    slow.show_closing_partial(slow_jobs)  # type: ignore[arg-type]
-    assert not slow_jobs.empty()  # the job reached the worker; nobody waits on it
-    assert slow.whisper_pending is None
-    assert slow.partial_sent_frames == 0
-
-    blank = frames(6, 400)
-    blank.show_closing_partial(Jobs("   "))  # type: ignore[arg-type]
-    assert len(posts) == 1
-    assert blank.partial_sent_frames == 0
-
-    down = frames(6, 400)
-    down.show_closing_partial(Jobs(None))  # type: ignore[arg-type]
-    assert len(posts) == 1
-
-    idle = controller.MicState()
-    idle.state = "IDLE"
-    idle.partial_base = "http://127.0.0.1:9"
-    assert idle.apply_whisper("partial", "hello there", None, None) is False
-    assert len(posts) == 1
-
-    ready.apply_whisper("partial", "good night", None, None)
-    assert posts[-2:] == [{"text": "scratch that"}, {"text": "good night"}]
-    assert ready.partial_shown == "good night"
-
-
 def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch: pytest.MonkeyPatch) -> None:
     # The cut runs on a thread. Run it inline so silence_speech cannot reach the live clips.
     calls: list[tuple] = []
@@ -2925,7 +2728,6 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
     monkeypatch.setattr(controller.time, "sleep", lambda seconds: clock.__setitem__("t", clock["t"] + float(seconds)))
     monkeypatch.setattr(controller, "fn_held", fn_held)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "latest_history_row", lambda: (11, "ignore me"))
     monkeypatch.setattr(controller, "kill_tts_clips", lambda: calls.append(("kill",)))
     monkeypatch.setattr(controller, "silence_speech", lambda flag: calls.append(("silence", flag)))
@@ -2997,7 +2799,6 @@ def test_idle_history_drops_a_row_recorded_over_playback(monkeypatch: pytest.Mon
     monkeypatch.setattr(controller, "dispatch_transcript", dispatch)
     monkeypatch.setattr(controller, "latest_history_row", lambda: (row["id"], row["text"]))
     monkeypatch.setattr(controller, "play_cue", lambda sound, wait=False: cues.append(sound))
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     for name in ("silence_speech", "kill_tts_clips", "handy_start_recording", "handy_cancel", "write_status", "stop_playback", "pause_tts_clips"):
@@ -3059,7 +2860,6 @@ def test_a_short_utterance_queues_whisper_without_entering_dictation(monkeypatch
     # Path 2 runs only when the wake score stays under 0.5. enter_dictating must not run.
     import queue
 
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     for name in (
@@ -3137,7 +2937,6 @@ def test_a_held_idle_utterance_is_queued_when_whisper_is_free(monkeypatch: pytes
     # release_idle_utterance runs at the start of every idle frame.
     import queue
 
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     for name in (
@@ -3257,53 +3056,6 @@ def test_a_held_barge_clip_is_queued_even_during_dictation() -> None:
     assert blocked.qsize() == 1
 
 
-def test_a_failed_partial_scratch_keeps_the_old_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A scratch that does not return action scratched must not post the replacement.
-    posts: list[dict | None] = []
-    answers: list[dict | None] = []
-
-    def bridge(path: str, method: str = "GET", body: dict | None = None, timeout: float = 1, base: str | None = None):
-        assert base == "http://127.0.0.1:9"
-        assert path == "/transcript"
-        posts.append(body)
-        return answers.pop(0) if answers else None
-
-    monkeypatch.setattr(controller, "bridge_request", bridge)
-    monkeypatch.setattr(controller, "resolve_delivery", lambda: (_ for _ in ()).throw(AssertionError("resolve_delivery")))
-
-    mic = controller.MicState()
-    mic.partial_base = "http://127.0.0.1:9"
-    mic.partial_shown = "hello there"
-    answers.append(None)
-    mic.show_partial("good night")
-    assert posts == [{"text": "scratch that"}]
-    assert mic.partial_shown == "hello there"
-
-    answers.append({"action": "appended"})
-    mic.show_partial("good night")
-    assert posts[-1] == {"text": "scratch that"}
-    assert mic.partial_shown == "hello there"
-    assert len(posts) == 2
-
-    answers.extend([{"action": "scratched"}, {"action": "sent"}])
-    mic.show_partial("good night")
-    assert [post for post in posts[-2:]] == [{"text": "scratch that"}, {"text": "good night"}]
-    assert mic.partial_shown == ""
-
-    answers.append({"action": "appended"})
-    mic.show_partial("good night")
-    assert posts[-1] == {"text": "good night"}
-    assert mic.partial_shown == "good night"
-
-    mic.partial_shown = "good night"
-    mic.partial_base = "http://127.0.0.1:9"
-    answers.append({"action": "appended"})
-    mic.retract_partial()
-    assert posts[-1] == {"text": "scratch that"}
-    assert mic.partial_shown == "good night"
-    assert mic.partial_base == "http://127.0.0.1:9"
-
-
 def test_ending_playback_drops_a_barge_hold_and_resumes_the_clip(monkeypatch: pytest.MonkeyPatch) -> None:
     # resume_tts_clips sends SIGCONT. The held frames must not be sent to Whisper.
     import queue
@@ -3315,7 +3067,6 @@ def test_ending_playback_drops_a_barge_hold_and_resumes_the_clip(monkeypatch: py
         resumes += 1
 
     monkeypatch.setattr(controller, "resume_tts_clips", resume)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     for name in (
@@ -3384,7 +3135,6 @@ def test_two_quiet_frames_release_a_barge_hold_while_playback_continues(monkeypa
         resumes += 1
 
     monkeypatch.setattr(controller, "resume_tts_clips", resume)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     for name in (
@@ -3401,6 +3151,9 @@ def test_two_quiet_frames_release_a_barge_hold_while_playback_continues(monkeypa
         monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
 
     class _Model:
+        def predict(self, _frame: np.ndarray) -> dict[str, float]:
+            return {"hey_jarvis": 0.0}
+
         def reset(self) -> None:
             return None
 
@@ -3460,7 +3213,6 @@ def test_an_unconfirmed_barge_does_not_resume_the_clip(monkeypatch: pytest.Monke
         resumes += 1
 
     monkeypatch.setattr(controller, "resume_tts_clips", resume)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     for name in (
@@ -3477,6 +3229,9 @@ def test_an_unconfirmed_barge_does_not_resume_the_clip(monkeypatch: pytest.Monke
         monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
 
     class _Model:
+        def predict(self, _frame: np.ndarray) -> dict[str, float]:
+            return {"hey_jarvis": 0.0}
+
         def reset(self) -> None:
             return None
 

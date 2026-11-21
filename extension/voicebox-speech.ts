@@ -919,9 +919,6 @@ async function play(
   }
   session.isSpeaking = true;
   const { promise, resolve } = Promise.withResolvers<void>();
-  const args = session.playbackRate !== 1.0
-    ? ["-r", String(session.playbackRate), "-q", "1", clip.wav]
-    : [clip.wav];
   if (epoch !== session.speechEpoch) {
     session.isSpeaking = false;
     try {
@@ -931,12 +928,11 @@ async function play(
     }
     return;
   }
-  const streamPlayer = process.env.OMP_VOICE_STREAM_PLAYER === "1";
+  // voice-play reads the controller's stream-gain file, so ducking a reply
+  // never changes the macOS master volume or any other app's level.
   const child = spawn(
-    streamPlayer ? "voice-play" : "afplay",
-    streamPlayer
-      ? [clip.wav, "--speed", String(session.playbackRate)]
-      : args,
+    path.join(os.homedir(), ".local", "bin", "voice-play"),
+    [clip.wav, "--speed", String(session.playbackRate)],
     { stdio: "ignore" },
   );
   if (epoch !== session.speechEpoch) {
@@ -1291,6 +1287,7 @@ function push(message: unknown, flush: boolean): void {
 }
 
 type VoiceUiCtx = {
+  hasUI?: boolean;
   isIdle?: () => boolean;
   abort?: () => void;
   ui?: {
@@ -1310,6 +1307,10 @@ export default function voiceboxSpeech(pi: {
   ) => void;
 }): void {
   let latestCtx: VoiceUiCtx | undefined;
+  // Task subagents load this extension in the same process. Only the session
+  // with a UI owns the bridge, the registry file, and the speaker; otherwise a
+  // subagent rebinds the bridge and the user's voice lands in the subagent.
+  let inert = false;
   let server: http.Server | undefined;
   let humanizeMode = false;
   const draftHistory: string[] = [];
@@ -1363,11 +1364,20 @@ export default function voiceboxSpeech(pi: {
     } else if (result.action === "paused" || result.action === "cancelled") {
       latestCtx?.ui?.setEditorText?.(nextEditorText);
     } else if (result.action === "sent") {
+      if (submitText && typeof pi.sendUserMessage === "function") {
+        // Mid-turn, a plain send is dropped: deliver it as a steer so the
+        // running agent sees it now. Clear the editor only once it is sent.
+        const busy = !(latestCtx?.isIdle?.() ?? true);
+        try {
+          pi.sendUserMessage(submitText, busy ? { deliverAs: "steer" } : undefined);
+        } catch (err) {
+          logOnce("voice-send", `voice send failed, draft kept: ${String(err)}`);
+          latestCtx?.ui?.setEditorText?.(submitText);
+          return result;
+        }
+      }
       draftHistory.length = 0;
       latestCtx?.ui?.setEditorText?.("");
-      if (submitText && typeof pi.sendUserMessage === "function") {
-        pi.sendUserMessage(submitText);
-      }
     }
     return result;
   };
@@ -1475,6 +1485,10 @@ export default function voiceboxSpeech(pi: {
   };
 
   pi.on("session_start", (_event, ctx) => {
+    if (ctx?.hasUI === false) {
+      inert = true;
+      return;
+    }
     latestCtx = ctx;
     startBridgeServer();
     const child = spawn(
@@ -1486,6 +1500,7 @@ export default function voiceboxSpeech(pi: {
   });
 
   pi.on("session_shutdown", () => {
+    if (inert) return;
     bargeIn();
     clearSessionRegistry();
     if (server) {
@@ -1499,6 +1514,7 @@ export default function voiceboxSpeech(pi: {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    if (inert) return undefined;
     if (ctx) latestCtx = ctx;
     if (humanizeMode && event && typeof event === "object" && "systemPrompt" in event && Array.isArray(event.systemPrompt)) {
       return {
@@ -1509,6 +1525,7 @@ export default function voiceboxSpeech(pi: {
   });
 
   pi.on("turn_start", (_event, ctx) => {
+    if (inert) return;
     if (ctx) latestCtx = ctx;
     onTurnStart();
   });
@@ -1537,6 +1554,7 @@ export default function voiceboxSpeech(pi: {
   };
 
   pi.on("message_update", (event, ctx) => {
+    if (inert) return;
     if (ctx) latestCtx = ctx;
     if (isControllerDictating()) return;
     if (!event || typeof event !== "object" || !("message" in event)) return;
@@ -1552,6 +1570,7 @@ export default function voiceboxSpeech(pi: {
   });
 
   pi.on("message_end", (event, ctx) => {
+    if (inert) return;
     if (ctx) latestCtx = ctx;
     if (isControllerDictating()) return;
     if (!event || typeof event !== "object" || !("message" in event)) return;

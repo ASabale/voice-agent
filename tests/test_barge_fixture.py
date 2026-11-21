@@ -78,7 +78,6 @@ def test_stop_fixture_is_whispered_before_playback_can_resume(monkeypatch) -> No
     monkeypatch.setattr(controller, "resume_tts_clips", lambda: resumes.__iadd__(1) or None)
     monkeypatch.setattr(controller, "stop_playback", lambda reason: stops.append(reason))
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     for name in ("silence_speech", "kill_tts_clips", "handy_start_recording", "dispatch_transcript", "play_cue", "write_status"):
         monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
@@ -129,30 +128,11 @@ def test_holds_duck_the_speaker_and_release_restores_it(monkeypatch, tmp_path) -
     """
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)  # never read a live probe's duck-off marker
-    osascript: list[str] = []
-    current = {"volume": 70}
-
-    class _Res:
-        stdout = ""
-        returncode = 0
-
-    def fake_run(_cmd: list[str], **_kw: object) -> object:
-        script = _cmd[2]
-        osascript.append(script)
-        res = _Res()
-        if "output volume of" in script:
-            res.stdout = str(current["volume"])
-        else:
-            current["volume"] = int(script.rsplit(" ", 1)[1])
-            res.stdout = ""
-        return res
-
-    monkeypatch.setattr(controller.subprocess, "run", fake_run)
+    calls = _master_writes(monkeypatch)
     monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "stop_playback", lambda _reason: 0.0)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
 
@@ -163,25 +143,23 @@ def test_holds_duck_the_speaker_and_release_restores_it(monkeypatch, tmp_path) -
     _feed(mic, _wav("stop-say.wav"), jobs, VAD())
     # The four-frame "Stop." burst opens a hold but is too brief to duck.
     assert mic.tts_barge_held
-    assert mic.tts_duck_restore is None
+    assert mic.tts_stream_gain is None
     mic.apply_whisper("tts_barge", "Stop.", None, VAD(), jobs)
-    assert mic.tts_duck_restore is None
+    assert mic.tts_stream_gain is None
 
-    # A sustained burst ducks in steps, stays ducked while Whisper decides,
-    # and restores on release.
+    # A sustained burst ducks the reply stream, stays ducked while Whisper
+    # decides, and restores on release. The master volume is never touched.
     jobs2: queue.Queue = queue.Queue(maxsize=1)
     mic2 = controller.MicState()
     mic2.last_manual_check = 1e12
     mic2.enter_dictating = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("enter"))  # type: ignore[method-assign]
     _feed(mic2, _wav("hold-on-say.wav"), jobs2, VAD())
-    assert mic2.tts_duck_restore == 70
-    assert current["volume"] == 20
-    ramp = [int(s.rsplit(" ", 1)[1]) for s in osascript if "set volume output volume " in s and "output volume of" not in s]
-    assert 20 in ramp and ramp[-1] == 20 and len(ramp) > 1  # stepped, not a single jump
+    assert mic2.tts_stream_gain is not None
+    assert _gain(tmp_path) < 1.0
     mic2.apply_whisper("tts_barge", "Hold on a second.", None, VAD(), jobs2)
-    assert mic2.tts_duck_restore is None
-    assert current["volume"] == 70  # verified by read-back
-    assert any("set volume output volume 70" in s for s in osascript)
+    assert mic2.tts_stream_gain is None
+    assert _gain(tmp_path) == 1.0
+    assert not any("volume" in c for c in calls)
 
 
 def test_duck_only_after_sustained_loud_frames(monkeypatch, tmp_path) -> None:
@@ -322,27 +300,9 @@ def test_duck_scales_the_echo_reference(monkeypatch, tmp_path) -> None:
     """
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
-    volume = {"volume": 70}
-
-    class _Res:
-        def __init__(self, out: str) -> None:
-            self.stdout = out
-            self.returncode = 0
-
-    def fake_run(cmd: list[str], **_kw: object) -> object:
-        script = cmd[2]
-        if "output volume of" in script:
-            return _Res(str(volume["volume"]))
-        volume["volume"] = int(script.rsplit(" ", 1)[1])
-        return _Res("")
-
-    monkeypatch.setattr(controller.subprocess, "run", fake_run)
-    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
-
     mic = controller.MicState()
     controller.duck_output_volume(mic)
-    assert mic.tts_duck_restore == 70
-    assert abs(controller._duck_ratio - 20 / 70) < 1e-9
+    assert controller._duck_ratio == 0.2
 
     samples = np.full(16000, 20000, dtype=np.int16)
     monkeypatch.setattr(controller, "_render_samples", samples)
@@ -371,13 +331,12 @@ def test_duck_scales_the_echo_reference(monkeypatch, tmp_path) -> None:
     )
     assert block.any()
     controller.cancel_playback_echo(frame, when)  # ducked: reference scaled to the speaker
-    assert np.array_equal(reverses[-1], np.rint(block * (20 / 70)).astype(np.int16))
+    assert np.array_equal(reverses[-1], np.rint(block * 0.2).astype(np.int16))
 
     controller.restore_output_volume(mic)
     assert controller._duck_ratio == 1.0
     controller.cancel_playback_echo(frame, when)
     assert np.array_equal(reverses[-1], block)
-    assert volume["volume"] == 70
 
 
 def test_floor_freezes_while_ducked(monkeypatch, tmp_path) -> None:
@@ -391,26 +350,10 @@ def test_floor_freezes_while_ducked(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "stop_playback", lambda _reason: 0.0)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
-    volume = {"volume": 70}
-
-    class _Res:
-        def __init__(self, out: str) -> None:
-            self.stdout = out
-            self.returncode = 0
-
-    def fake_run(cmd: list[str], **_kw: object) -> object:
-        script = cmd[2]
-        if "output volume of" in script:
-            return _Res(str(volume["volume"]))
-        volume["volume"] = int(script.rsplit(" ", 1)[1])
-        return _Res("")
-
-    monkeypatch.setattr(controller.subprocess, "run", fake_run)
-    monkeypatch.setattr(controller.time, "sleep", lambda _s: None)
+    _master_writes(monkeypatch)
 
     jobs: queue.Queue = queue.Queue(maxsize=1)
     vad = VAD()
@@ -425,7 +368,7 @@ def test_floor_freezes_while_ducked(monkeypatch, tmp_path) -> None:
     assert len(mic.tts_rms_floor) == 5
     before = list(mic.tts_rms_floor)
     controller.duck_output_volume(mic)
-    assert mic.tts_duck_restore == 70
+    assert mic.tts_stream_gain is not None
     for _ in range(5):
         controller.handle_captured_frame(
             mic, quiet, controller.time.time(), "fixture", _OwwStub(), vad,
@@ -444,8 +387,7 @@ def test_cooldown_blocks_ducking_never_detection(monkeypatch, tmp_path) -> None:
     """A repeated "stop" inside the duck cooldown is still detected; only the volume change waits."""
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
-    volume = {"volume": 70}
-    monkeypatch.setattr(controller.subprocess, "run", lambda cmd, **_kw: _volume_res(cmd, volume))
+    _master_writes(monkeypatch)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
     monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
@@ -468,14 +410,14 @@ def test_cooldown_blocks_ducking_never_detection(monkeypatch, tmp_path) -> None:
             mic, _burst(), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
             0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
         )
-    assert mic.tts_duck_restore == 70
+    assert mic.tts_stream_gain is not None
     for _ in range(4):
         controller.handle_captured_frame(
             mic, np.zeros(1280, dtype=np.int16), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
             0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
         )
     mic.apply_whisper("tts_barge", "The weather is nice.", None, _HotVad(), jobs)
-    assert mic.tts_duck_restore is None
+    assert mic.tts_stream_gain is None
     assert clock["t"] < mic.tts_duck_cooldown_until  # 1.5 s duck cooldown is armed
     for _ in range(5):  # person says "stop" again immediately: detected, not re-ducked
         controller.handle_captured_frame(
@@ -483,13 +425,13 @@ def test_cooldown_blocks_ducking_never_detection(monkeypatch, tmp_path) -> None:
             0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
         )
     assert mic.tts_barge_held
-    assert mic.tts_duck_restore is None
+    assert mic.tts_stream_gain is None
     clock["t"] += 2.0
     controller.handle_captured_frame(
         mic, _burst(), controller.time.time(), "fixture", _OwwStub(), _HotVad(),
         0.40, "hey_jarvis", 0.5, 5.0, 15.0, jobs,
     )
-    assert mic.tts_duck_restore == 70
+    assert mic.tts_stream_gain is not None
 
 
 def _volume_res(cmd: list[str], volume: dict) -> object:
@@ -521,7 +463,6 @@ def test_a_squashing_canceller_cannot_erase_the_stop(monkeypatch) -> None:
     monkeypatch.setattr(controller, "pause_tts_clips", lambda: pauses.append("pause"))
     monkeypatch.setattr(controller, "stop_playback", lambda reason: stops.append(reason))
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     monkeypatch.setattr(controller, "refresh_render_reference", lambda: None)
     for name in ("silence_speech", "kill_tts_clips", "handy_start_recording", "dispatch_transcript", "play_cue", "write_status"):
@@ -826,7 +767,6 @@ def test_rising_ambient_noise_alone_neither_holds_nor_ducks(monkeypatch, tmp_pat
     monkeypatch.setattr(controller, "pause_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     volume = {"volume": 70}
     writes: list[str] = []
 
@@ -865,7 +805,6 @@ def test_partial_recognition_kicks_before_the_clip_flushes(monkeypatch) -> None:
     monkeypatch.setattr(controller, "resume_tts_clips", lambda: None)
     monkeypatch.setattr(controller, "stop_playback", lambda reason: (_ for _ in ()).throw(AssertionError("stop_playback")))
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: True)
-    monkeypatch.setattr(controller, "sync_speech_tier", lambda _now: None)
     monkeypatch.setattr(controller, "fn_held", lambda: False)
     for name in ("silence_speech", "kill_tts_clips", "handy_start_recording", "dispatch_transcript", "play_cue", "write_status"):
         monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))

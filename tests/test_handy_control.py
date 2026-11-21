@@ -824,27 +824,6 @@ def test_a_newer_history_row_is_dispatched_once_after_a_clear_flush(monkeypatch:
     assert posted == ["clear draft", "Next line."]
 
 
-def test_a_repeated_partial_does_not_submit(monkeypatch: pytest.MonkeyPatch) -> None:
-    posts: list[dict[str, str]] = []
-
-    def bridge(path: str, method: str = "GET", body: dict | None = None, base: str | None = None) -> dict[str, str]:
-        posts.append({"path": path, "text": str((body or {}).get("text"))})
-        return {"action": "appended"}
-
-    monkeypatch.setattr(controller, "bridge_request", bridge)
-    monkeypatch.setattr(
-        controller,
-        "dispatch_transcript",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("submit")),
-    )
-    mic = controller.MicState()
-    mic.partial_base = "http://127.0.0.1:9"
-    mic.show_partial("Ship the notes.")
-    mic.show_partial("Ship the notes.")
-    assert posts == [{"path": "/transcript", "text": "Ship the notes."}]
-    assert mic.state == "IDLE"
-
-
 class _Now:
     def __init__(self, target) -> None:
         self._target = target
@@ -853,7 +832,7 @@ class _Now:
         self._target()
 
 
-def test_idle_cancel_clears_the_partial_and_the_next_wake_starts_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_idle_timeout_cancels_handy_and_the_next_wake_starts_once(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _install(monkeypatch, running=True)
     posts: list[str] = []
 
@@ -880,8 +859,6 @@ def test_idle_cancel_clears_the_partial_and_the_next_wake_starts_once(monkeypatc
 
     mic = controller.MicState()
     mic.state = "DICTATING"
-    mic.partial_shown = "Ship the notes."
-    mic.partial_base = "http://127.0.0.1:9"
     now = 100.0
     mic.chunk_started_at = now - 15
     mic.last_handy_ui_check = now
@@ -898,9 +875,7 @@ def test_idle_cancel_clears_the_partial_and_the_next_wake_starts_once(monkeypatc
         queue.Queue(),
     )
     assert mic.state == "IDLE"
-    assert mic.partial_shown == ""
-    assert mic.partial_base == ""
-    assert posts == ["scratch that"]
+    assert posts == []
     assert calls == [[controller.HANDY_BIN, "--cancel"]]
 
     mic.enter_dictating("second wake", _Reset(), _Reset())
@@ -975,8 +950,6 @@ def test_cancel_that_stops_once_scratches_and_does_not_submit(monkeypatch: pytes
     mic = controller.MicState()
     mic.state = "DICTATING"
     mic.speech_seen_in_chunk = True
-    mic.partial_shown = "Ship the notes."
-    mic.partial_base = "http://127.0.0.1:9"
     now = 100.0
     mic.chunk_started_at = now
     mic.last_handy_ui_check = now
@@ -995,9 +968,7 @@ def test_cancel_that_stops_once_scratches_and_does_not_submit(monkeypatch: pytes
         queue.Queue(),
     )
     assert mic.state == "IDLE"
-    assert mic.partial_shown == ""
-    assert mic.partial_base == ""
-    assert [item for item in posts if item[0] == "POST"] == [("POST", "scratch that")]
+    assert [item for item in posts if item[0] == "POST"] == []
     assert calls == [[controller.HANDY_BIN, "--toggle-transcription"]]
 
     mic.enter_dictating("next wake", _Reset(), _Reset())

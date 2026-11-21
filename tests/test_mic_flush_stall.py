@@ -68,44 +68,6 @@ def test_queue_full_drops_one_block_per_offer_at_real_stall_size() -> None:
     assert dropped == 5
 
 
-def test_closing_partial_does_not_block_when_whisper_is_busy() -> None:
-    """The flush path used to `jobs.put(timeout=8)` even while a partial was
-    in flight, stalling the mic loop for the whole worker delay."""
-    jobs: queue.Queue = queue.Queue(maxsize=1)
-    worker = _SlowWorker(jobs, 2.0)
-    mic = _dictating_mic()
-    # An in-flight partial: a job already queued and being transcribed.
-    inflight_slot: queue.Queue = queue.Queue(maxsize=1)
-    jobs.put_nowait({"audio": np.zeros(4, dtype=np.float32), "prompt": "partial", "slot": inflight_slot})
-    mic.whisper_pending = {"kind": "partial", "slot": inflight_slot}
-    started = time.monotonic()
-    mic.show_closing_partial(jobs)
-    elapsed = time.monotonic() - started
-    worker.close()
-    assert elapsed < 0.2, f"closing partial blocked the mic loop for {elapsed:.2f}s while whisper was busy"
-
-
-def test_closing_partial_waits_only_its_bound_when_whisper_is_free() -> None:
-    """A free but slow worker must not hold the frame loop past the bound."""
-    jobs: queue.Queue = queue.Queue(maxsize=1)
-    worker = _SlowWorker(jobs, 5.0)
-    mic = _dictating_mic()
-    monkey_bound = 0.3
-    original = getattr(controller, "CLOSING_PARTIAL_WAIT_SECONDS", None)
-    if original is None:
-        worker.close()
-        raise AssertionError("CLOSING_PARTIAL_WAIT_SECONDS constant missing")
-    controller.CLOSING_PARTIAL_WAIT_SECONDS = monkey_bound
-    started = time.monotonic()
-    mic.show_closing_partial(jobs)
-    elapsed = time.monotonic() - started
-    worker.close()
-    if original is not None:
-        controller.CLOSING_PARTIAL_WAIT_SECONDS = original
-    assert elapsed < monkey_bound + 0.3, f"closing partial waited {elapsed:.2f}s past its bound"
-    assert mic.whisper_pending is None, "a timed-out closing partial must not leave a pending slot"
-
-
 def test_local_fallback_returns_empty_immediately_when_whisper_is_busy() -> None:
     jobs: queue.Queue = queue.Queue(maxsize=1)
     worker = _SlowWorker(jobs, 2.0)
