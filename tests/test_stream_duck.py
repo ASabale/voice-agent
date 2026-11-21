@@ -27,7 +27,6 @@ def _gain(tmp_path: Path) -> float:
 
 def test_stream_duck_writes_gain_not_master_volume(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
-    monkeypatch.setenv("OMP_VOICE_STREAM_PLAYER", "1")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
     osascript: list[str] = []
 
@@ -41,14 +40,12 @@ def test_stream_duck_writes_gain_not_master_volume(monkeypatch, tmp_path) -> Non
     assert not osascript
     assert _gain(tmp_path) == 0.2
     assert state.tts_stream_gain == 0.2
-    assert state.tts_duck_restore is None
     assert controller._duck_ratio == 0.2
     assert json.loads((tmp_path / "duck-state.json").read_text())["stream_gain"] == 0.2
 
 
 def test_stream_restore_returns_gain_and_ratio(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
-    monkeypatch.setenv("OMP_VOICE_STREAM_PLAYER", "1")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
     state = controller.MicState()
     controller.duck_output_volume(state)
@@ -62,7 +59,6 @@ def test_stream_restore_returns_gain_and_ratio(monkeypatch, tmp_path) -> None:
 
 def test_stream_duck_halves_when_ambient_dominates(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "20")
-    monkeypatch.setenv("OMP_VOICE_STREAM_PLAYER", "1")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
     state = controller.MicState()
     state.echo_full_gain = 30.0
@@ -73,7 +69,6 @@ def test_stream_duck_halves_when_ambient_dominates(monkeypatch, tmp_path) -> Non
 
 def test_stream_duck_skips_under_minimum_attenuation(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("OMP_VOICE_DUCK_VOLUME", "95")
-    monkeypatch.setenv("OMP_VOICE_STREAM_PLAYER", "1")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
     state = controller.MicState()
     controller.duck_output_volume(state)
@@ -82,7 +77,6 @@ def test_stream_duck_skips_under_minimum_attenuation(monkeypatch, tmp_path) -> N
 
 
 def test_reconcile_restores_stream_duck_after_crash(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("OMP_VOICE_STREAM_PLAYER", "1")
     monkeypatch.setattr(controller, "STATE_DIR", tmp_path)
     (tmp_path / "stream-gain.json").write_text(json.dumps({"gain": 0.2}))
     (tmp_path / "duck-state.json").write_text(

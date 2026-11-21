@@ -60,6 +60,18 @@ const upGenerator: ClipGenerator = async (text: string) => ({
   clip: { wav: "mock.wav", sentence: text, clip: 1, reference: null },
 });
 
+// The extension spawns ~/.local/bin/voice-play; point HOME at a stub so tests
+// never play real audio. Returns the previous HOME for restoration.
+function installPlayer(dir: string, script: string): string | undefined {
+  const bin = path.join(dir, ".local", "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, "voice-play"), script);
+  fs.chmodSync(path.join(bin, "voice-play"), 0o755);
+  const saved = process.env.HOME;
+  process.env.HOME = dir;
+  return saved;
+}
+
 test("a 200 with a truncated audio payload holds the sentence instead of dropping it", async () => {
   resetSpeechSession();
   // Each scenario gets its own port: Node's keep-alive pool keys by origin and
@@ -333,10 +345,7 @@ test("a player hung until the watchdog kills it is never counted as spoken", asy
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-hung-player-"));
   const wav = path.join(dir, "clip.wav");
   fs.writeFileSync(wav, validWav(4410));
-  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nwhile :; do :; done\n");
-  fs.chmodSync(path.join(dir, "afplay"), 0o755);
-  const savedPath = process.env.PATH;
-  process.env.PATH = `${dir}:${savedPath}`;
+  const savedHome = installPlayer(dir, "#!/bin/sh\nwhile :; do :; done\n");
   process.env.OMP_PLAY_WATCHDOG_MS = "300";
   const gen: ClipGenerator = () =>
     Promise.resolve({ clip: { wav, sentence: "the player hung and the watchdog killed it", clip: 1, reference: null } });
@@ -349,7 +358,7 @@ test("a player hung until the watchdog kills it is never counted as spoken", asy
     assert.equal(currentSpokenText(), "");
   } finally {
     stopDeferredRetry();
-    process.env.PATH = savedPath;
+    process.env.HOME = savedHome;
     delete process.env.OMP_PLAY_WATCHDOG_MS;
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -360,10 +369,7 @@ test("a watchdog-killed hung player defers the sentence into the retry chain", a
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-hung-player-defer-"));
   const wav = path.join(dir, "clip.wav");
   fs.writeFileSync(wav, validWav(4410));
-  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nwhile :; do :; done\n");
-  fs.chmodSync(path.join(dir, "afplay"), 0o755);
-  const savedPath = process.env.PATH;
-  process.env.PATH = `${dir}:${savedPath}`;
+  const savedHome = installPlayer(dir, "#!/bin/sh\nwhile :; do :; done\n");
   process.env.OMP_PLAY_WATCHDOG_MS = "300";
   const sentence = "the player hung and the sentence must be retried";
   const gen: ClipGenerator = () =>
@@ -386,7 +392,7 @@ test("a watchdog-killed hung player defers the sentence into the retry chain", a
     assert.equal(currentSpokenText(), sentence);
   } finally {
     stopDeferredRetry();
-    process.env.PATH = savedPath;
+    process.env.HOME = savedHome;
     delete process.env.OMP_PLAY_WATCHDOG_MS;
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -397,10 +403,7 @@ test("a player process that exits with a failure code defers the sentence", asyn
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-player-fail-"));
   const wav = path.join(dir, "clip.wav");
   fs.writeFileSync(wav, validWav(4410));
-  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nexit 1\n");
-  fs.chmodSync(path.join(dir, "afplay"), 0o755);
-  const savedPath = process.env.PATH;
-  process.env.PATH = `${dir}:${savedPath}`;
+  const savedHome = installPlayer(dir, "#!/bin/sh\nexit 1\n");
   const sentence = "the player failed and the sentence must be retried";
   const gen: ClipGenerator = () =>
     Promise.resolve({ clip: { wav, sentence, clip: 1, reference: null } });
@@ -419,7 +422,7 @@ test("a player process that exits with a failure code defers the sentence", asyn
     assert.equal(currentSpokenText(), sentence);
   } finally {
     stopDeferredRetry();
-    process.env.PATH = savedPath;
+    process.env.HOME = savedHome;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -429,10 +432,7 @@ test("re-enqueueing a watchdog-held sentence does not duplicate its deferral", a
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "va-hung-player-recovery-"));
   const wav = path.join(dir, "clip.wav");
   fs.writeFileSync(wav, validWav(4410));
-  fs.writeFileSync(path.join(dir, "afplay"), "#!/bin/sh\nwhile :; do :; done\n");
-  fs.chmodSync(path.join(dir, "afplay"), 0o755);
-  const savedPath = process.env.PATH;
-  process.env.PATH = `${dir}:${savedPath}`;
+  const savedHome = installPlayer(dir, "#!/bin/sh\nwhile :; do :; done\n");
   process.env.OMP_PLAY_WATCHDOG_MS = "300";
   const sentence = "the player hung but the sentence is not lost";
   const gen: ClipGenerator = () =>
@@ -455,7 +455,7 @@ test("re-enqueueing a watchdog-held sentence does not duplicate its deferral", a
     assert.equal(currentSpokenText(), sentence);
   } finally {
     stopDeferredRetry();
-    process.env.PATH = savedPath;
+    process.env.HOME = savedHome;
     delete process.env.OMP_PLAY_WATCHDOG_MS;
     fs.rmSync(dir, { recursive: true, force: true });
   }
