@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   VoiceSession,
@@ -33,6 +33,20 @@ for (const vector of vectors) {
     assert.equal(matched.tail, vector.tail);
   });
 }
+
+test("the grammar resolves from the checkout when nothing is installed", () => {
+  // bin/install links grammar.json into ~/.local/share/omp-voice. CI never runs
+  // it, so the extension must fall back to the grammar shipped with this repo.
+  const realHome = process.env.HOME;
+  process.env.HOME = mkdtempSync("/tmp/voice-grammar-");
+  try {
+    const parsed = parseVoiceTranscript("hey jarvis zoom in", "the draft so far");
+    assert.equal(parsed.result.action, "noop");
+    assert.equal(parsed.nextEditorText, "the draft so far");
+  } finally {
+    process.env.HOME = realHome;
+  }
+});
 
 test("an app switch never lands in the draft", () => {
   for (const raw of ["hey jarvis switch app", "switch to Chrome", "go to the store"]) {

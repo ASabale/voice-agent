@@ -585,6 +585,36 @@ def test_echo_estimate_survives_ducking_without_collapsing() -> None:
     controller._duck_ratio = 1.0
 
 
+def test_a_stale_reference_is_not_attributed_to_the_speaker(monkeypatch) -> None:
+    """§2B: bleed attribution needs the render reference this frame.
+
+    The estimator reads the canceller's per-frame signals. A render reference
+    that has gone away leaves those signals behind, and the estimator then
+    explains every frame as "unmeasured bleed" instead of learning the coupling
+    gain: the echo estimate stays at 0 and the barge gate loses its floor.
+    """
+    reference = np.full(16000, 20000, dtype=np.int16)
+    monkeypatch.setattr(controller, "_render_samples", reference)
+    monkeypatch.setattr(
+        controller,
+        "_render_parsed",
+        {"aligned": True, "started_at": controller.time.time() - 1.0, "playback_rate": 1.0},
+    )
+    monkeypatch.setattr(controller, "playback_echo_canceller", lambda _key: object())
+    monkeypatch.setattr(controller, "process_echo_block", lambda _proc, frame, _reverse: frame)
+    controller.cancel_playback_echo(np.full(1280, 18000, dtype=np.int16), controller.time.time())
+    assert controller._last_ref_rms >= controller.ECHO_REF_ACTIVE_RMS  # the signal exists
+
+    monkeypatch.undo()  # the clip ended: no render reference, stale signal left behind
+
+    mic = controller.MicState()
+    mic.tts_active = True
+    mic.ambient_short = mic.ambient_long = 90.0
+    for _ in range(12):
+        mic.update_acoustic_estimates(175.0, 0.1)
+    assert 60 <= mic.echo_full_gain <= 110  # the bleed is still measurable
+
+
 def test_rising_ambient_noise_alone_neither_holds_nor_ducks(monkeypatch, tmp_path) -> None:
     """§11: environmental noise ramping to 400 rms opens nothing and ducks nothing.
 

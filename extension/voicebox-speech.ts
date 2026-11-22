@@ -304,7 +304,10 @@ let commandGrammar: CommandGrammar | null = null;
 
 function loadCommandGrammar(): CommandGrammar {
   if (commandGrammar) return commandGrammar;
-  const grammarPath = path.join(os.homedir(), ".local", "share", "omp-voice", "grammar.json");
+  // bin/install links grammar.json into ~/.local/share/omp-voice. A checkout
+  // that has never been installed, CI included, uses the copy next to this file.
+  const installed = path.join(os.homedir(), ".local", "share", "omp-voice", "grammar.json");
+  const grammarPath = fs.existsSync(installed) ? installed : new URL("../grammar.json", import.meta.url);
   commandGrammar = JSON.parse(fs.readFileSync(grammarPath, "utf8")) as CommandGrammar;
   commandGrammar.wake.sort((a, b) => b.length - a.length);
   return commandGrammar;

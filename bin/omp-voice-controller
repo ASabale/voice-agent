@@ -1022,6 +1022,16 @@ _last_echo_corr = 0.0
 _last_mic_rms = 0.0
 
 
+def render_reference_connected() -> bool:
+    """True when a speaking clip's PCM is loaded, so this frame can be cancelled.
+
+    The attribution signals above are written by the canceller. They are only
+    meaningful while a reference is connected; a clip that has ended leaves the
+    last frame's numbers behind, and the estimator must not read them as bleed.
+    """
+    return _render_samples is not None and bool(_render_parsed) and bool(_render_parsed.get("aligned"))
+
+
 def refresh_render_reference(now: float | None = None) -> dict:
     """Load the newest speaking slot's WAV when the file matches that slot.
 
@@ -4099,7 +4109,7 @@ class MicState:
         """
         global _acoustic_snapshot
         if self.tts_active:
-            if _last_ref_rms >= ECHO_REF_ACTIVE_RMS:
+            if _last_ref_rms >= ECHO_REF_ACTIVE_RMS and render_reference_connected():
                 # The render reference gives the speaker's exact emission for
                 # this block. Blocks that correlate with it at a plausible
                 # flight lag are bleed: their raw energy, normalized by the
@@ -4201,7 +4211,7 @@ class MicState:
                 self.dict_human_frames += 1
             else:
                 self.dict_echo_frames += 1
-        elif _last_echo_corr >= AEC_CORRELATION_GUARD:
+        elif render_reference_connected() and _last_echo_corr >= AEC_CORRELATION_GUARD:
             # The reference is emitting and this frame correlates with it, but
             # no gain is calibrated yet: assume bleed until proven otherwise.
             self.dict_echo_frames += 1
@@ -4345,7 +4355,8 @@ class MicState:
                 # rejected hold must be heard. Bleed sits below the gate, so
                 # the resume attack cannot open a hold on its own.
                 calibrated = (
-                    _last_ref_rms >= ECHO_REF_ACTIVE_RMS
+                    render_reference_connected()
+                    and _last_ref_rms >= ECHO_REF_ACTIVE_RMS
                     and len(self.echo_ratios) >= ECHO_RATIO_MIN_SAMPLES
                 )
                 hot = (
