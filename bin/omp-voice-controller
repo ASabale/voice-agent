@@ -254,6 +254,11 @@ def _load_macos_frameworks() -> tuple[ctypes.CDLL, ctypes.CDLL]:
         ]
         graphics.CGEventCreateScrollWheelEvent2.restype = ctypes.c_void_p
         graphics.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        graphics.CGEventCreateKeyboardEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
+        ]
+        graphics.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        graphics.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         graphics.CFRelease = ctypes.CDLL(
             "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
         ).CFRelease
@@ -2873,6 +2878,248 @@ def _hold_failed_send(prefix: str) -> dict:
     return {"action": "held", "draft": _visible_hold()}
 
 
+# ---- Actuator: the one module that does something to the Mac.
+#
+# One seam, two adapters. RealActuator posts CGEvents and runs osascript;
+# RecordingActuator records exactly what would be sent, so a test can assert
+# a command's events without touching the machine. Recognition of the phrase
+# stays outside the actuator: dispatch hands it an action name.
+
+AFPLAY = "/usr/bin/afplay"
+
+# One-shot confirmation for a command that ran. Empty string means silence.
+COMMAND_SOUND = os.environ.get("OMP_VOICE_COMMAND_SOUND", "/System/Library/Sounds/Tink.aiff")
+
+# Apple virtual key codes: the physical key on an ANSI US keyboard.
+KEY_F = 0x03
+KEY_W = 0x09
+KEY_T = 0x11
+KEY_MINUS = 0x1B
+KEY_EQUAL = 0x18
+KEY_RIGHT_BRACKET = 0x1E
+KEY_LEFT_BRACKET = 0x21
+KEY_TAB = 0x30
+KEY_SPACE = 0x31
+KEY_K = 0x28
+KEY_ESCAPE = 0x35
+KEY_HOME = 0x73
+KEY_PAGE_UP = 0x74
+KEY_END = 0x77
+KEY_PAGE_DOWN = 0x79
+
+_MODIFIER_FLAGS = {
+    "command": 1 << 16,
+    "shift": 1 << 17,
+    "control": 1 << 18,
+    "option": 1 << 19,
+}
+
+# One key press per command that does not depend on what is on screen.
+_KEY_COMMANDS: dict[str, tuple[int, tuple[str, ...]]] = {
+    "scroll_end": (KEY_END, ()),
+    "scroll_top": (KEY_HOME, ()),
+    "page_down": (KEY_PAGE_DOWN, ()),
+    "page_up": (KEY_PAGE_UP, ()),
+    "go_back": (KEY_LEFT_BRACKET, ("command",)),
+    "go_forward": (KEY_RIGHT_BRACKET, ("command",)),
+    "next_tab": (KEY_TAB, ("control",)),
+    "previous_tab": (KEY_TAB, ("control", "shift")),
+    "new_tab": (KEY_T, ("command",)),
+    "close_tab": (KEY_W, ("command",)),
+    "zoom_in": (KEY_EQUAL, ("command",)),
+    "zoom_out": (KEY_MINUS, ("command",)),
+}
+
+_FRONTMOST_APP_SCRIPT = """
+tell application "System Events"
+  set frontApp to first application process whose frontmost is true
+  return name of frontApp
+end tell
+"""
+
+_FRONTMOST_URL_SCRIPT = """
+tell application "Google Chrome"
+  try
+    return URL of active tab of front window
+  catch
+    return ""
+  end try
+end tell
+"""
+
+
+@dataclass(frozen=True)
+class FrontApp:
+    """The frontmost app, and the page it is showing when it has one."""
+
+    name: str
+    url: str | None = None
+
+    def is_youtube(self) -> bool:
+        return "chrome" in self.name.lower() and "youtube" in (self.url or "").lower()
+
+
+class MacActuator:
+    """Perform one fixed-grammar command on the Mac."""
+
+    def frontmost_app(self) -> FrontApp | None:
+        raise NotImplementedError
+
+    def scroll(self, direction: str, lines: int) -> bool:
+        raise NotImplementedError
+
+    def key(self, keycode: int, mods: tuple[str, ...] = ()) -> bool:
+        raise NotImplementedError
+
+    def chime(self, path: str) -> bool:
+        """Play a one-shot confirmation sound; empty path means silence."""
+        raise NotImplementedError
+
+    def perform(self, action: str, lines: int = 0) -> bool:
+        """Run one command, then confirm it with the chime."""
+        if action == "scroll_up":
+            ok = self.scroll("up", lines)
+        elif action == "scroll_down":
+            ok = self.scroll("down", lines)
+        else:
+            chord = self._chord(action)
+            ok = self.key(*chord) if chord is not None else False
+        if ok:
+            self.chime(COMMAND_SOUND)
+        return ok
+
+    def _chord(self, action: str) -> tuple[int, tuple[str, ...]] | None:
+        """The key press a command needs, given the page in front of us."""
+        if action in _KEY_COMMANDS:
+            return _KEY_COMMANDS[action]
+        front = self.frontmost_app()
+        youtube = front is not None and front.is_youtube()
+        if action in ("play_video", "pause_video"):
+            return (KEY_K if youtube else KEY_SPACE, ())
+        if action == "full_screen":
+            return (KEY_F, ()) if youtube else (KEY_F, ("control", "command"))
+        if action == "exit_full_screen":
+            return (KEY_ESCAPE, ()) if youtube else (KEY_F, ("control", "command"))
+        return None
+
+
+class RealActuator(MacActuator):
+    """Send events to the machine through CoreGraphics and AppleScript."""
+
+    def frontmost_app(self) -> FrontApp | None:
+        try:
+            name = subprocess.run(
+                ["/usr/bin/osascript", "-e", _FRONTMOST_APP_SCRIPT],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            ).stdout.strip()
+        except Exception as exc:
+            log_once("frontmost-app", f"frontmost app lookup failed: {exc}")
+            return None
+        if not name:
+            return None
+        url: str | None = None
+        if "chrome" in name.lower():
+            try:
+                url = subprocess.run(
+                    ["/usr/bin/osascript", "-e", _FRONTMOST_URL_SCRIPT],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                ).stdout.strip() or None
+            except Exception:
+                url = None
+        return FrontApp(name, url)
+
+    def scroll(self, direction: str, lines: int) -> bool:
+        """Post line-unit scroll-wheel events (kCGHIDEventTap) at the pointer."""
+        try:
+            _, graphics = _load_macos_frameworks()
+            delta = lines if direction == "up" else -lines
+            event = graphics.CGEventCreateScrollWheelEvent2(None, 1, 1, delta, 0, 0)
+            if not event:
+                return False
+            graphics.CGEventPost(0, event)
+            graphics.CFRelease(event)
+            return True
+        except Exception as exc:
+            log(f"scroll failed: {exc}")
+            return False
+
+    def key(self, keycode: int, mods: tuple[str, ...] = ()) -> bool:
+        """Press and release one key with the named modifiers held."""
+        flags = 0
+        for mod in mods:
+            flags |= _MODIFIER_FLAGS[mod]
+        try:
+            _, graphics = _load_macos_frameworks()
+            for down in (True, False):
+                event = graphics.CGEventCreateKeyboardEvent(None, keycode, down)
+                if not event:
+                    return False
+                if flags:
+                    graphics.CGEventSetFlags(event, flags)
+                graphics.CGEventPost(0, event)
+                graphics.CFRelease(event)
+            return True
+        except Exception as exc:
+            log(f"key chord failed: {exc}")
+            return False
+
+
+    def chime(self, path: str) -> bool:
+        """Fire afplay and walk away; the cue never blocks the mic loop."""
+        if not path:
+            return False
+        try:
+            subprocess.Popen(
+                [AFPLAY, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except OSError as exc:
+            log_once("chime", f"command sound failed: {exc}")
+            return False
+
+
+class RecordingActuator(MacActuator):
+    """Record the events a command would send; touch nothing on the machine."""
+
+    def __init__(self, front: FrontApp | None = None) -> None:
+        self.events: list[tuple] = []
+        self.sounds: list[tuple] = []
+        self._front = front
+
+    def frontmost_app(self) -> FrontApp | None:
+        return self._front
+
+    def scroll(self, direction: str, lines: int) -> bool:
+        self.events.append(("scroll", direction, lines))
+        return True
+
+    def key(self, keycode: int, mods: tuple[str, ...] = ()) -> bool:
+        self.events.append(("key", keycode, tuple(mods)))
+        return True
+
+    def chime(self, path: str) -> bool:
+        if not path:
+            return False
+        self.sounds.append((AFPLAY, path))
+        return True
+
+
+ACTUATOR = RealActuator()
+
+# Every grammar action dispatch hands to the actuator instead of the draft.
+ACTUATOR_ACTIONS = frozenset({"scroll_up", "scroll_down"}) | frozenset(_KEY_COMMANDS) | {
+    "play_video", "pause_video", "full_screen", "exit_full_screen",
+}
+
 # "scroll up", "scroll down a lot", "hey jarvis scroll down": scrolls the
 # window under the pointer in any app. Lines per command, by size word.
 _SCROLL_RE = re.compile(
@@ -2887,23 +3134,7 @@ def scroll_command(text: str) -> tuple[str, int] | None:
     if not m:
         return None
     size = " ".join(m.group(2).split()) if m.group(2) else None
-    return m.group(1), _SCROLL_LINES[size]
-
-
-def scroll_focus(direction: str, lines: int) -> bool:
-    """Post line-unit scroll-wheel events (kCGHIDEventTap) at the pointer."""
-    try:
-        _, graphics = _load_macos_frameworks()
-        delta = lines if direction == "up" else -lines
-        event = graphics.CGEventCreateScrollWheelEvent2(None, 1, 1, delta, 0, 0)
-        if not event:
-            return False
-        graphics.CGEventPost(0, event)
-        graphics.CFRelease(event)
-        return True
-    except Exception as exc:
-        log(f"scroll failed: {exc}")
-        return False
+    return f"scroll_{m.group(1)}", _SCROLL_LINES[size]
 
 
 def dispatch_transcript(text: str) -> dict:
@@ -2917,9 +3148,16 @@ def dispatch_transcript(text: str) -> dict:
         return {"action": "noop", "draft": ""}
     scroll = scroll_command(original)
     if scroll:
-        ok = scroll_focus(*scroll)
-        log(f"Scrolled {scroll[0]} {scroll[1]} lines (ok={ok}) for {original!r}")
+        action, lines = scroll
+        ok = ACTUATOR.perform(action, lines=lines)
+        log(f"Scrolled {action[7:]} {lines} lines (ok={ok}) for {original!r}")
         return {"action": "scrolled", "draft": ""}
+
+    matched_now = match_command(original)
+    if matched_now and matched_now["action"] in ACTUATOR_ACTIONS:
+        ok = ACTUATOR.perform(matched_now["action"])
+        log(f"Actuator {matched_now['action']} from {original!r} (ok={ok})")
+        return {"action": "command", "command": matched_now["action"], "draft": ""}
 
     try:
         dest = resolve_delivery()
@@ -2930,7 +3168,6 @@ def dispatch_transcript(text: str) -> dict:
         f"Delivery {dest.get('mode')} pid={dest.get('pid')} port={dest.get('port')} "
         f"focused_text={dest.get('focused_text')}"
     )
-    matched_now = match_command(original)
     if matched_now and matched_now["action"] == "paused":
         note_pause(original)
 
@@ -3145,6 +3382,32 @@ def idle_command(heard: str) -> dict | None:
     if matched and not matched["prefix"]:
         return matched
     return None
+
+
+# A tail short enough to be an instruction rather than dictation.
+_UNMATCHED_MAX_WORDS = 8
+
+
+def note_unmatched_command(heard: str, reason: str, path: Path | None = None) -> None:
+    """Keep a command-shaped phrase the grammar matched nothing of.
+
+    The intent layer later learns from these; nothing is sent to the machine.
+    """
+    tail = " ".join(heard.split())
+    if not tail or len(tail.split()) > _UNMATCHED_MAX_WORDS:
+        return
+    out = path or STATE_DIR / "unmatched.jsonl"
+    row = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "text": tail,
+        "reason": reason,
+    }
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+    except OSError as exc:
+        log_once("unmatched-write", f"could not record an unmatched command: {exc}")
 
 
 def _open_pid_lock(block: bool) -> object | None:
@@ -3637,8 +3900,13 @@ class MicState:
                 dispatch_transcript(heard)
                 play_cue(SOUND_CANCEL, wait=False)
                 self.cooldown_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
+            elif idle_cmd is None and not scroll_command(heard) and heard.strip():
+                note_unmatched_command(heard, "idle_no_match")
         elif heard_kind == "fast_cmd" and self.state == "DICTATING":
-            self.pending_fast_flush = bool(match_command(heard) or scroll_command(heard))
+            flush = bool(match_command(heard) or scroll_command(heard))
+            self.pending_fast_flush = flush
+            if not flush:
+                note_unmatched_command(heard, "fast_tail_no_match")
         return False
 
     def update_acoustic_estimates(self, rms: float, vad_score: float) -> None:

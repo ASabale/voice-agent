@@ -470,6 +470,14 @@ def test_idle_verify_submits_or_scratches_without_posting(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(controller, "dispatch_transcript", dispatch)
     monkeypatch.setattr(controller, "play_cue", play)
+    # The lone-send guard reads the live draft; pin it so the test does not
+    # depend on what the bridge happens to hold on this machine.
+    monkeypatch.setattr(
+        controller,
+        "resolve_delivery",
+        lambda: {"mode": "bridge", "port": 17494, "focused_text": False},
+    )
+    monkeypatch.setattr(controller, "bridge_draft", lambda _base: "a drafted sentence")
 
     def boom(name: str):
         def _blocked(*_args: object, **_kwargs: object) -> None:

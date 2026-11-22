@@ -244,8 +244,53 @@ export type TranscriptAction =
   | { action: "noop"; draft: string };
 
 type GrammarAction = {
-  action: "sent" | "paused" | "cancelled" | "scratched" | "cleared";
+  action:
+    | "sent"
+    | "paused"
+    | "cancelled"
+    | "scratched"
+    | "cleared"
+    | "scroll_up"
+    | "scroll_down"
+    | "scroll_end"
+    | "scroll_top"
+    | "page_down"
+    | "page_up"
+    | "play_video"
+    | "pause_video"
+    | "full_screen"
+    | "exit_full_screen"
+    | "go_back"
+    | "go_forward"
+    | "next_tab"
+    | "previous_tab"
+    | "new_tab"
+    | "close_tab"
+    | "zoom_in"
+    | "zoom_out";
   slots: string[][];
+};
+
+// Actions the controller's actuator performs; they never reach the draft.
+const ACTUATOR_ACTIONS: Record<string, true> = {
+  scroll_up: true,
+  scroll_down: true,
+  scroll_end: true,
+  scroll_top: true,
+  page_down: true,
+  page_up: true,
+  play_video: true,
+  pause_video: true,
+  full_screen: true,
+  exit_full_screen: true,
+  go_back: true,
+  go_forward: true,
+  next_tab: true,
+  previous_tab: true,
+  new_tab: true,
+  close_tab: true,
+  zoom_in: true,
+  zoom_out: true,
 };
 type CommandGrammar = { wake: string[][]; actions: GrammarAction[] };
 
@@ -277,7 +322,7 @@ export function matchCommand(raw: string, grammar: CommandGrammar = loadCommandG
     .trim()
     .split(" ")
     .filter(Boolean);
-  let best: { span: number; action: GrammarAction["action"]; content: string[] } | null = null;
+  let best: { span: number; action: GrammarAction["action"]; prefix: string; phrase: string } | null = null;
   for (let i = 0; i < tokens.length; i++) {
     const span = tokens.slice(i);
     for (const wake of [[] as string[], ...grammar.wake]) {
@@ -286,14 +331,18 @@ export function matchCommand(raw: string, grammar: CommandGrammar = loadCommandG
       for (const group of grammar.actions) {
         if (!slotsMatch(rest, group.slots)) continue;
         if (best === null || span.length > best.span) {
-          best = { span: span.length, action: group.action, content: tokens.slice(0, i) };
+          best = {
+            span: span.length,
+            action: group.action,
+            prefix: tokens.slice(0, i).join(" "),
+            phrase: span.join(" "),
+          };
         }
       }
     }
   }
   if (!best) return null;
-  const phraseTokens = tokens.slice(tokens.length - best.span);
-  return { action: best.action, prefix: best.content.join(" "), phrase: phraseTokens.join(" ") };
+  return { action: best.action, prefix: best.prefix, phrase: best.phrase };
 }
 
 export function deduplicateHandyPaste(currentEditorText: string, rawTranscript: string): string {
@@ -321,6 +370,10 @@ export function parseVoiceTranscript(
   }
 
   const command = matchCommand(cleaned);
+  if (command && ACTUATOR_ACTIONS[command.action] === true) {
+    // The controller's actuator already ran this; the draft keeps what was typed.
+    return { result: { action: "noop", draft: baseDraft }, nextEditorText: baseDraft };
+  }
   if (command?.action === "cleared") {
     return {
       result: { action: "cleared", draft: "", strippedCommand: command.phrase },

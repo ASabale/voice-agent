@@ -6,6 +6,7 @@ import {
   deduplicateHandyPaste,
   forSpeech,
   matchCommand,
+  parseVoiceTranscript,
   takeSentences,
 } from "../extension/voicebox-speech.ts";
 
@@ -34,6 +35,12 @@ for (const vector of vectors) {
 test("longest suffix beats a shorter stop", () => {
   const matched = matchCommand("stop listening", grammar);
   assert.equal(matched?.phrase, "stop listening");
+});
+
+test("an actuator command never lands in the draft", () => {
+  const parsed = parseVoiceTranscript("hey jarvis zoom in", "the draft so far");
+  assert.equal(parsed.result.action, "noop");
+  assert.equal(parsed.nextEditorText, "the draft so far");
 });
 
 test("forSpeech strips a code fence and keeps the sentence", () => {

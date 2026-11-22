@@ -75,6 +75,106 @@
     {
       "action": "cancelled",
       "slots": [["cancel", "canceled", "cancelled"]]
+    },
+    {
+      "action": "pause_video",
+      "slots": [["pause", "stop"], ["video"]]
+    },
+    {
+      "action": "pause_video",
+      "slots": [["pause", "stop"], ["the"], ["video"]]
+    },
+    {
+      "action": "play_video",
+      "slots": [["play", "resume", "start"], ["video"]]
+    },
+    {
+      "action": "play_video",
+      "slots": [["play", "resume", "start"], ["the"], ["video"]]
+    },
+    {
+      "action": "scroll_end",
+      "slots": [["scroll"], ["to"], ["the"], ["end", "bottom"]]
+    },
+    {
+      "action": "scroll_end",
+      "slots": [["scroll"], ["to"], ["end", "bottom"]]
+    },
+    {
+      "action": "scroll_top",
+      "slots": [["scroll"], ["to"], ["the"], ["top", "start", "beginning"]]
+    },
+    {
+      "action": "scroll_top",
+      "slots": [["scroll"], ["to"], ["top", "start", "beginning"]]
+    },
+    {
+      "action": "page_down",
+      "slots": [["page"], ["down"]]
+    },
+    {
+      "action": "page_down",
+      "slots": [["scroll"], ["page"], ["down"]]
+    },
+    {
+      "action": "page_up",
+      "slots": [["page"], ["up"]]
+    },
+    {
+      "action": "page_up",
+      "slots": [["scroll"], ["page"], ["up"]]
+    },
+    {
+      "action": "full_screen",
+      "slots": [["full"], ["screen"]]
+    },
+    {
+      "action": "full_screen",
+      "slots": [["fullscreen"]]
+    },
+    {
+      "action": "full_screen",
+      "slots": [["go", "enter"], ["full"], ["screen"]]
+    },
+    {
+      "action": "exit_full_screen",
+      "slots": [["exit", "leave", "close"], ["full"], ["screen"]]
+    },
+    {
+      "action": "exit_full_screen",
+      "slots": [["exit", "leave"], ["fullscreen"]]
+    },
+    {
+      "action": "go_back",
+      "slots": [["go"], ["back"]]
+    },
+    {
+      "action": "go_forward",
+      "slots": [["go"], ["forward"]]
+    },
+    {
+      "action": "next_tab",
+      "slots": [["next"], ["tab"]]
+    },
+    {
+      "action": "previous_tab",
+      "slots": [["previous", "prior"], ["tab"]]
+    },
+    {
+      "action": "new_tab",
+      "slots": [["new"], ["tab"]]
+    },
+    {
+      "action": "close_tab",
+      "slots": [["close"], ["tab"]]
+    },
+    {
+      "action": "zoom_in",
+      "slots": [["zoom"], ["in", "up"]]
+    },
+    {
+      "action": "zoom_out",
+      "slots": [["zoom"], ["out", "down"]]
     }
   ]
 }
