@@ -13,7 +13,7 @@
     <string>--wake-threshold</string>
     <string>0.5</string>
     <string>--pause-seconds</string>
-    <string>5.0</string>
+    <string>2.0</string>
     <string>--idle-timeout</string>
     <string>15.0</string>
   </array>

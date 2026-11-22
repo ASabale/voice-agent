@@ -25,8 +25,9 @@ State machine:
       4. Enters DICTATING.
 - DICTATING:
     Monitors Silero VAD + RMS energy on the same 16 kHz stream:
-      - Once speech is detected in the current chunk and 5.0s of silence elapses (Pause),
-        flushes the chunk by calling `handy --toggle-transcription`.
+      - Once speech is detected in the current chunk and 2.0s of silence elapses (Pause),
+        flushes the chunk by calling `handy --toggle-transcription`. If silence reaches
+        5.0s total after the last word, closes Handy and returns to IDLE (draft kept).
       - Reads the newly transcribed row from Handy's SQLite `history.db`, forwards it to
         OMP extension `POST http://127.0.0.1:17494/transcript` (which strips command phrases
         like "send prompt" / "pause listening" / "cancel that", updates `ctx.ui.setEditorText`,
@@ -122,6 +123,9 @@ SILENCE_PAUSE_SECONDS = 5.0
 HEADPHONE_FLUSH_SECONDS = 8.0
 IDLE_TIMEOUT_SECONDS = 15.0
 FAST_COMMAND_SILENCE_SECONDS = 1.5
+# Total silence after the last word that ends a dictation take. The chunk
+# already flushed at pause_seconds, so ending here loses nothing.
+END_SILENCE_SECONDS = 5.0
 HANDY_UI_GRACE_SECONDS = 1.5
 HANDY_UI_POLL_SECONDS = 1.0
 MANUAL_HANDY_POLL_SECONDS = 1.0
@@ -2058,7 +2062,12 @@ def handy_cancel(allow_launch: bool = False) -> bool:
 # Strata load/unload killed Handy mid-dictation and made VoiceBox answer the
 # first request after each swap with HTTP 500. Qwen3.8 Flash-Next is the
 # resident worker, so the tiers never bought memory back in practice.
-HANDY_MODEL = "handy-computer/Qwen3-ASR-1.7B-gguf/Qwen3-ASR-1.7B-Q8_0.gguf"
+# Preference when the current selection is blank or not installed. A valid
+# user selection is never overridden. Parakeet streams live and matched
+# Qwen3-ASR on every command fixture (2026-11-22), so Qwen was removed.
+HANDY_MODEL_PREFERENCE = (
+    "handy-computer/parakeet-unified-en-0.6b-gguf/parakeet-unified-en-0.6b-Q8_0.gguf",
+)
 
 
 def handy_file_mode() -> bool:
@@ -2135,24 +2144,57 @@ def handy_model_id() -> str:
         return ""
 
 
-def ensure_handy_model(settings_changed: bool = False) -> None:
-    """Select HANDY_MODEL once at controller start. Never called while dictating.
+HANDY_MODEL_RECONCILE_SECONDS = 30.0
+_handy_missing_logged = False
+HF_HUB = Path.home() / ".cache" / "huggingface" / "hub"
 
-    Handy reads settings_store.json only at launch, so any change made at
-    startup (model or overlay) needs one restart here.
+
+def handy_model_installed(model_id: str) -> bool:
+    """True when Handy's HuggingFace-cache GGUF for model_id (org/repo/file) is on disk."""
+    org, _, rest = model_id.partition("/")
+    repo, _, filename = rest.partition("/")
+    if not (org and repo and filename):
+        return False
+    return any((HF_HUB / f"models--{org}--{repo}" / "snapshots").glob(f"*/{filename}"))
+
+
+def pick_handy_model() -> str | None:
+    """Keep a valid current selection; otherwise the best installed preference."""
+    current = handy_model_id()
+    if current and handy_model_installed(current):
+        return current
+    for candidate in HANDY_MODEL_PREFERENCE:
+        if handy_model_installed(candidate):
+            return candidate
+    return None
+
+
+def ensure_handy_model(settings_changed: bool = False) -> bool:
+    """Make Handy's selected_model an installed model. Never called while dictating.
+
+    Handy reads settings_store.json only at launch, so any change made here
+    (model or overlay) needs one restart. Returns True if Handy was restarted.
     """
-    if handy_model_id() != HANDY_MODEL:
+    chosen = pick_handy_model()
+    if chosen is None:
+        global _handy_missing_logged
+        if not _handy_missing_logged:
+            log("No Handy ASR model installed; download one in Handy (cannot reconcile)")
+            _handy_missing_logged = True
+        return False
+    _handy_missing_logged = False
+    if handy_model_id() != chosen:
         try:
             raw = json.loads(HANDY_SETTINGS.read_text(encoding="utf-8"))
-            raw.setdefault("settings", {})["selected_model"] = HANDY_MODEL
+            raw.setdefault("settings", {})["selected_model"] = chosen
             HANDY_SETTINGS.write_text(json.dumps(raw, indent=2), encoding="utf-8")
         except (OSError, ValueError) as exc:
             log(f"Could not set Handy model: {exc}")
-            return
+            return False
         settings_changed = True
     if not settings_changed:
-        return
-    log(f"Handy settings changed (model {HANDY_MODEL}); restarting Handy once to load them")
+        return False
+    log(f"Handy settings changed (model {chosen}); restarting Handy once to load them")
     subprocess.run(["/usr/bin/pkill", "-f", "Handy.app/Contents/MacOS/handy"], check=False)
     time.sleep(0.4)
     subprocess.Popen(
@@ -2161,6 +2203,23 @@ def ensure_handy_model(settings_changed: bool = False) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    return True
+
+
+def handy_model_reconcile_loop(mic: "MicState") -> None:
+    """Heal a blank or missing Handy model while idle; Handy clears it on its own."""
+    while _daemon_running.is_set():
+        time.sleep(HANDY_MODEL_RECONCILE_SECONDS)
+        if mic.state != "IDLE":
+            continue
+        current = handy_model_id()
+        if current and handy_model_installed(current):
+            continue
+        try:
+            ensure_handy_model()
+        except Exception as exc:
+            log(f"Handy model reconcile failed: {exc}")
+
 
 
 def _run_osascript(script: str) -> None:
@@ -3187,6 +3246,8 @@ class MicState:
     handy_ui_gone: bool = False
     handy_ui_seen: bool = False
     last_speech_at: float = 0.0
+    last_real_speech_at: float | None = None
+    flushed_this_turn: bool = False
     cooldown_until: float = 0.0
     score_wake_blocked_until: float = 0.0
     last_tts_check: float = 0.0
@@ -3396,6 +3457,8 @@ class MicState:
         self.speech_seen_in_chunk = False
         self.chunk_started_at = time.monotonic()
         self.last_speech_at = self.chunk_started_at
+        self.last_real_speech_at = self.chunk_started_at
+        self.flushed_this_turn = False
         self.dict_human_frames = 0
         self.dict_echo_frames = 0
         self.score_wake_blocked_until = 0.0
@@ -4187,6 +4250,7 @@ class MicState:
                 log(f"Speech started in chunk (vad={vad_score:.2f}, rms={rms:.0f})")
             self.speech_seen_in_chunk = True
             self.last_speech_at = now
+            self.last_real_speech_at = now
             self.checked_fast_cmd = False
             self.dict_tail_frames.append(frame.copy())
             if len(self.dict_speech_frames) < 750:  # cap at ~60s
@@ -4311,8 +4375,18 @@ class MicState:
                         self.last_speech_at = self.chunk_started_at
                         self.cooldown_until = self.chunk_started_at + 0.25
                         write_status(self.state, {"last_action": action, "turn": self.turn_metrics()})
+                        self.flushed_this_turn = True
                         log("Continuing DICTATING for next chunk...")
             else:
+                flush_after = 8.0 if self.on_headphones else pause_seconds
+                end_after = max(END_SILENCE_SECONDS, flush_after + 1.0)
+                silent_for = None if self.last_real_speech_at is None else now - self.last_real_speech_at
+                if self.flushed_this_turn and silent_for is not None and silent_for >= end_after:
+                    log(f"{silent_for:.1f}s of silence after the last chunk -> closing Handy & returning to IDLE")
+                    if not handy_file_mode():
+                        handy_cancel()
+                    self.transition_to_idle("silence_end", SOUND_PAUSE, oww, vad, cooldown=IDLE_TIMEOUT_COOLDOWN_SECONDS)
+                    return False
                 if (now - self.chunk_started_at) >= idle_timeout_seconds:
                     log(f"No speech for {idle_timeout_seconds:.0f}s in DICTATING -> cancelling Handy & returning to IDLE")
                     if not handy_file_mode():
@@ -4710,7 +4784,7 @@ def load_fixture_listeners():
 def run_daemon(
     wake_word: str = "hey_jarvis",
     wake_threshold: float = WAKE_SCORE_THRESHOLD,
-    pause_seconds: float = 5.0,
+    pause_seconds: float = 2.0,
     idle_timeout_seconds: float = 15.0,
     vad_threshold: float = 0.40,
 ) -> int:
@@ -4780,6 +4854,7 @@ def run_daemon(
     _daemon_running.set()
     if not handy_file_mode():
         ensure_handy_model(handy_settings_changed)
+        threading.Thread(target=handy_model_reconcile_loop, args=(mic,), daemon=True).start()
     threading.Thread(target=watch_submitted_messages, daemon=True).start()
     if not handy_file_mode():
         threading.Thread(target=memory_guard_loop, args=(mic,), daemon=True).start()
@@ -5050,7 +5125,7 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--wake-word", default="hey_jarvis", help="openWakeWord model name (default: hey_jarvis)")
         p.add_argument("--wake-threshold", type=float, default=WAKE_SCORE_THRESHOLD, help="Wake word threshold 0..1 (default: 0.50)")
-        p.add_argument("--pause-seconds", type=float, default=5.0, help="Silence pause to flush chunk (default: 5.0)")
+        p.add_argument("--pause-seconds", type=float, default=2.0, help="Silence that flushes a chunk into the draft (default: 2.0); END_SILENCE_SECONDS (5.0) ends the take")
         p.add_argument("--idle-timeout", type=float, default=15.0, help="Max silence with no speech before IDLE (default: 15.0)")
 
     sub.add_parser("stop")

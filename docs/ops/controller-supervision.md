@@ -1,11 +1,11 @@
 # A4 — Who supervises the controller?
 
-**RESOLVED (2026-11-16 07:16 UTC): Option 1 installed.** Owner approved; the unit `~/Library/LaunchAgents/com.akshay.omp-voice-controller.plist` (copy kept at `docs/ops/com.akshay.omp-voice-controller.plist`) runs `run --wake-word hey_jarvis --wake-threshold 0.5 --pause-seconds 5.0 --idle-timeout 15.0` with `KeepAlive: true`, `ThrottleInterval: 10`, stdout/stderr → `~/.local/state/omp-voice/controller-restart.log`. Verified: SIGINT to pid 4085 → launchd respawned pid 4387 in ~14 s, `status` IDLE holding the mic. The old unsupervised pid 251 was stopped cleanly (`stop` exit 0).
+**RESOLVED (2026-11-16 07:16 UTC): Option 1 installed.** Owner approved; the unit `~/Library/LaunchAgents/com.akshay.omp-voice-controller.plist` (copy kept at `docs/ops/com.akshay.omp-voice-controller.plist`) runs `run --wake-word hey_jarvis --wake-threshold 0.5 --pause-seconds 2.0 --idle-timeout 15.0` with `KeepAlive: true`, `ThrottleInterval: 10`, stdout/stderr → `~/.local/state/omp-voice/controller-restart.log`. Verified: SIGINT to pid 4085 → launchd respawned pid 4387 in ~14 s, `status` IDLE holding the mic. The old unsupervised pid 251 was stopped cleanly (`stop` exit 0).
 
 **Previous state (measured 2026-11-16 05:47 UTC):** the live controller (pid 251, up ~1 h 25 m) had parent pid 1 — nothing restarted it if it died.
 
 ## Option 1 — launchd unit (recommended)
-- `~/Library/LaunchAgents/com.akshay.omp-voice-controller.plist` with `KeepAlive: true`, the exact production argv (`run --wake-word hey_jarvis --wake-threshold 0.5 --pause-seconds 5.0 --idle-timeout 15.0`), stdout redirected to the rotating `controller-restart.log` path.
+- `~/Library/LaunchAgents/com.akshay.omp-voice-controller.plist` with `KeepAlive: true`, the exact production argv (`run --wake-word hey_jarvis --wake-threshold 0.5 --pause-seconds 2.0 --idle-timeout 15.0`), stdout redirected to the rotating `controller-restart.log` path.
 - Pros: auto-restart on crash, survives reboots, one supervisor, matches the guardian pattern; launchd already proved it can re-spawn and claim a lock (A3 consolidation).
 - Risks: the mic is exclusive — a restart storm while a probe holds the mic would thrash; the pid lock (`~/.local/state/omp-voice/controller.pid`) already refuses double starts, so a KeepAlive loop is bounded. Log rotation is fd-based (VA-LOG-003), so redirecting launchd stdout to the same file is safe.
 

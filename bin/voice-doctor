@@ -802,7 +802,7 @@ def loop(args: argparse.Namespace) -> int:
         env["OMP_VOICE_STREAM_PLAYER"] = "1"
         ctrl_log = DOCTOR_RUNS / f"loop-controller-{int(time.time())}.log"
         test_controller = subprocess.Popen(
-            [str(ROOT / "bin" / "omp-voice-controller"), "run", "--wake-word", "hey_jarvis", "--wake-threshold", "0.5", "--pause-seconds", "5.0", "--idle-timeout", "15.0"],
+            [str(ROOT / "bin" / "omp-voice-controller"), "run", "--wake-word", "hey_jarvis", "--wake-threshold", "0.5", "--pause-seconds", "2.0", "--idle-timeout", "15.0"],
             env=env,
             stdout=open(ctrl_log, "w", encoding="utf-8"),
             stderr=subprocess.STDOUT,
