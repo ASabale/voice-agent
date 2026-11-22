@@ -2427,7 +2427,12 @@ def _slots_match(words: list[str], slots: list[list[str]]) -> bool:
 
 
 def match_command(raw: str, grammar: dict | None = None) -> dict | None:
-    """Longest suffix that is an optional wake plus one word from each slot."""
+    """Longest suffix that is an optional wake plus one word from each slot.
+
+    A group may carry "tail": N, meaning up to N free words may follow the
+    slots. That is how "switch to <any app name>" is recognised without a
+    slot per app name; the words themselves are resolved later.
+    """
     grammar = grammar or command_grammar()
     tokens = _command_tokens(raw)
     best: dict | None = None
@@ -2438,8 +2443,13 @@ def match_command(raw: str, grammar: dict | None = None) -> dict | None:
                 continue
             rest = span[len(wake) :]
             for group in grammar["actions"]:
-                if not _slots_match(rest, group["slots"]):
+                slots = group["slots"]
+                if len(rest) < len(slots) or not _slots_match(rest[: len(slots)], slots):
                     continue
+                tail = rest[len(slots) :]
+                if tail:
+                    if not group.get("tail") or len(tail) > group["tail"]:
+                        continue
                 if best is None or len(span) > best["span"]:
                     best = {
                         "span": len(span),
@@ -2447,6 +2457,7 @@ def match_command(raw: str, grammar: dict | None = None) -> dict | None:
                         "stem": [rest[0]],
                         "prefix": " ".join(tokens[:start]),
                         "phrase": " ".join(span),
+                        "tail": " ".join(tail),
                     }
     if best is None:
         return None
@@ -2928,6 +2939,7 @@ _KEY_COMMANDS: dict[str, tuple[int, tuple[str, ...]]] = {
     "close_tab": (KEY_W, ("command",)),
     "zoom_in": (KEY_EQUAL, ("command",)),
     "zoom_out": (KEY_MINUS, ("command",)),
+    "previous_app": (KEY_TAB, ("command",)),
 }
 
 _FRONTMOST_APP_SCRIPT = """
@@ -2947,6 +2959,75 @@ tell application "Google Chrome"
 end tell
 """
 
+# Which app does a spoken name mean? The inventory is the machine's: apps
+# running now, plus .app bundles in the places macOS installs them. It is
+# cached and refreshed once on a miss, so an app installed after the
+# controller started can still be named.
+_APP_DIRS = ("/Applications", "/System/Applications", os.path.expanduser("~/Applications"))
+
+_RUNNING_APPS_SCRIPT = """
+tell application "System Events"
+  return name of every application process
+end tell
+"""
+
+# Spoken names that are shorter or different from the app's real one.
+_APP_ALIASES = {
+    "chrome": "Google Chrome",
+    "vs code": "Visual Studio Code",
+    "code": "Visual Studio Code",
+    "terminal": "Terminal",
+    "finder": "Finder",
+    "settings": "System Settings",
+    "preferences": "System Settings",
+}
+
+_ARTICLES = ("the", "a", "an")
+
+
+def _app_key(name: str) -> str:
+    """Lowercase, punctuation-free form of a name, minus "the" and "app"."""
+    words = [word for word in re.sub(r"[^a-z0-9]+", " ", name.lower()).split() if word]
+    if len(words) > 1 and words[-1] == "app":
+        words.pop()
+    while len(words) > 1 and words[0] in _ARTICLES:
+        words.pop(0)
+    return " ".join(words)
+
+
+def _exact_hit(key: str, names: list[str]) -> str | None:
+    for name in names:
+        if _app_key(name) == key:
+            return name
+    return None
+
+
+def _prefix_hit(key: str, names: list[str]) -> str | None:
+    for name in names:
+        name_key = _app_key(name)
+        if name_key.startswith(key) or key.startswith(name_key):
+            return name
+    return None
+
+
+def _match_app_name(key: str, names: list[str]) -> str | None:
+    """Exact name, then the alias map, then a prefix. Returns what `open -a` wants.
+
+    The alias map comes before the prefix search: on this machine "chrome"
+    is a prefix of "Chrome Remote Desktop Host Uninstaller", and switching to
+    that is never what the speaker meant.
+    """
+    hit = _exact_hit(key, names)
+    if hit:
+        return hit
+    target = _APP_ALIASES.get(key)
+    if target:
+        target_key = _app_key(target)
+        hit = _exact_hit(target_key, names) or _prefix_hit(target_key, names)
+        if hit:
+            return hit
+    return _prefix_hit(key, names)
+
 
 @dataclass(frozen=True)
 class FrontApp:
@@ -2965,22 +3046,47 @@ class MacActuator:
     def frontmost_app(self) -> FrontApp | None:
         raise NotImplementedError
 
+    def known_apps(self) -> list[str]:
+        """The apps this machine can be switched to."""
+        raise NotImplementedError
+
+    def refresh_apps(self) -> list[str]:
+        """Re-read the inventory; the cached one did not know this name."""
+        return self.known_apps()
+
+    def resolve_app(self, name: str) -> str | None:
+        """The real app a spoken name means, or None when nothing matches."""
+        key = _app_key(name)
+        if not key:
+            return None
+        for names in (self.known_apps(), self.refresh_apps()):
+            hit = _match_app_name(key, names)
+            if hit:
+                return hit
+        return None
+
     def scroll(self, direction: str, lines: int) -> bool:
         raise NotImplementedError
 
     def key(self, keycode: int, mods: tuple[str, ...] = ()) -> bool:
         raise NotImplementedError
 
+    def activate(self, name: str) -> bool:
+        """Bring an app to the front, launching it if it is not running."""
+        raise NotImplementedError
+
     def chime(self, path: str) -> bool:
         """Play a one-shot confirmation sound; empty path means silence."""
         raise NotImplementedError
 
-    def perform(self, action: str, lines: int = 0) -> bool:
+    def perform(self, action: str, lines: int = 0, app: str | None = None) -> bool:
         """Run one command, then confirm it with the chime."""
         if action == "scroll_up":
             ok = self.scroll("up", lines)
         elif action == "scroll_down":
             ok = self.scroll("down", lines)
+        elif action == "switch_to_app":
+            ok = self.activate(app) if app else False
         else:
             chord = self._chord(action)
             ok = self.key(*chord) if chord is not None else False
@@ -3005,6 +3111,38 @@ class MacActuator:
 
 class RealActuator(MacActuator):
     """Send events to the machine through CoreGraphics and AppleScript."""
+
+    def __init__(self) -> None:
+        self._apps: list[str] | None = None
+
+    def _scan_apps(self) -> list[str]:
+        names: list[str] = []
+        try:
+            listing = subprocess.run(
+                ["/usr/bin/osascript", "-e", _RUNNING_APPS_SCRIPT],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            ).stdout
+            names += [name.strip() for name in listing.split(",") if name.strip()]
+        except Exception as exc:
+            log_once("running-apps", f"running app lookup failed: {exc}")
+        for directory in _APP_DIRS:
+            try:
+                names += [entry.name[:-4] for entry in Path(directory).iterdir() if entry.name.endswith(".app")]
+            except OSError:
+                continue
+        return list(dict.fromkeys(names))
+
+    def known_apps(self) -> list[str]:
+        if self._apps is None:
+            self._apps = self._scan_apps()
+        return self._apps
+
+    def refresh_apps(self) -> list[str]:
+        self._apps = self._scan_apps()
+        return self._apps
 
     def frontmost_app(self) -> FrontApp | None:
         try:
@@ -3069,6 +3207,24 @@ class RealActuator(MacActuator):
             log(f"key chord failed: {exc}")
             return False
 
+    def activate(self, name: str) -> bool:
+        """`open -a` the app: launches it if it is not running."""
+        try:
+            result = subprocess.run(
+                ["/usr/bin/open", "-a", name],
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+                check=False,
+            )
+        except Exception as exc:
+            log_once("activate-app", f"could not activate {name!r}: {exc}")
+            return False
+        if result.returncode != 0:
+            log_once("activate-app", f"open -a {name!r} failed: {result.stderr.strip()}")
+            return False
+        return True
+
 
     def chime(self, path: str) -> bool:
         """Fire afplay and walk away; the cue never blocks the mic loop."""
@@ -3090,13 +3246,17 @@ class RealActuator(MacActuator):
 class RecordingActuator(MacActuator):
     """Record the events a command would send; touch nothing on the machine."""
 
-    def __init__(self, front: FrontApp | None = None) -> None:
+    def __init__(self, front: FrontApp | None = None, apps: list[str] | None = None) -> None:
         self.events: list[tuple] = []
         self.sounds: list[tuple] = []
         self._front = front
+        self._apps = list(apps or [])
 
     def frontmost_app(self) -> FrontApp | None:
         return self._front
+
+    def known_apps(self) -> list[str]:
+        return self._apps
 
     def scroll(self, direction: str, lines: int) -> bool:
         self.events.append(("scroll", direction, lines))
@@ -3104,6 +3264,12 @@ class RecordingActuator(MacActuator):
 
     def key(self, keycode: int, mods: tuple[str, ...] = ()) -> bool:
         self.events.append(("key", keycode, tuple(mods)))
+        return True
+
+    def activate(self, name: str) -> bool:
+        if not name:
+            return False
+        self.events.append(("activate", name))
         return True
 
     def chime(self, path: str) -> bool:
@@ -3117,7 +3283,7 @@ ACTUATOR = RealActuator()
 
 # Every grammar action dispatch hands to the actuator instead of the draft.
 ACTUATOR_ACTIONS = frozenset({"scroll_up", "scroll_down"}) | frozenset(_KEY_COMMANDS) | {
-    "play_video", "pause_video", "full_screen", "exit_full_screen",
+    "play_video", "pause_video", "full_screen", "exit_full_screen", "switch_to_app",
 }
 
 # "scroll up", "scroll down a lot", "hey jarvis scroll down": scrolls the
@@ -3155,9 +3321,18 @@ def dispatch_transcript(text: str) -> dict:
 
     matched_now = match_command(original)
     if matched_now and matched_now["action"] in ACTUATOR_ACTIONS:
-        ok = ACTUATOR.perform(matched_now["action"])
-        log(f"Actuator {matched_now['action']} from {original!r} (ok={ok})")
-        return {"action": "command", "command": matched_now["action"], "draft": ""}
+        app: str | None = None
+        if matched_now["action"] == "switch_to_app":
+            app = ACTUATOR.resolve_app(matched_now["tail"])
+            if app is None:
+                # No app on this machine answers that name: it is dictation
+                # that happens to look like a switch, so keep the words.
+                note_unmatched_command(original, "app_not_found")
+                matched_now = None
+        if matched_now:
+            ok = ACTUATOR.perform(matched_now["action"], app=app)
+            log(f"Actuator {matched_now['action']} from {original!r} (ok={ok})")
+            return {"action": "command", "command": matched_now["action"], "draft": ""}
 
     try:
         dest = resolve_delivery()

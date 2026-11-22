@@ -16,6 +16,7 @@ const vectors = JSON.parse(readFileSync(new URL("./command_vectors.json", import
   action: string | null;
   prefix: string;
   phrase: string;
+  tail: string;
 }>;
 
 for (const vector of vectors) {
@@ -29,8 +30,17 @@ for (const vector of vectors) {
     assert.equal(matched.action, vector.action);
     assert.equal(matched.prefix, vector.prefix);
     assert.equal(matched.phrase, vector.phrase);
+    assert.equal(matched.tail, vector.tail);
   });
 }
+
+test("an app switch never lands in the draft", () => {
+  for (const raw of ["hey jarvis switch app", "switch to Chrome", "go to the store"]) {
+    const parsed = parseVoiceTranscript(raw, "the draft so far");
+    assert.equal(parsed.result.action, "noop", raw);
+    assert.equal(parsed.nextEditorText, "the draft so far", raw);
+  }
+});
 
 test("longest suffix beats a shorter stop", () => {
   const matched = matchCommand("stop listening", grammar);

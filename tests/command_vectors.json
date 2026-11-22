@@ -3,204 +3,315 @@
     "raw": "send prompt",
     "action": "sent",
     "prefix": "",
-    "phrase": "send prompt"
+    "phrase": "send prompt",
+    "tail": ""
   },
   {
     "raw": "hey jarvis stop",
     "action": "paused",
     "prefix": "",
-    "phrase": "hey jarvis stop"
+    "phrase": "hey jarvis stop",
+    "tail": ""
   },
   {
     "raw": "please stop listening",
     "action": "paused",
     "prefix": "please",
-    "phrase": "stop listening"
+    "phrase": "stop listening",
+    "tail": ""
   },
   {
     "raw": "stop",
     "action": "paused",
     "prefix": "",
-    "phrase": "stop"
+    "phrase": "stop",
+    "tail": ""
   },
   {
     "raw": "pause",
     "action": "paused",
     "prefix": "",
-    "phrase": "pause"
+    "phrase": "pause",
+    "tail": ""
   },
   {
     "raw": "pause listening",
     "action": "paused",
     "prefix": "",
-    "phrase": "pause listening"
+    "phrase": "pause listening",
+    "tail": ""
   },
   {
     "raw": "scratch that",
     "action": "scratched",
     "prefix": "",
-    "phrase": "scratch that"
+    "phrase": "scratch that",
+    "tail": ""
   },
   {
     "raw": "clear draft",
     "action": "cleared",
     "prefix": "",
-    "phrase": "clear draft"
+    "phrase": "clear draft",
+    "tail": ""
   },
   {
     "raw": "cancel that",
     "action": "cancelled",
     "prefix": "",
-    "phrase": "cancel that"
+    "phrase": "cancel that",
+    "tail": ""
   },
   {
     "raw": "not a command",
     "action": null,
     "prefix": "",
-    "phrase": ""
+    "phrase": "",
+    "tail": ""
   },
   {
     "raw": "over",
     "action": "sent",
     "prefix": "",
-    "phrase": "over"
+    "phrase": "over",
+    "tail": ""
   },
   {
     "raw": "see you over",
     "action": "sent",
     "prefix": "see you",
-    "phrase": "over"
+    "phrase": "over",
+    "tail": ""
   },
   {
     "raw": "submit",
     "action": "sent",
     "prefix": "",
-    "phrase": "submit"
+    "phrase": "submit",
+    "tail": ""
   },
   {
     "raw": "all done",
     "action": "sent",
     "prefix": "",
-    "phrase": "all done"
+    "phrase": "all done",
+    "tail": ""
   },
   {
     "raw": "send now",
     "action": "sent",
     "prefix": "",
-    "phrase": "send now"
+    "phrase": "send now",
+    "tail": ""
   },
   {
     "raw": "clear everything",
     "action": "cleared",
     "prefix": "",
-    "phrase": "clear everything"
+    "phrase": "clear everything",
+    "tail": ""
   },
   {
     "raw": "clear on",
     "action": "cleared",
     "prefix": "",
-    "phrase": "clear on"
+    "phrase": "clear on",
+    "tail": ""
   },
   {
     "raw": "undo",
     "action": "scratched",
     "prefix": "",
-    "phrase": "undo"
+    "phrase": "undo",
+    "tail": ""
   },
   {
     "raw": "undo that",
     "action": "scratched",
     "prefix": "",
-    "phrase": "undo that"
+    "phrase": "undo that",
+    "tail": ""
   },
   {
     "raw": "discard",
     "action": "cancelled",
     "prefix": "",
-    "phrase": "discard"
+    "phrase": "discard",
+    "tail": ""
   },
   {
     "raw": "cancel",
     "action": "cancelled",
     "prefix": "",
-    "phrase": "cancel"
+    "phrase": "cancel",
+    "tail": ""
   },
   {
     "raw": "canceled",
     "action": "cancelled",
     "prefix": "",
-    "phrase": "canceled"
+    "phrase": "canceled",
+    "tail": ""
   },
   {
     "raw": "start over",
     "action": "cleared",
     "prefix": "",
-    "phrase": "start over"
+    "phrase": "start over",
+    "tail": ""
   },
   {
     "raw": "said that",
     "action": null,
     "prefix": "",
-    "phrase": ""
+    "phrase": "",
+    "tail": ""
   },
   {
     "raw": "scroll to the end",
     "action": "scroll_end",
     "prefix": "",
-    "phrase": "scroll to the end"
+    "phrase": "scroll to the end",
+    "tail": ""
   },
   {
     "raw": "hey jarvis page down",
     "action": "page_down",
     "prefix": "",
-    "phrase": "hey jarvis page down"
+    "phrase": "hey jarvis page down",
+    "tail": ""
   },
   {
     "raw": "go back",
     "action": "go_back",
     "prefix": "",
-    "phrase": "go back"
+    "phrase": "go back",
+    "tail": ""
   },
   {
     "raw": "zoom in",
     "action": "zoom_in",
     "prefix": "",
-    "phrase": "zoom in"
+    "phrase": "zoom in",
+    "tail": ""
   },
   {
     "raw": "pause video",
     "action": "pause_video",
     "prefix": "",
-    "phrase": "pause video"
+    "phrase": "pause video",
+    "tail": ""
   },
   {
     "raw": "hey jarvis exit full screen",
     "action": "exit_full_screen",
     "prefix": "",
-    "phrase": "hey jarvis exit full screen"
+    "phrase": "hey jarvis exit full screen",
+    "tail": ""
   },
   {
     "raw": "close tab",
     "action": "close_tab",
     "prefix": "",
-    "phrase": "close tab"
+    "phrase": "close tab",
+    "tail": ""
   },
   {
     "raw": "full screen",
     "action": "full_screen",
     "prefix": "",
-    "phrase": "full screen"
+    "phrase": "full screen",
+    "tail": ""
   },
   {
     "raw": "next tab",
     "action": "next_tab",
     "prefix": "",
-    "phrase": "next tab"
+    "phrase": "next tab",
+    "tail": ""
   },
   {
     "raw": "can you scroll to the top",
     "action": "scroll_top",
     "prefix": "can you",
-    "phrase": "scroll to the top"
+    "phrase": "scroll to the top",
+    "tail": ""
+  },
+  {
+    "raw": "switch app",
+    "action": "previous_app",
+    "prefix": "",
+    "phrase": "switch app",
+    "tail": ""
+  },
+  {
+    "raw": "hey jarvis previous app",
+    "action": "previous_app",
+    "prefix": "",
+    "phrase": "hey jarvis previous app",
+    "tail": ""
+  },
+  {
+    "raw": "last app",
+    "action": "previous_app",
+    "prefix": "",
+    "phrase": "last app",
+    "tail": ""
+  },
+  {
+    "raw": "switch to Chrome",
+    "action": "switch_to_app",
+    "prefix": "",
+    "phrase": "switch to chrome",
+    "tail": "chrome"
+  },
+  {
+    "raw": "hey jarvis can you switch to Visual Studio Code",
+    "action": "switch_to_app",
+    "prefix": "hey jarvis can you",
+    "phrase": "switch to visual studio code",
+    "tail": "visual studio code"
+  },
+  {
+    "raw": "go to terminal",
+    "action": "switch_to_app",
+    "prefix": "",
+    "phrase": "go to terminal",
+    "tail": "terminal"
+  },
+  {
+    "raw": "open Slack",
+    "action": "switch_to_app",
+    "prefix": "",
+    "phrase": "open slack",
+    "tail": "slack"
+  },
+  {
+    "raw": "hey jarvis switch to Chrome app",
+    "action": "switch_to_app",
+    "prefix": "",
+    "phrase": "hey jarvis switch to chrome app",
+    "tail": "chrome app"
+  },
+  {
+    "raw": "go to sleep",
+    "action": "paused",
+    "prefix": "",
+    "phrase": "go to sleep",
+    "tail": ""
+  },
+  {
+    "raw": "go to the store",
+    "action": "switch_to_app",
+    "prefix": "",
+    "phrase": "go to the store",
+    "tail": "the store"
+  },
+  {
+    "raw": "go to the store and buy milk",
+    "action": null,
+    "prefix": "",
+    "phrase": "",
+    "tail": ""
   }
 ]

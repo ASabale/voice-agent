@@ -33,6 +33,7 @@ def test_match_command_vector(vector: dict) -> None:
     assert matched["action"] == vector["action"]
     assert matched["prefix"] == vector["prefix"]
     assert matched["phrase"] == vector["phrase"]
+    assert matched["tail"] == vector["tail"]
 
 
 def test_longest_suffix_beats_shorter_stop() -> None:

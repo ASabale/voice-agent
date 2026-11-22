@@ -267,8 +267,12 @@ type GrammarAction = {
     | "new_tab"
     | "close_tab"
     | "zoom_in"
-    | "zoom_out";
+    | "zoom_out"
+    | "previous_app"
+    | "switch_to_app";
   slots: string[][];
+  // Up to N free words may follow the slots ("switch to <app name>").
+  tail?: number;
 };
 
 // Actions the controller's actuator performs; they never reach the draft.
@@ -291,6 +295,8 @@ const ACTUATOR_ACTIONS: Record<string, true> = {
   close_tab: true,
   zoom_in: true,
   zoom_out: true,
+  previous_app: true,
+  switch_to_app: true,
 };
 type CommandGrammar = { wake: string[][]; actions: GrammarAction[] };
 
@@ -304,7 +310,12 @@ function loadCommandGrammar(): CommandGrammar {
   return commandGrammar;
 }
 
-export type CommandMatch = { action: GrammarAction["action"]; prefix: string; phrase: string };
+export type CommandMatch = {
+  action: GrammarAction["action"];
+  prefix: string;
+  phrase: string;
+  tail: string;
+};
 
 function sameTokens(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((token, i) => token === b[i]);
@@ -322,27 +333,39 @@ export function matchCommand(raw: string, grammar: CommandGrammar = loadCommandG
     .trim()
     .split(" ")
     .filter(Boolean);
-  let best: { span: number; action: GrammarAction["action"]; prefix: string; phrase: string } | null = null;
+  let best: {
+    span: number;
+    action: GrammarAction["action"];
+    prefix: string;
+    phrase: string;
+    tail: string;
+  } | null = null;
   for (let i = 0; i < tokens.length; i++) {
     const span = tokens.slice(i);
     for (const wake of [[] as string[], ...grammar.wake]) {
       if (wake.length > 0 && !sameTokens(span.slice(0, wake.length), wake)) continue;
       const rest = span.slice(wake.length);
       for (const group of grammar.actions) {
-        if (!slotsMatch(rest, group.slots)) continue;
+        if (rest.length < group.slots.length) continue;
+        if (!slotsMatch(rest.slice(0, group.slots.length), group.slots)) continue;
+        const tailWords = rest.slice(group.slots.length);
+        if (tailWords.length > 0) {
+          if (!group.tail || tailWords.length > group.tail) continue;
+        }
         if (best === null || span.length > best.span) {
           best = {
             span: span.length,
             action: group.action,
             prefix: tokens.slice(0, i).join(" "),
             phrase: span.join(" "),
+            tail: tailWords.join(" "),
           };
         }
       }
     }
   }
   if (!best) return null;
-  return { action: best.action, prefix: best.prefix, phrase: best.phrase };
+  return { action: best.action, prefix: best.prefix, phrase: best.phrase, tail: best.tail };
 }
 
 export function deduplicateHandyPaste(currentEditorText: string, rawTranscript: string): string {

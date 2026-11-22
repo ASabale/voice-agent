@@ -175,6 +175,24 @@
     {
       "action": "zoom_out",
       "slots": [["zoom"], ["out", "down"]]
+    },
+    {
+      "action": "previous_app",
+      "slots": [["switch", "change"], ["app"]]
+    },
+    {
+      "action": "previous_app",
+      "slots": [["previous", "last"], ["app"]]
+    },
+    {
+      "action": "switch_to_app",
+      "slots": [["switch", "go", "open", "activate"], ["to"]],
+      "tail": 4
+    },
+    {
+      "action": "switch_to_app",
+      "slots": [["open"]],
+      "tail": 4
     }
   ]
 }
