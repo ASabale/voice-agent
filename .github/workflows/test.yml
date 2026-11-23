@@ -2,6 +2,8 @@ name: test
 on:
   push:
   pull_request:
+permissions:
+  contents: read
 jobs:
   python:
     runs-on: macos-latest
@@ -20,4 +22,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --experimental-strip-types --test tests/match_command.test.ts tests/playback-state.test.ts tests/speech-queue.test.ts tests/memory-pressure.test.ts tests/voicebox-refusal.test.ts tests/memory-defer.test.ts
+      - run: node --experimental-strip-types --test tests/match_command.test.ts tests/playback-state.test.ts tests/speech-queue.test.ts tests/memory-pressure.test.ts tests/voicebox-refusal.test.ts tests/memory-defer.test.ts tests/bridge-auth.test.ts

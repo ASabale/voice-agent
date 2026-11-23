@@ -25,7 +25,7 @@ A working **Stage 1 In-Room Hands-Free Voice Loop** for the focused OMP terminal
 
 ## Not yet specified
 
-- **Stage 2 — Tailscale Phone Voice Bridge**: Speak on iPhone/phone over Tailscale → transcribe on Mac → inject into OMP → stream/play VoiceBox audio reply back on the phone.
+- **Stage 2 — Tailscale Phone Voice Bridge**: Speak on iPhone/phone over Tailscale → transcribe on Mac → inject into OMP → stream/play VoiceBox audio reply back on the phone. The bridge is guarded only by the per-session `X-OMP-Voice-Token` and bound to 127.0.0.1; phone exposure needs a real transport credential first.
 - **Stage 3 — Cross-Session Memory Bank**: Structured cross-session memory layer (`memory://` / knowledge bank) that persists context across OMP sessions automatically.
 - **Stage 4 — Directory Sandboxing & OS Safety**: Encapsulating where the AFK agent can operate safely (restricting filesystem/shell/browser blast radius to an approved directory/policy when driven remotely).
 - **Stage 5 — Real-Time Duplex Conversational Broker**: Full-duplex voice model that converses, confirms intent verbally, and dispatches refined prompts to underlying OMP sessions.

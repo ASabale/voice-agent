@@ -54,10 +54,12 @@ import stat
 import sqlite3
 import struct
 import subprocess
+import tempfile
 import queue
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -234,6 +236,19 @@ TEXT_ROLES = frozenset(
 STATUS_FILE = STATE_DIR / "status.json"
 LOG_FILE = STATE_DIR / "controller.log"
 TTS_STATE_FILE = STATE_DIR / "tts-playing.json"
+# Per-session credential for the omp bridge, written by the extension into
+# sessions/<pid>.json; every bridge request must carry it.
+BRIDGE_TOKEN_HEADER = "X-OMP-Voice-Token"
+# A send phrase only submits if a wake fired this recently (mirrors the
+# extension's WAKE_GATE_MS).
+WAKE_SEND_WINDOW_SECONDS = 30.0
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write state text with 0600 so other local users cannot read drafts."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
 
 _coreaudio = None
 _coregraphics = None
@@ -1161,7 +1176,7 @@ def _read_playback_slots() -> list[dict] | None:
     # prune is a chance to re-derive the projection from the surviving slots.
     if pruned:
         try:
-            TTS_STATE_FILE.write_text(json.dumps(project_aggregate(found, pid_alive, now)), encoding="utf-8")
+            _write_private(TTS_STATE_FILE, json.dumps(project_aggregate(found, pid_alive, now)))
         except OSError:
             pass
     return found
@@ -1273,7 +1288,7 @@ def _rotate_stdout_log() -> bool:
     sys.stdout.flush()
     if not rotate_log(path, LOG_ROTATE_BYTES):
         return False
-    new_fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    new_fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     os.dup2(new_fd, 1)
     os.close(new_fd)
     return True
@@ -1371,16 +1386,18 @@ def publish_capture_totals() -> None:
     data.update(render)
     data.update(aec)
     data.update(_acoustic_snapshot)
-    tmp = STATUS_FILE.with_suffix(".capture.tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(STATUS_FILE)
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), prefix="status-", suffix=".capture.tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2))
+    os.replace(tmp, str(STATUS_FILE))
     if note:
         log(note)
 
 
 def write_status(state: str, extra: dict | None = None) -> None:
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         payload = {
             "state": state,
             "pid": os.getpid(),
@@ -1392,11 +1409,24 @@ def write_status(state: str, extra: dict | None = None) -> None:
         payload["mic_dropped"] = dropped
         payload["mic_invalid"] = invalid
         payload.update(_render_fields)
-        tmp = STATUS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(STATUS_FILE)
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), prefix="status-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2))
+        os.replace(tmp, str(STATUS_FILE))
     except Exception as exc:
         log_once("write-status", f"write_status failed: {exc}")
+
+
+def bridge_token_for_base(base: str) -> str | None:
+    """The session token for the bridge port this request targets, if known."""
+    try:
+        port = int(urllib.parse.urlsplit(base).port)
+    except (TypeError, ValueError):
+        return None
+    for session in load_session_registry().values():
+        if session.get("port") == port and session.get("token"):
+            return str(session["token"])
+    return None
 
 
 def bridge_request(
@@ -1409,6 +1439,9 @@ def bridge_request(
     url = f"{base or OMP_BRIDGE_URL}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"content-type": "application/json"} if data is not None else {}
+    token = bridge_token_for_base(base or OMP_BRIDGE_URL)
+    if token:
+        headers[BRIDGE_TOKEN_HEADER] = token
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1592,6 +1625,7 @@ def load_session_registry() -> dict[int, dict]:
             "tty": normalize_tty(data.get("tty")),
             "started_at": normalize_started_at(data.get("startedAt")),
             "port": int(port) if isinstance(port, int) and port > 0 else None,
+            "token": data.get("token") if isinstance(data.get("token"), str) else None,
         }
     return found
 
@@ -1613,7 +1647,7 @@ def loopback_listen_port(lsof_text: str) -> int | None:
     return ports[0]
 
 
-def pid_bridge_port(pid: int) -> int | None:
+def pid_bridge_port(pid: int, token: str | None = None) -> int | None:
     """Registry files disappear while the bridge is still listening. One loopback port that answers /status is that bridge."""
     try:
         text = subprocess.check_output(
@@ -1626,9 +1660,16 @@ def pid_bridge_port(pid: int) -> int | None:
     port = loopback_listen_port(text)
     if port is None:
         return None
+    headers = {BRIDGE_TOKEN_HEADER: token} if token else {}
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=1) as res:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/status", headers=headers)
+        with urllib.request.urlopen(req, timeout=1) as res:
             data = json.loads(res.read().decode())
+    except urllib.error.HTTPError as exc:
+        # A 401 proves a token-guarded bridge is listening on this port.
+        if exc.code == 401:
+            return port
+        return None
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict) or data.get("ok") is not True or data.get("pid") != pid:
@@ -1647,7 +1688,7 @@ def omp_session_records() -> list[dict]:
         if not current.get("started_at"):
             current["started_at"] = pid_started_at(pid)
         if not current.get("port"):
-            current["port"] = pid_bridge_port(pid)
+            current["port"] = pid_bridge_port(pid, current.get("token"))
         records[pid] = current
     return list(records.values())
 
@@ -1868,7 +1909,8 @@ def _duck_transaction_path() -> Path:
 
 def _save_duck_transaction(state: "MicState") -> None:
     try:
-        _duck_transaction_path().write_text(
+        _write_private(
+            _duck_transaction_path(),
             json.dumps(
                 {
                     "target": state.tts_duck_target,
@@ -1876,7 +1918,7 @@ def _save_duck_transaction(state: "MicState") -> None:
                     "ducked_at": state.tts_duck_at,
                     "stream_gain": state.tts_stream_gain,
                 }
-            )
+            ),
         )
     except Exception as exc:
         log_once("duck-persist", f"could not persist duck transaction: {exc}")
@@ -1896,7 +1938,7 @@ def _stream_gain_path() -> Path:
 def write_stream_gain(gain: float) -> bool:
     gain = max(0.0, min(1.0, gain))
     try:
-        _stream_gain_path().write_text(json.dumps({"gain": gain}), encoding="utf-8")
+        _write_private(_stream_gain_path(), json.dumps({"gain": gain}))
         return True
     except Exception as exc:
         log_once("stream-gain", f"could not write stream gain: {exc}")
@@ -2100,15 +2142,16 @@ def transcribe_handy_file(frames: list[np.ndarray]) -> str:
     if not frames:
         return ""
     audio = np.concatenate(frames).astype(np.int16, copy=False)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    path = STATE_DIR / f"handy-capture-{time.time_ns()}.wav"
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     import wave
 
-    with wave.open(str(path), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(16000)
-        handle.writeframes(audio.tobytes())
+    fd, path = tempfile.mkstemp(dir=str(STATE_DIR), prefix="handy-capture-", suffix=".wav")
+    with os.fdopen(fd, "wb") as raw:
+        with wave.open(raw, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            handle.writeframes(audio.tobytes())
     try:
         proc = subprocess.run(
             [HANDY_BIN, "--transcribe-file", str(path), "--json"],
@@ -3313,11 +3356,13 @@ def scroll_command(text: str) -> tuple[str, int] | None:
     return f"scroll_{m.group(1)}", _SCROLL_LINES[size]
 
 
-def dispatch_transcript(text: str) -> dict:
+def dispatch_transcript(text: str, wake: bool = True) -> dict:
     """Paste into the focused text control, or send to the newest omp when focus is not text.
 
     In a text field, a trailing send phrase ("send it", "send that") is Enter,
     not more typed words. Anywhere else, that phrase still submits the omp draft.
+    `wake` tells the bridge whether a wake word fired recently, so a bare send
+    phrase heard from ambient audio cannot submit a draft on its own.
     """
     original = " ".join(text.strip().split())
     if not original:
@@ -3362,7 +3407,7 @@ def dispatch_transcript(text: str) -> dict:
         # copy only when that copy is the pause line and nothing else.
         base = session_bridge_base(dest)
         if matched_now and matched_now["action"] == "paused" and base:
-            resp = bridge_request("/transcript", method="POST", body={"text": original}, base=base)
+            resp = bridge_request("/transcript", method="POST", body={"text": original, "wake": wake}, base=base)
             if resp and resp.get("ok"):
                 log(f"Paused draft: {resp.get('draft')!r}")
                 return resp
@@ -3378,7 +3423,7 @@ def dispatch_transcript(text: str) -> dict:
             if result.get("action") == "sent" and base and kept.strip():
                 draft = bridge_draft(base)
                 if " ".join(draft.split()).lower() == " ".join(kept.split()).lower():
-                    bridge_request("/transcript", method="POST", body={"text": "clear draft"}, base=base)
+                    bridge_request("/transcript", method="POST", body={"text": "clear draft", "wake": wake}, base=base)
             return result
         return paste_into_focus(original, app=dest.get("app"))
 
@@ -3399,7 +3444,7 @@ def dispatch_transcript(text: str) -> dict:
         if status.get("version", 1) >= 2:
             aside = _command_leaves_hold(text)
             payload = text if aside else _with_undelivered(text)
-            resp = bridge_request("/transcript", method="POST", body={"text": payload}, base=base)
+            resp = bridge_request("/transcript", method="POST", body={"text": payload, "wake": wake}, base=base)
             if resp and resp.get("ok"):
                 cleared = match_command(text)
                 if not aside or (cleared and cleared["action"] == "cleared"):
@@ -3447,21 +3492,21 @@ def dispatch_transcript(text: str) -> dict:
                 time.sleep(0.08)
             if matched and matched["action"] == "paused":
                 mapped = f"{matched['prefix']} pause listening".strip()
-                resp = bridge_request("/transcript", method="POST", body={"text": mapped}, base=base)
+                resp = bridge_request("/transcript", method="POST", body={"text": mapped, "wake": wake}, base=base)
                 if resp and resp.get("ok"):
                     return resp
                 log("Pause post failed; keeping the held sentence")
                 return {"action": "held", "draft": _visible_hold()}
             if matched and matched["action"] == "sent":
                 mapped = _with_undelivered(f"{matched['prefix']} send prompt".strip())
-                resp = bridge_request("/transcript", method="POST", body={"text": mapped}, base=base)
+                resp = bridge_request("/transcript", method="POST", body={"text": mapped, "wake": wake}, base=base)
                 if resp and resp.get("ok"):
                     _clear_delivery(text)
                     return resp
                 return _hold_failed_send(matched["prefix"])
             aside = _command_leaves_hold(text)
             payload = text if aside else _with_undelivered(text)
-            resp = bridge_request("/transcript", method="POST", body={"text": payload}, base=base)
+            resp = bridge_request("/transcript", method="POST", body={"text": payload, "wake": wake}, base=base)
             if resp and resp.get("ok"):
                 if not aside or (matched and matched["action"] == "cleared"):
                     _clear_delivery(text)
@@ -3588,8 +3633,9 @@ def note_unmatched_command(heard: str, reason: str, path: Path | None = None) ->
         "reason": reason,
     }
     try:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with out.open("a", encoding="utf-8") as handle:
+        out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(out), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
     except OSError as exc:
         log_once("unmatched-write", f"could not record an unmatched command: {exc}")
@@ -3602,7 +3648,8 @@ def _open_pid_lock(block: bool) -> object | None:
     already-locked fd to the child via pass_fds); a start probe takes it only
     briefly to prove no daemon is holding it.
     """
-    handle = open(PID_FILE, "a+", encoding="utf-8")
+    fd = os.open(str(PID_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    handle = os.fdopen(fd, "a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
     except OSError:
@@ -3639,8 +3686,9 @@ def barge_note(mic: "MicState", stage: str, **fields) -> None:
     if len(mic.barge_trace) > 80:
         del mic.barge_trace[:-80]
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with (STATE_DIR / "barge-trace.jsonl").open("a", encoding="utf-8") as handle:
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(STATE_DIR / "barge-trace.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event) + "\n")
     except OSError:
         return
@@ -3766,6 +3814,12 @@ class MicState:
     idle_speech_frames: list[np.ndarray] = field(default_factory=list)
     dict_tail_frames: deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=38))
     dict_speech_frames: list[np.ndarray] = field(default_factory=list)
+
+    def recent_wake(self) -> bool:
+        """True while a wake is fresh: dictating now, or woken within the send
+        window. Ambient "send prompt" from media audio has no wake behind it,
+        so it must never submit a draft."""
+        return self.state == "DICTATING" or time.monotonic() - self.wake_mono <= WAKE_SEND_WINDOW_SECONDS
 
     def turn_metrics(self) -> dict:
         """Latencies for the most recent turn, monotonic seconds. Metadata only, no transcript text.
@@ -4068,6 +4122,12 @@ class MicState:
                 return True
             idle_cmd = idle_command(heard)
             if idle_cmd and idle_cmd["action"] == "sent":
+                if not self.recent_wake():
+                    # No wake in the window: the phrase is ambient audio, not
+                    # the user finishing a dictation take (F2).
+                    log(f"Standalone send phrase in IDLE ({heard!r}) ignored: no wake within {WAKE_SEND_WINDOW_SECONDS:.0f}s")
+                    self.cooldown_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
+                    return False
                 target = resolve_delivery()
                 if target.get("mode") == "bridge" and not bridge_draft(bridge_base(target)).strip():
                     # A lone "send that" with nothing drafted is the tail of a
@@ -4076,7 +4136,7 @@ class MicState:
                     self.cooldown_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
                     return False
                 log(f"Standalone send phrase in IDLE ({heard!r}) -> submitting draft")
-                outcome = dispatch_transcript("send prompt")
+                outcome = dispatch_transcript("send prompt", wake=self.recent_wake())
                 if outcome.get("action") == "sent":
                     play_cue(SOUND_SEND, wait=False)
                 self.cooldown_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
@@ -4512,12 +4572,14 @@ class MicState:
                             import wave
 
                             clip_dir = STATE_DIR / "barge-clips"
-                            clip_dir.mkdir(parents=True, exist_ok=True)
-                            with wave.open(str(clip_dir / f"{time.time():.3f}.wav"), "wb") as wav:
-                                wav.setnchannels(1)
-                                wav.setsampwidth(2)
-                                wav.setframerate(MIC_RENDER_RATE)
-                                wav.writeframes(clip.astype(np.int16).tobytes())
+                            clip_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                            fd, clip_path = tempfile.mkstemp(dir=str(clip_dir), prefix="barge-", suffix=".wav")
+                            with os.fdopen(fd, "wb") as raw:
+                                with wave.open(raw, "wb") as wav:
+                                    wav.setnchannels(1)
+                                    wav.setsampwidth(2)
+                                    wav.setframerate(MIC_RENDER_RATE)
+                                    wav.writeframes(clip.astype(np.int16).tobytes())
                         except OSError:
                             pass
                     log(
@@ -4974,7 +5036,7 @@ def publish_listening(mic: "MicState") -> None:
         return
     _listening_written = now
     try:
-        (STATE_DIR / "listening.json").write_text(json.dumps({"until": now + 1.0}), encoding="utf-8")
+        _write_private(STATE_DIR / "listening.json", json.dumps({"until": now + 1.0}))
     except OSError as exc:
         log_once("listening", f"could not write listening.json: {exc}")
 
@@ -5242,13 +5304,13 @@ def run_daemon(
     idle_timeout_seconds: float = 15.0,
     vad_threshold: float = 0.40,
 ) -> int:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     global _pid_lock_handle
     _pid_lock_handle = _claim_run_lock()
     if _pid_lock_handle is None:
         log("OMP Voice Controller already running (pid lock held); refusing to start a second instance.")
         return 1
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    _write_private(PID_FILE, str(os.getpid()))
     import sounddevice as sd
     from faster_whisper import WhisperModel
     from openwakeword.model import Model
@@ -5498,7 +5560,7 @@ def cmd_stop() -> int:
 
 
 def cmd_start_bg(args: argparse.Namespace) -> int:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = _open_pid_lock(block=False)
     if lock is None:
         print("OMP Voice Controller already running.")
@@ -5528,7 +5590,8 @@ def cmd_start_bg(args: argparse.Namespace) -> int:
         str(args.idle_timeout),
     ]
     rotate_log(LOG_FILE, LOG_ROTATE_BYTES)
-    log_fh = open(LOG_FILE, "a", encoding="utf-8")
+    log_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    log_fh = os.fdopen(log_fd, "a", encoding="utf-8")
     child_env = os.environ.copy()
     child_env["OMP_VOICE_PID_LOCK_FD"] = str(lock.fileno())
     proc = subprocess.Popen(

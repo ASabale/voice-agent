@@ -31,7 +31,7 @@ def test_a_missing_registry_port_uses_the_one_loopback_listener(monkeypatch) -> 
     monkeypatch.setattr(controller, "pid_alive", lambda _pid: True)
     monkeypatch.setattr(controller, "pid_tty", lambda _pid: "/dev/ttys002")
     monkeypatch.setattr(controller, "pid_started_at", lambda _pid: 10)
-    monkeypatch.setattr(controller, "pid_bridge_port", lambda _pid: 56876)
+    monkeypatch.setattr(controller, "pid_bridge_port", lambda _pid, _token=None: 56876)
     records = controller.omp_session_records()
     dest = controller.choose_delivery(TEXT, records, None)
     assert dest == {"mode": "bridge", "pid": 80894, "port": 56876, "focused_text": True}

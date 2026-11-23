@@ -15,8 +15,8 @@ Specifically, inside any OMP extension (`~/.omp/agent/extensions/*.ts`):
 - **`pi.sendUserMessage(content: string, options?)`** — submits a user prompt through the exact normal prompt flow (when idle, starts a turn immediately; when streaming, steers or queues as `followUp`).
 
 ### Why this is a game-changer for Akshay's Stage 1 AND Stage 2 (Tailscale Phone):
-1. **Zero focus bugs**: Even if Terminal/iTerm/Ghostty is not the frontmost macOS window while Akshay is walking around the room (or on his phone over Tailscale), an OMP extension (`omp-voice-loop.ts`) listening on a local Unix socket / HTTP port (`127.0.0.1`) or watching Handy's `history.db` can call `ctx.ui.setEditorText(current + " " + chunk)` to visibly accumulate the Draft in the OMP input box, and when `"send prompt"` is spoken, read `const draft = ctx.ui.getEditorText()`, clear the editor `ctx.ui.setEditorText("")`, and call `pi.sendUserMessage(draft)`!
-2. **Stage 2 Ready**: When Akshay connects from his phone over Tailscale later, the phone sends audio/text to the exact same local endpoint and sees/submits directly into the live OMP session.
+1. **Zero focus bugs**: Even if Terminal/iTerm/Ghostty is not the frontmost macOS window while Akshay is walking around the room (or on his phone over Tailscale), an OMP extension (`omp-voice-loop.ts`) listening on a local HTTP port (`127.0.0.1`) — every request must carry the session's `X-OMP-Voice-Token` — can call `ctx.ui.setEditorText(current + " " + chunk)` to visibly accumulate the Draft in the OMP input box, and when `"send prompt"` is spoken, read `const draft = ctx.ui.getEditorText()`, clear the editor `ctx.ui.setEditorText("")`, and call `pi.sendUserMessage(draft)`!
+2. **Stage 2 Ready**: When Akshay connects from his phone over Tailscale later, the phone sends audio/text to the same bridge with the session token; Stage 2 must add a real transport credential before the bridge is bound to anything beyond 127.0.0.1.
 
 ## 2. VoiceBox Playback State & Immediate Barge-In
 

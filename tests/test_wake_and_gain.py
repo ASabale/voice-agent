@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import queue
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -459,7 +460,7 @@ def test_idle_verify_submits_or_scratches_without_posting(monkeypatch: pytest.Mo
     posted: list[str] = []
     cues: list[str] = []
 
-    def dispatch(text: str) -> dict[str, str]:
+    def dispatch(text: str, wake: bool = True) -> dict[str, str]:
         posted.append(text)
         if text == "send prompt":
             return {"action": "sent"}
@@ -493,6 +494,7 @@ def test_idle_verify_submits_or_scratches_without_posting(monkeypatch: pytest.Mo
 
     send = controller.MicState()
     send.enter_dictating = refuse_enter  # type: ignore[method-assign]
+    send.wake_mono = time.monotonic() - 5  # a wake fired just before the send
     assert send.apply_whisper("idle_verify", "send prompt", None, None) is False
     assert posted == ["send prompt"]
     assert cues == [controller.SOUND_SEND]
@@ -500,6 +502,7 @@ def test_idle_verify_submits_or_scratches_without_posting(monkeypatch: pytest.Mo
 
     synonym = controller.MicState()
     synonym.enter_dictating = refuse_enter  # type: ignore[method-assign]
+    synonym.wake_mono = time.monotonic() - 5
     assert synonym.apply_whisper("idle_verify", "all done", None, None) is False
     assert posted == ["send prompt", "send prompt"]
     assert cues == [controller.SOUND_SEND, controller.SOUND_SEND]
@@ -773,11 +776,11 @@ def test_dispatch_rewrites_a_send_on_a_v2_bridge_without_posting_live(monkeypatc
 
     sent = controller.dispatch_transcript("all done")
     assert sent["draft"] == "send prompt"
-    assert calls[-1] == ("POST", "/transcript", {"text": "send prompt"}, "http://127.0.0.1:9")
+    assert calls[-1] == ("POST", "/transcript", {"text": "send prompt", "wake": True}, "http://127.0.0.1:9")
 
     heard = controller.dispatch_transcript("scratch that")
     assert heard["draft"] == "scratch that"
-    assert calls[-1][2] == {"text": "scratch that"}
+    assert calls[-1][2] == {"text": "scratch that", "wake": True}
 
     plain = controller.dispatch_transcript("hello there")
     assert plain["draft"] == "hello there"
@@ -2273,7 +2276,7 @@ def test_v1_dispatch_rewrites_a_pause_without_sending_keystrokes(monkeypatch: py
     draft["text"] = ""
     sent = controller.dispatch_transcript("all done")
     assert sent["draft"] == "send prompt"
-    assert posts[-1] == {"text": "send prompt"}
+    assert posts[-1] == {"text": "send prompt", "wake": True}
     assert scripts == []
 
     controller.PRESERVED_PAUSE = ""
@@ -2281,7 +2284,7 @@ def test_v1_dispatch_rewrites_a_pause_without_sending_keystrokes(monkeypatch: py
         draft["text"] = "please stop"
         paused = controller.dispatch_transcript("please stop")
         assert paused["draft"] == "please pause listening"
-        assert posts[-1] == {"text": "please pause listening"}
+        assert posts[-1] == {"text": "please pause listening", "wake": True}
         assert scripts == ['tell application "System Events" to repeat 11 times\nkey code 51\nend repeat']
     finally:
         controller.PRESERVED_PAUSE = ""
@@ -2343,7 +2346,7 @@ def test_paste_delivery_types_a_plan_without_touching_the_focused_app(monkeypatc
     try:
         paused = controller.dispatch_transcript("please stop")
         assert paused["action"] == "paused"
-        assert posts == [{"text": "please stop"}]
+        assert posts == [{"text": "please stop", "wake": True}]
         assert len(injected) == 2
     finally:
         controller.PRESERVED_PAUSE = ""
@@ -2354,7 +2357,7 @@ def test_paste_delivery_types_a_plan_without_touching_the_focused_app(monkeypatc
         kept = controller.dispatch_transcript("ship all done")
         assert kept["action"] == "sent"
         assert injected[-1] == ("remember this ship", "sent")
-        assert posts[-1] == {"text": "clear draft"}
+        assert posts[-1] == {"text": "clear draft", "wake": True}
     finally:
         controller.PRESERVED_PAUSE = ""
 
@@ -2810,9 +2813,10 @@ def test_standalone_send_with_an_empty_draft_does_nothing(monkeypatch: pytest.Mo
     draft = {"text": ""}
     monkeypatch.setattr(controller, "resolve_delivery", lambda: {"mode": "bridge", "port": 1})
     monkeypatch.setattr(controller, "bridge_draft", lambda _base: draft["text"])
-    monkeypatch.setattr(controller, "dispatch_transcript", lambda text: sent.append(text) or {"action": "sent"})
+    monkeypatch.setattr(controller, "dispatch_transcript", lambda text, wake=True: sent.append(text) or {"action": "sent"})
     monkeypatch.setattr(controller, "play_cue", lambda *_a, **_k: None)
     mic = controller.MicState()
+    mic.wake_mono = time.monotonic() - 5  # wake fired just before, so the send is legitimate
     mic.apply_whisper("idle_verify", "Send that.", None, None)
     assert sent == []
     draft["text"] = "fix the bridge"

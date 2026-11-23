@@ -226,9 +226,14 @@ function readJson(file: string): unknown {
 }
 
 function writeJsonAtomic(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value));
+  const fd = fs.openSync(tmp, "w", 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(value));
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, file);
 }
 

@@ -100,6 +100,31 @@ test("deduplicateHandyPaste drops a transcript already pasted at the end", () =>
   assert.equal(deduplicateHandyPaste("draft", "send prompt"), "draft");
 });
 
+test("a bare send phrase with no recent wake does not submit", () => {
+  const parsed = parseVoiceTranscript("send prompt", "my private draft", "", { wakeActive: false });
+  assert.equal(parsed.result.action, "noop");
+  assert.equal(parsed.nextEditorText, "my private draft");
+  assert.equal(parsed.submitText, undefined);
+});
+
+test("a bare send phrase submits when the controller reports a recent wake", () => {
+  const parsed = parseVoiceTranscript("send prompt", "draft words", undefined, { wakeActive: true });
+  assert.equal(parsed.result.action, "sent");
+  assert.equal(parsed.submitText, "draft words");
+});
+
+test("a send phrase that says the wake word submits without the wake flag", () => {
+  const parsed = parseVoiceTranscript("hey jarvis send prompt", "draft words", undefined, { wakeActive: false });
+  assert.equal(parsed.result.action, "sent");
+  assert.equal(parsed.submitText, "draft words");
+});
+
+test("pause and clear phrases keep working without the wake flag", () => {
+  const parsed = parseVoiceTranscript("pause listening", "draft words", undefined, { wakeActive: false });
+  assert.equal(parsed.result.action, "paused");
+  assert.equal(parsed.nextEditorText, "draft words");
+});
+
 test("VoiceSession instances do not share spoken state", () => {
   const first = new VoiceSession();
   const second = new VoiceSession();

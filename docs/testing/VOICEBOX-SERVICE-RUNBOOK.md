@@ -29,7 +29,7 @@ On a production launch the window calls `start_server` once. The sidecar argumen
 --data-dir <app data dir> --port 17493 --parent-pid <gui pid>
 ```
 
-`--host 0.0.0.0` is added only when network access is enabled. `VOICEBOX_MODELS_DIR` is set only when a custom models directory is set. The data dir on this Mac is `~/Library/Application Support/sh.voicebox.app`.
+`VOICEBOX_MODELS_DIR` is set only when a custom models directory is set. The data dir on this Mac is `~/Library/Application Support/sh.voicebox.app`. The sidecar has no authentication of any kind: keep it loopback-only. Never add `--host 0.0.0.0` — a LAN or tailnet host could then generate speech in the owner's cloned voice or unload models.
 
 If that one start fails for a reason other than "port in use", the UI records the error and does not try again. It polls `/health` only when the port is already taken. A server that exits after launch is not started again by the running GUI.
 

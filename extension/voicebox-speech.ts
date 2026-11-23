@@ -4,12 +4,16 @@
 // One HTTP server per omp session, on an ephemeral 127.0.0.1 port.
 // The controller reads ~/.local/state/omp-voice/sessions/<pid>.json and
 // sends /transcript to the focused session, not to whichever process
-// happened to bind a single shared port.
+// happened to bind a single shared port. Every request must carry the
+// per-session token written into that registry file as `token` via the
+// header `X-OMP-Voice-Token`; requests with an Origin header or a Host
+// other than 127.0.0.1:<port> are refused (403), unauthenticated ones 401.
 // - GET  /status     -> { speaking, draft, draftLength, pid }
 // - POST /barge-in   -> kills active afplay and flushes pending TTS queue
-// - POST /transcript -> { text } -> appends to OMP editor Draft or submits on command phrase
+// - POST /transcript -> { text, wake } -> appends to OMP editor Draft or submits on command phrase
 
 import { type ChildProcess, spawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -87,8 +91,97 @@ export async function waitForHeadroom(
 
 let voiceboxRetryAt = 0;
 const BRIDGE_HOST = "127.0.0.1";
+// Header names arrive lowercased on the Node side; the controller sends
+// `X-OMP-Voice-Token` and Node normalizes it to this key.
+export const BRIDGE_TOKEN_HEADER = "x-omp-voice-token";
+// A send phrase submits only when a wake fired this recently (or the wake
+// word is spoken inside the phrase). Ambient "send prompt" from media audio
+// must never submit the draft.
+export const WAKE_GATE_MS = 30000;
+
+export function newBridgeToken(): string {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function tokenMatches(candidate: string, expected: string): boolean {
+  const a = Buffer.from(candidate, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+export interface BridgeHandlers {
+  status: () => Record<string, unknown>;
+  transcript: (text: string, wake: boolean) => Record<string, unknown>;
+  takeover: () => Record<string, unknown>;
+  bargeIn: (body: string) => Record<string, unknown>;
+}
+
+// The bridge seam: all four routes behind one authenticated http.Server.
+// Refuses cross-origin/rebinding requests and anything without the session
+// token before touching any session state.
+export function createBridgeServer(handlers: BridgeHandlers, token: string): http.Server {
+  return http.createServer((req, res) => {
+    const sendJson = (code: number, payload: unknown) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    if (req.headers.origin) {
+      sendJson(403, { ok: false, error: "origin_not_allowed" });
+      return;
+    }
+    const localPort = req.socket.localPort;
+    if (req.headers.host !== `${BRIDGE_HOST}:${localPort}`) {
+      sendJson(403, { ok: false, error: "host_not_allowed" });
+      return;
+    }
+    const rawToken = req.headers[BRIDGE_TOKEN_HEADER];
+    const candidate = Array.isArray(rawToken) ? rawToken[0] : rawToken;
+    if (typeof candidate !== "string" || !tokenMatches(candidate, token)) {
+      sendJson(401, { ok: false, error: "missing_or_bad_token" });
+      return;
+    }
+    if (req.method === "POST" && !/^application\/json/i.test(String(req.headers["content-type"] ?? ""))) {
+      sendJson(415, { ok: false, error: "content_type_not_allowed" });
+      return;
+    }
+    if (req.method === "GET" && req.url === "/status") {
+      sendJson(200, handlers.status());
+      return;
+    }
+    if (req.method === "POST" && req.url === "/takeover") {
+      sendJson(200, handlers.takeover());
+      return;
+    }
+    if (req.method === "POST" && req.url === "/barge-in") {
+      readBody(req, (body) => sendJson(200, handlers.bargeIn(body)));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/transcript") {
+      readBody(req, (body) => {
+        try {
+          const parsed = JSON.parse(body || "{}") as { text?: unknown; wake?: unknown };
+          const text = typeof parsed.text === "string" ? parsed.text : "";
+          const wake = Boolean(parsed.wake);
+          sendJson(200, handlers.transcript(text, wake));
+        } catch (err) {
+          sendJson(400, { ok: false, error: String(err) });
+        }
+      });
+      return;
+    }
+    sendJson(404, { ok: false, error: "not_found" });
+  });
+}
 const HTTP_BODY_CAP = 65536;
 let boundBridgePort = 0;
+// TTS clips live in a private per-session directory (0700) instead of
+// predictable names directly in tmpdir, so another local user cannot race a
+// symlink against a clip write.
+let clipDir: string | undefined;
+function sessionClipDir(): string {
+  if (!clipDir) clipDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-vb-"), { mode: 0o700 });
+  return clipDir;
+}
 function ttsModelSize(): "0.6B" | "1.7B" {
   try {
     const raw = fs
@@ -318,6 +411,8 @@ export type CommandMatch = {
   prefix: string;
   phrase: string;
   tail: string;
+  // True when the matched span itself started with the wake word.
+  wakeIncluded: boolean;
 };
 
 function sameTokens(a: string[], b: string[]): boolean {
@@ -342,6 +437,7 @@ export function matchCommand(raw: string, grammar: CommandGrammar = loadCommandG
     prefix: string;
     phrase: string;
     tail: string;
+    wakeIncluded: boolean;
   } | null = null;
   for (let i = 0; i < tokens.length; i++) {
     const span = tokens.slice(i);
@@ -362,13 +458,14 @@ export function matchCommand(raw: string, grammar: CommandGrammar = loadCommandG
             prefix: tokens.slice(0, i).join(" "),
             phrase: span.join(" "),
             tail: tailWords.join(" "),
+            wakeIncluded: wake.length > 0,
           };
         }
       }
     }
   }
   if (!best) return null;
-  return { action: best.action, prefix: best.prefix, phrase: best.phrase, tail: best.tail };
+  return { action: best.action, prefix: best.prefix, phrase: best.phrase, tail: best.tail, wakeIncluded: best.wakeIncluded };
 }
 
 export function deduplicateHandyPaste(currentEditorText: string, rawTranscript: string): string {
@@ -385,6 +482,7 @@ export function parseVoiceTranscript(
   rawTranscript: string,
   currentDraft: string,
   previousDraft?: string,
+  opts?: { wakeActive?: boolean },
 ): { result: TranscriptAction; nextEditorText: string; submitText?: string } {
   const baseDraft = deduplicateHandyPaste(currentDraft, rawTranscript);
   const cleaned = rawTranscript.replace(/\s+/g, " ").trim();
@@ -435,6 +533,11 @@ export function parseVoiceTranscript(
     };
   }
   if (command?.action === "sent") {
+    // F2: a bare send phrase submits only when the controller reports a wake
+    // within the last 30 s; otherwise it is ambient audio and does nothing.
+    if (!command.wakeIncluded && opts?.wakeActive === false) {
+      return { result: { action: "noop", draft: baseDraft }, nextEditorText: baseDraft };
+    }
     const combined = command.prefix
       ? baseDraft.trim()
         ? `${baseDraft.trimEnd()} ${command.prefix}`
@@ -849,10 +952,15 @@ export function speechLogRecord(
 function logSpeech(event: string, text: string, extra: Record<string, unknown> = {}): void {
   try {
     const dir = voiceStateDir();
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const file = path.join(dir, "speech.log");
     rotateLogFile(file, SPEECH_LOG_LIMIT);
-    fs.appendFileSync(file, `${JSON.stringify(speechLogRecord(event, text, extra))}\n`);
+    const fd = fs.openSync(file, "a", 0o600);
+    try {
+      fs.writeSync(fd, `${JSON.stringify(speechLogRecord(event, text, extra))}\n`);
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     // ignore
   }
@@ -938,7 +1046,7 @@ export async function generate(
       return { deferred: true };
     }
     const clipNo = ++session.clipSeq;
-    const wavPath = path.join(os.tmpdir(), `omp-vb-${process.pid}-${clipNo}.wav`);
+    const wavPath = path.join(sessionClipDir(), `clip-${clipNo}.wav`);
     const wavBytes = Buffer.from(arrayBuf);
     const reference = wavReference(wavBytes, wavPath);
     if (!reference || reference.frames < Math.floor(reference.sample_rate * 0.1)) {
@@ -949,7 +1057,12 @@ export async function generate(
       logSpeech("deferred", text, { reason: "invalid-audio", bytes: wavBytes.byteLength });
       return { deferred: true };
     }
-    fs.writeFileSync(wavPath, wavBytes);
+    const fd = fs.openSync(wavPath, "w", 0o600);
+    try {
+      fs.writeSync(fd, wavBytes);
+    } finally {
+      fs.closeSync(fd);
+    }
     logSpeech("generated", text, {
       bytes: wavBytes.byteLength,
       wav: path.basename(wavPath),
@@ -1421,6 +1534,14 @@ export default function voiceboxSpeech(pi: {
     } catch {
       // ignore
     }
+    if (clipDir) {
+      try {
+        fs.rmSync(clipDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+      clipDir = undefined;
+    }
   };
   const sessionTty = (): string | null => {
     try {
@@ -1437,11 +1558,16 @@ export default function voiceboxSpeech(pi: {
     body: JSON.stringify({ autoplay_on_generate: false }),
   }).catch(() => undefined);
 
-  const applyTranscript = (text: string): TranscriptAction => {
+  const bridgeToken = newBridgeToken();
+  let lastWakeAt = 0;
+
+  const applyTranscript = (text: string, wake: boolean): TranscriptAction => {
+    if (wake) lastWakeAt = Date.now();
+    const wakeActive = wake || Date.now() - lastWakeAt <= WAKE_GATE_MS;
     const currentDraft = latestCtx?.ui?.getEditorText?.() ?? "";
     const baseDraft = deduplicateHandyPaste(currentDraft, text);
     const prevDraft = draftHistory.length > 0 ? draftHistory[draftHistory.length - 1] : "";
-    const { result, nextEditorText, submitText } = parseVoiceTranscript(text, currentDraft, prevDraft);
+    const { result, nextEditorText, submitText } = parseVoiceTranscript(text, currentDraft, prevDraft, { wakeActive });
     if (result.action === "appended") {
       draftHistory.push(baseDraft);
       if (draftHistory.length > 30) draftHistory.shift();
@@ -1477,17 +1603,12 @@ export default function voiceboxSpeech(pi: {
 
   const startBridgeServer = () => {
     if (server) return;
-    const createSrv = () =>
-      http.createServer((req, res) => {
-        const sendJson = (code: number, payload: unknown) => {
-          res.writeHead(code, { "content-type": "application/json" });
-          res.end(JSON.stringify(payload));
-        };
-
-        if (req.method === "GET" && req.url === "/status") {
+    server = createBridgeServer(
+      {
+        status: () => {
           const draft = latestCtx?.ui?.getEditorText?.() ?? "";
           const idle = latestCtx?.isIdle?.() ?? true;
-          sendJson(200, {
+          return {
             ok: true,
             version: 2,
             pid: process.pid,
@@ -1495,13 +1616,11 @@ export default function voiceboxSpeech(pi: {
             agentBusy: !idle,
             draft,
             draftLength: draft.length,
-          });
-          return;
-        }
-
-        if (req.method === "POST" && req.url === "/takeover") {
+          };
+        },
+        transcript: (text, wake) => applyTranscript(text, wake),
+        takeover: () => {
           bargeIn();
-          sendJson(200, { ok: true, releasedBy: process.pid });
           if (server) {
             try {
               server.close();
@@ -1510,71 +1629,58 @@ export default function voiceboxSpeech(pi: {
             }
             server = undefined;
           }
-          return;
-        }
-
-        if (req.method === "POST" && req.url === "/barge-in") {
-          readBody(req, (body) => {
-            let abortAgent = false;
+          return { ok: true, releasedBy: process.pid };
+        },
+        bargeIn: (body) => {
+          let abortAgent = false;
+          try {
+            const parsed = JSON.parse(body || "{}") as { abortAgent?: boolean };
+            abortAgent = Boolean(parsed.abortAgent);
+          } catch {
+            // ignore
+          }
+          const stopped = bargeIn();
+          let abortedTurn = false;
+          if (abortAgent && latestCtx?.isIdle && !latestCtx.isIdle()) {
             try {
-              const parsed = JSON.parse(body || "{}") as { abortAgent?: boolean };
-              abortAgent = Boolean(parsed.abortAgent);
+              latestCtx.abort?.();
+              abortedTurn = true;
             } catch {
               // ignore
             }
-            const stopped = bargeIn();
-            let abortedTurn = false;
-            if (abortAgent && latestCtx?.isIdle && !latestCtx.isIdle()) {
-              try {
-                latestCtx.abort?.();
-                abortedTurn = true;
-              } catch {
-                // ignore
-              }
-            }
-            sendJson(200, { ok: true, stopped, abortedTurn });
-          });
-          return;
-        }
-
-        if (req.method === "POST" && req.url === "/transcript") {
-          readBody(req, (body) => {
-            try {
-              const parsed = JSON.parse(body || "{}") as { text?: string };
-              const text = typeof parsed.text === "string" ? parsed.text : "";
-              const out = applyTranscript(text);
-              sendJson(200, { ok: true, ...out });
-            } catch (err) {
-              sendJson(400, { ok: false, error: String(err) });
-            }
-          });
-          return;
-        }
-
-        sendJson(404, { ok: false, error: "not_found" });
-      });
-
-    const srv = createSrv();
-    srv.on("error", () => {
+          }
+          return { ok: true, stopped, abortedTurn };
+        },
+      },
+      bridgeToken,
+    );
+    server.on("error", () => {
       clearSessionRegistry();
     });
-    srv.listen(0, BRIDGE_HOST, () => {
-      const addr = srv.address();
+    server.listen(0, BRIDGE_HOST, () => {
+      const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
       boundBridgePort = port;
-      fs.mkdirSync(path.dirname(registryFile), { recursive: true });
-      fs.writeFileSync(
-        registryFile,
-        JSON.stringify({
-          pid: process.pid,
-          port,
-          tty: sessionTty(),
-          startedAt: Date.now() / 1000,
-        }),
-      );
-      srv.unref();
+      fs.mkdirSync(path.dirname(registryFile), { recursive: true, mode: 0o700 });
+      fs.chmodSync(path.dirname(registryFile), 0o700);
+      // The token is the bridge's only credential: registry dir 0700, file 0600.
+      const fd = fs.openSync(registryFile, "w", 0o600);
+      try {
+        fs.writeSync(
+          fd,
+          JSON.stringify({
+            pid: process.pid,
+            port,
+            token: bridgeToken,
+            tty: sessionTty(),
+            startedAt: Date.now() / 1000,
+          }),
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
+      server.unref();
     });
-    server = srv;
   };
 
   pi.on("session_start", (_event, ctx) => {
