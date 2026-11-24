@@ -28,7 +28,7 @@
 16. **Cleanup:** None. The status command does not write the registry or the draft.
 17. **Known failure modes:** A dead pid leaves a registry file; `load_session_registry` deletes it when the pid is not alive. A focused non-text surface still selects the newest session. A focused text control whose tty does not match a session is a paste; the bridge can still be up. Caching a port from an earlier run fails because the extension binds with `listen(0)` again on session start.
 18. **Automation status:** LEVEL 4 for target selection and probe order (`tests/test_delivery.py`). The live registry comparison is LEVEL 2: the command is documented, and a person or agent still has to read the JSON.
-19. **Known limitations:** This scenario does not submit a dictation and does not prove the draft changed. G10 in `HANDY-SCENARIO-CHECKPOINT.md` stays blocked. `bridge_base` still falls back to 17494 when a delivery dict has no port; status does not use that fallback.
+19. **Known limitations:** This scenario does not submit a dictation and does not prove the draft changed. G10 (spoken scenario rows) stays blocked. `bridge_base` still falls back to 17494 when a delivery dict has no port; status does not use that fallback.
 20. **Last verified:** 2026-11-13, working tree on commit `5540a03` plus the uncommitted status change. Unit suite `pytest tests/ -q`: 67 passed. Live status at 12:43:48 local reported `url` `http://127.0.0.1:57042` for pid 80894, matching `sessions/80894.json` then. Earlier the same hour that pid's file said port 56876. Do not treat either port as the bridge address.
 
 ## History

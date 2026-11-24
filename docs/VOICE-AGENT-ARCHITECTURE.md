@@ -41,7 +41,7 @@ While a clip is playing, the slot's `reference` is the WAV file `afplay` was giv
 
 A dead `afplay` is not speaking. A legacy file with no `sessions` object still means "playing" without a pid check, and only when the directory is absent.
 
-The running controller and the running OMP process keep the previous code until they restart or reload. As of 2026-11-14 03:43 UTC neither had been restarted since the VA-* fixes, so every "the live process still ... until restart" limitation in `docs/testing/INDEX.md` is currently true; the dated list is in `HANDY-SCENARIO-CHECKPOINT.md` under "Tested but not loaded into running processes".
+The running controller and the running OMP process keep the previous code until they restart or reload. Every "the live process still ... until restart" limitation in `docs/testing/INDEX.md` holds until both are restarted.
 
 ## Wake-during-playback contract
 

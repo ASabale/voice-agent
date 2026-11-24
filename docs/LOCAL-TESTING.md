@@ -36,7 +36,7 @@ Status runs an AppleScript focus lookup and one or more GETs. It does not post a
 
 ## Commands that do touch the mic
 
-Spoken rows A–J are in `HANDY-SCENARIO-CHECKPOINT.md`. They need the MacBook microphone and the playback procedure in that file. Do not rerun a row marked pass. Do not run G10.
+Spoken rows A–J need the MacBook microphone and a human speaker. Do not rerun a row marked pass. Do not run G10.
 
 ## Logs
 
