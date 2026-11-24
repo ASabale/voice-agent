@@ -162,7 +162,8 @@ export function createBridgeServer(handlers: BridgeHandlers, token: string): htt
           const parsed = JSON.parse(body || "{}") as { text?: unknown; wake?: unknown };
           const text = typeof parsed.text === "string" ? parsed.text : "";
           const wake = Boolean(parsed.wake);
-          sendJson(200, handlers.transcript(text, wake));
+          // The controller treats a reply without ok:true as a failed post and pastes the text itself.
+          sendJson(200, { ok: true, ...handlers.transcript(text, wake) });
         } catch (err) {
           sendJson(400, { ok: false, error: String(err) });
         }

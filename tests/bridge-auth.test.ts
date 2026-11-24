@@ -27,7 +27,8 @@ function makeBridge(): { server: http.Server; token: string; port: Promise<numbe
   const server = createBridgeServer(
     {
       status: () => ({ ok: true, draft: "secret draft", draftLength: 12 }),
-      transcript: (text: string, wake: boolean) => ({ ok: true, echo: text, wake }),
+      // Real applyTranscript returns a bare action; the seam must add ok:true or the controller pastes twice.
+      transcript: (text: string, wake: boolean) => ({ action: "appended", draft: text, wake }),
       takeover: () => ({ ok: true, releasedBy: "test" }),
       bargeIn: (body: string) => ({ ok: true, body }),
     },
@@ -154,7 +155,7 @@ test("authenticated loopback requests reach the handlers, including the draft in
       body: JSON.stringify({ text: "hey jarvis zoom in", wake: true }),
     });
     assert.equal(transcript.status, 200);
-    assert.deepEqual(transcript.json, { ok: true, echo: "hey jarvis zoom in", wake: true });
+    assert.deepEqual(transcript.json, { ok: true, action: "appended", draft: "hey jarvis zoom in", wake: true });
     const barge = await request(p, "POST", {
       path: "/barge-in",
       headers: { [BRIDGE_TOKEN_HEADER]: token, "content-type": "application/json" },
