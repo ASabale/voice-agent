@@ -2715,19 +2715,23 @@ def test_headphones_keep_a_quiet_frame_and_wait_longer_to_flush(monkeypatch: pyt
     assert stops == 2
 
 
-def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fn_during_playback_cuts_speech_and_keeps_the_handy_take(monkeypatch: pytest.MonkeyPatch) -> None:
     # The cut runs on a thread. Run it inline so silence_speech cannot reach the live clips.
     calls: list[tuple] = []
+    posted: list[str] = []
     clock = {"t": 1000.0}
     held = {"answers": [False]}
+    window = {"open": True}
+    row: tuple[int, str] | None = None
 
     class _Now:
-        def __init__(self, target: object = None, daemon: bool = False) -> None:
+        def __init__(self, target: object = None, args: tuple = (), daemon: bool = False) -> None:
             self.target = target
+            self.args = tuple(args)
 
         def start(self) -> None:
             assert self.target is not None
-            self.target()
+            self.target(*self.args)
 
     def fn_held() -> bool:
         if held["answers"]:
@@ -2740,6 +2744,7 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
     monkeypatch.setattr(controller, "fn_held", fn_held)
     monkeypatch.setattr(controller, "is_voicebox_speaking", lambda: False)
     monkeypatch.setattr(controller, "latest_history_row", lambda: (11, "ignore me"))
+    monkeypatch.setattr(controller, "wait_for_new_history_row", lambda _prev, timeout_sec=2.2: row)
     monkeypatch.setattr(controller, "kill_tts_clips", lambda: calls.append(("kill",)))
     monkeypatch.setattr(controller, "silence_speech", lambda flag: calls.append(("silence", flag)))
     monkeypatch.setattr(controller, "handy_cancel", lambda allow_launch=False: calls.append(("cancel", allow_launch)))
@@ -2748,11 +2753,23 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
         "handy_start_recording",
         lambda allow_launch=False, fresh=False: calls.append(("start", allow_launch, fresh)),
     )
-    window = {"open": True}
     monkeypatch.setattr(controller, "handy_window_open", lambda: window["open"])
     monkeypatch.setattr(controller, "handy_stop_recording", lambda: calls.append(("stop",)))
-    for name in ("dispatch_transcript", "play_cue", "write_status", "stop_playback", "pause_tts_clips"):
-        monkeypatch.setattr(controller, name, lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)))
+    monkeypatch.setattr(
+        controller,
+        "dispatch_transcript",
+        lambda text, wake=True: (posted.append(text), {"action": "appended"})[1],
+    )
+    cues: list[str] = []
+    statuses: list[tuple[str, dict]] = []
+    monkeypatch.setattr(controller, "play_cue", lambda sound, wait=False: cues.append(sound))
+    monkeypatch.setattr(controller, "write_status", lambda state, payload: statuses.append((state, payload)))
+    for name in ("stop_playback", "pause_tts_clips"):
+        monkeypatch.setattr(
+            controller,
+            name,
+            lambda *_a, _name=name, **_k: (_ for _ in ()).throw(AssertionError(_name)),
+        )
 
     class _Model:
         def predict(self, _frame: np.ndarray) -> dict[str, float]:
@@ -2761,8 +2778,12 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
         def reset(self) -> None:
             return None
 
+        def reset_states(self) -> None:
+            return None
+
     def press(tts: bool, answers: list[bool], was_down: bool = False) -> controller.MicState:
         calls.clear()
+        cues.clear()
         held["answers"] = list(answers)
         mic = controller.MicState()
         mic.tts_active = tts
@@ -2771,7 +2792,7 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
         mic.last_tts_check = 1e12
         mic.enter_dictating = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("enter_dictating"))  # type: ignore[method-assign]
         frame = np.zeros(1280, dtype=np.int16)
-        mic.handle_idle_frame(frame, clock["t"], 0.0, 0.0, False, "test", _Model(), None, "hey_jarvis", 0.5, __import__("queue").Queue())
+        mic.handle_idle_frame(frame, clock["t"], 0.0, 0.0, False, "test", _Model(), _Model(), "hey_jarvis", 0.5, __import__("queue").Queue())
         return mic
 
     idle = press(False, [True])
@@ -2783,28 +2804,37 @@ def test_fn_during_playback_cuts_speech_and_restarts_only_while_held(monkeypatch
     assert calls == [("silence", False)]  # a reply under a held fn is silenced, the take keeps going
     assert repeat.tts_active is False
 
+    # fn came down during playback and came back up before the stop finished.
+    # Handy's own take is left alone: cancelling it closed the pill the user
+    # was still holding and left nothing to paste.
     released = press(True, [True, False])
-    assert ("silence", True) in calls
-    assert ("kill",) in calls
-    assert ("cancel", False) in calls
-    assert not any(call[0] == "start" for call in calls)
+    assert calls == [("kill",), ("silence", True)]
     assert released.tts_active is False
     assert released.fn_cut_busy is False
-    assert released.fn_ignore_through == 11
+    assert released.fn_ignore_through == 11  # bleed rows from the stop are swallowed
     assert released.state == "IDLE"
 
-    # Live 15:53: the toggle-restarted take must be stopped on fn release,
-    # or Handy drops it with no transcript.
-    still = press(True, [True, True, True, False])
-    assert ("start", False, False) in calls
-    assert calls[-1] == ("stop",)
-    assert still.fn_cut_busy is False
-    assert still.state == "IDLE"
+    # Held through the take: Handy's push-to-talk closes it on release, so the
+    # controller touches nothing and dispatches the row once.
+    row = (12, "the quick brown fox")
+    held_take = press(True, [True, True, True, False])
+    assert calls == [("kill",), ("silence", True)]
+    assert posted == ["the quick brown fox"]
+    assert cues == [controller.SOUND_PAUSE]
+    assert held_take.state == "IDLE"
+    assert held_take.fn_cut_busy is False
 
-    # Handy already closed the take itself: no toggle, which would start a new one.
+    # Handy did not open a take on its own: open exactly one, fresh.
+    row = None
     window["open"] = False
+    started = press(True, [True, True, True, False])
+    assert calls == [("kill",), ("silence", True), ("start", False, True)]
+    assert started.state == "IDLE"
+
+    # A take Handy left open with nothing transcribed is flushed, then cleared.
+    window["open"] = True
     press(True, [True, True, True, False])
-    assert ("stop",) not in calls
+    assert calls == [("kill",), ("silence", True), ("stop",), ("cancel", False)]
 
 
 def test_standalone_send_with_an_empty_draft_does_nothing(monkeypatch: pytest.MonkeyPatch) -> None:

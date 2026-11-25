@@ -173,6 +173,46 @@ test("a VoiceBox answering 500 holds the sentence instead of dropping it", async
   }
 });
 
+test("a pinned model tier missing from VoiceBox falls back to the cached tier instead of dropping speech", async () => {
+  resetSpeechSession();
+  process.env.OMP_VOICEBOX_API = "http://127.0.0.1:17987";
+  const requestedSizes: string[] = [];
+  const server = http.createServer((req, res) => {
+    if (req.url === "/generate/stream") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const size = JSON.parse(body).model_size as string;
+        requestedSizes.push(size);
+        if (requestedSizes.length === 1) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ detail: `Model ${size} is not downloaded yet. Use /generate to trigger a download.` }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "audio/wav" });
+        res.end(validWav());
+      });
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([{ name: "test-voice", id: "p-tier" }]));
+  });
+  await listen(server, 17987);
+  try {
+    const played: string[] = [];
+    enqueue("the small model is gone from the cache", undefined, stubPlayer(played));
+    await speechSettled();
+    assert.equal(requestedSizes.length, 2);
+    assert.notEqual(requestedSizes[0], requestedSizes[1]);
+    assert.deepEqual(played, ["the small model is gone from the cache"]);
+    assert.equal(currentDeferred().length, 0);
+  } finally {
+    stopDeferredRetry();
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test("a sidecar dying mid-request holds the sentence and replays it on recovery", async () => {
   // VA-TTS-021 end-to-end repro: VoiceBox accepts the TCP connection, then the
   // socket closes before any response — the exact shape speech.log recorded as

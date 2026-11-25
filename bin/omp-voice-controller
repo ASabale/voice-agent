@@ -2053,7 +2053,9 @@ def handy_is_recording() -> bool:
 def handy_exec(flag: str, allow_launch: bool = False) -> bool:
     """Send a flag to the running Handy app. Never launches the app unless allow_launch is set."""
     if not allow_launch and not handy_process_running():
+        log(f"handy {flag} skipped: Handy is not running")
         return False
+    started = time.monotonic()
     try:
         subprocess.run(
             [HANDY_BIN, flag],
@@ -2062,6 +2064,7 @@ def handy_exec(flag: str, allow_launch: bool = False) -> bool:
             timeout=3.0,
             check=False,
         )
+        log(f"handy {flag} sent in {time.monotonic() - started:.3f}s")
         return True
     except Exception as exc:
         log(f"handy_exec {flag} failed: {exc}")
@@ -4009,6 +4012,40 @@ class MicState:
         self.handy_ui_seen = False
         self.last_handy_ui_check = time.monotonic()
 
+    def run_fn_take(self, oww, vad) -> None:
+        """The take Handy started when fn went down, with the reply cut out.
+
+        Silence the speakers and then leave Handy alone: push-to-talk opens on
+        the press and closes on the release. Reopening a cancelled take here
+        raced that release, which is where the flicker and the missing paste
+        came from.
+        """
+        try:
+            stop_started = time.monotonic()
+            silence_speech(True)
+            # A take that was already running when fn went down flushes a row that
+            # is reply bleed, not the user's words; swallow it while recording runs.
+            absorb_until = time.monotonic() + 0.45
+            while time.monotonic() < absorb_until:
+                row_id, _ = latest_history_row()
+                self.fn_ignore_through = max(self.fn_ignore_through, row_id)
+                time.sleep(0.05)
+            held = fn_held()
+            log(f"fn edge: reply stop took {time.monotonic() - stop_started:.2f}s, fn {'still held' if held else 'already released'}")
+            if not held:
+                log("fn released during the reply stop -> Handy keeps its take")
+                return
+            if handy_window_open():
+                log("fn barge-in: speakers stopped, Handy's take keeps running")
+            else:
+                started = handy_start_recording(allow_launch=False, fresh=True)
+                log(f"fn barge-in: speakers stopped, Handy take {'opened' if started else 'did not open'}")
+            while fn_held():
+                time.sleep(0.03)
+            self.finish_fn_take(oww, vad)
+        finally:
+            self.fn_cut_busy = False
+
     def finish_fn_take(self, oww, vad) -> None:
         """Fn went down and back up. Handy push-to-talk already stops on release.
 
@@ -4017,7 +4054,9 @@ class MicState:
         because a voice-started take is still running, and cancel if that
         toggle opened another one.
         """
-        prev = self.last_history_id
+        # Rows at or below fn_ignore_through were already accounted for (reply
+        # bleed dropped at the fn edge), so start the wait above them.
+        prev = max(self.last_history_id, self.fn_ignore_through)
         row = wait_for_new_history_row(prev, timeout_sec=2.2)
         if row is None and handy_window_open():
             handy_stop_recording()
@@ -4308,9 +4347,11 @@ class MicState:
                 self.last_tts_seen = now
             if self.tts_active != was_speaking:
                 barge_note(self, "speaking", speaking=self.tts_active)
-        # Handy starts recording on fn. That used to keep the reply that was
-        # still coming out of the speakers. Cut the speakers on the key edge,
-        # throw away that take, and record again only if fn is still held.
+        # Handy opens its take on the fn edge. The controller's only job here
+        # is to stop the reply still coming out of the speakers. Cancelling the
+        # take and reopening it a second later flickered the pill, dropped
+        # every word spoken while the reply was being stopped, and left a quick
+        # tap with nothing to paste.
         fn_down = fn_held()
         if (
             not handy_file_mode()
@@ -4323,39 +4364,7 @@ class MicState:
             self.tts_active = False
             kill_tts_clips()
             log("fn held during playback -> stopping speech before Handy keeps it")
-
-            def cut_playback_then_listen() -> None:
-                silence_speech(True)
-                handy_cancel(allow_launch=False)
-                deadline = time.monotonic() + 1.5
-                while time.monotonic() < deadline and is_voicebox_speaking():
-                    kill_tts_clips()
-                    time.sleep(0.05)
-                absorb_until = time.monotonic() + 0.45
-                while time.monotonic() < absorb_until:
-                    row_id, _ = latest_history_row()
-                    self.fn_ignore_through = max(self.fn_ignore_through, row_id)
-                    time.sleep(0.05)
-                if fn_held():
-                    before_take = latest_history_row()[0]
-                    handy_start_recording(allow_launch=False)
-                    log("fn barge-in: speakers stopped, recording restarted without the reply")
-                    # This take was started by a toggle, so Handy's own
-                    # push-to-talk release does not end it (live 15:53: the
-                    # take was dropped with no transcript). Stop it on release;
-                    # the idle history poll then delivers the new row.
-                    while fn_held():
-                        time.sleep(0.03)
-                    # If Handy ended the take itself, a toggle would open a new
-                    # recording; wait briefly for its row first (as finish_fn_take).
-                    if wait_for_new_history_row(before_take, timeout_sec=1.5) is None and handy_window_open():
-                        handy_stop_recording()
-                        log("fn released after barge-in -> stopped Handy for transcription")
-                else:
-                    log("fn barge-in: speakers stopped")
-                self.fn_cut_busy = False
-
-            threading.Thread(target=cut_playback_then_listen, daemon=True).start()
+            threading.Thread(target=self.run_fn_take, args=(oww, vad), daemon=True).start()
         elif fn_down and self.fn_was_down and self.tts_active and not self.fn_cut_busy:
             # A reply that starts while fn is already held would be recorded
             # into the take: silence it, keep the recording going.

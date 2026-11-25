@@ -1011,20 +1011,30 @@ export async function generate(
     }
     logSpeech("requested", text);
     // Use /generate/stream directly to eliminate 200ms polling latency + SQLite history churn
-    const res = await fetch(`${apiBase()}/generate/stream`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        profile_id: id,
-        text,
-        language: "en",
-        engine: "qwen",
-        model_size: ttsModelSize(),
-        personality: false,
-        crossfade_ms: 25,
-      }),
-      signal: controller.signal,
-    });
+    const requestStream = (modelSize: "0.6B" | "1.7B") =>
+      fetch(`${apiBase()}/generate/stream`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          profile_id: id,
+          text,
+          language: "en",
+          engine: "qwen",
+          model_size: modelSize,
+          personality: false,
+          crossfade_ms: 25,
+        }),
+        signal: controller.signal,
+      });
+    const wanted = ttsModelSize();
+    let res = await requestStream(wanted);
+    if (res.status === 400 && /not downloaded/i.test(await res.clone().text())) {
+      // VoiceBox lost the pinned tier from its cache. Speaking on the other
+      // tier beats holding every sentence until DEFER_EXPIRY_MS drops it.
+      const other = wanted === "0.6B" ? "1.7B" : "0.6B";
+      logOnce("voicebox-tier-missing", `VoiceBox has no ${wanted} model; speaking on ${other}`);
+      res = await requestStream(other);
+    }
     if (!res.ok) {
       // A live but unhealthy VoiceBox (e.g. 500 with the TTS model unloaded)
       // is the same speech-loss problem as a dead one: hold the sentence and
